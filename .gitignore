@@ -1,0 +1,38 @@
+# Claude Code local overrides (personal, never commit)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Build / dist
+build/
+dist/
+*.egg
+
+# Run artifacts (traces, parquet, jsonl)
+data/runs/
+data/bench_runs/
+data/traces/
+*.parquet
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

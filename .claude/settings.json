@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~/*)",
+      "Bash(rm -rf $HOME*)",
+      "Bash(rm -rf /c/*)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git reset --hard origin/*)",
+      "Bash(curl * | bash*)",
+      "Bash(curl * | sh*)",
+      "Bash(wget * | bash*)",
+      "Bash(wget * | sh*)",
+      "Write(/c/repo/ai_math_base_resolver/**)",
+      "Edit(/c/repo/ai_math_base_resolver/**)",
+      "Write(/c/Users/chand/.claude/**)",
+      "Edit(/c/Users/chand/.claude/**)"
+    ]
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "permissions_note": "bypassPermissions enabled for autonomous Phase 1-3 CAT agent build. Deny rules: (1) ai_math_base_resolver is READ-ONLY reference, never write/edit it; (2) global ~/.claude untouchable from this project; (3) no nuclear deletes or force pushes; (4) no piping remote scripts to shell."
+}
