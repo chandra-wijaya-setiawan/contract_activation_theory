@@ -31,6 +31,14 @@ EventKind = Literal[
     "contract_decompose",    # planner emitted criteria + sub-contracts
     "criterion_check",       # verifier ran a criterion: {criterion_id, satisfied, evidence}
     "capability_activate",   # capability invoked under a contract
+    "failure_attribution",   # layer-attributed failure: {layer, description, tool, args}
+]
+
+FailureLayer = Literal[
+    "action_realization",    # tool call was malformed (bad args, wrong format)
+    "environment_contract",  # tool call violated precondition / usage protocol
+    "trajectory_regulation", # agent looped, stalled, or failed to recover
+    "residual_reasoning",    # model made a bad decision despite correct interface
 ]
 
 

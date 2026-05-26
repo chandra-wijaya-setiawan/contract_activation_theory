@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from cat.contracts import State
-from cat.trace import Recorder, TraceEvent, utcnow_iso
+from cat.trace import FailureLayer, Recorder, TraceEvent, utcnow_iso
 
 
 OUTPUT_CAP_BYTES = 8_000
@@ -46,12 +46,16 @@ class ToolResult:
     wall_s: float = 0.0
 
 
+Precondition = Callable[[dict[str, Any], State], Optional[str]]
+
+
 @dataclass
 class Capability:
     name: str
     description: str
     json_schema: dict[str, Any]
     handler: Callable[[dict[str, Any], State], ToolResult]
+    preconditions: list[Precondition] = field(default_factory=list)
 
 
 class CapabilityRegistry:
@@ -97,6 +101,29 @@ class CapabilityRegistry:
             return ToolResult(tool=name, is_error=True, output=f"unknown tool: {name}")
 
         call_id = tool_call_id or f"tc-{uuid.uuid4().hex[:8]}"
+
+        for pre in cap.preconditions:
+            violation = pre(args, state)
+            if violation is not None:
+                if recorder is not None:
+                    recorder.append(TraceEvent(
+                        event_id=f"fail-{uuid.uuid4().hex[:6]}",
+                        parent_id=contract_id,
+                        ts=utcnow_iso(),
+                        kind="failure_attribution",
+                        payload={
+                            "layer": "environment_contract",
+                            "description": violation,
+                            "tool": name,
+                            "args": args,
+                        },
+                    ))
+                return ToolResult(
+                    tool=name, is_error=True,
+                    output=f"[PRECONDITION] {violation}",
+                    detail={"precondition_failed": True, "failure_layer": "environment_contract"},
+                )
+
         if recorder is not None:
             recorder.append(TraceEvent(
                 event_id=call_id,
@@ -255,6 +282,29 @@ def _h_list(args: dict[str, Any], state: State) -> ToolResult:
     return ToolResult(tool="list", is_error=False, output="\n".join(entries) or "(empty)", detail={"count": len(entries)})
 
 
+# ── Preconditions for built-in capabilities ───────────────────────────────
+
+
+def _pre_read_file_exists(args: dict[str, Any], state: State) -> Optional[str]:
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        return "missing 'path' argument"
+    try:
+        resolved = _resolve_inside_workdir(path, state.workdir)
+    except ValueError:
+        return f"path '{path}' is outside workdir"
+    if not resolved.exists():
+        return f"file '{path}' does not exist; use 'list' to see available files"
+    return None
+
+
+def _pre_bash_non_empty(args: dict[str, Any], state: State) -> Optional[str]:
+    cmd = str(args.get("command", "")).strip()
+    if not cmd:
+        return "empty command"
+    return None
+
+
 def build_default_registry() -> CapabilityRegistry:
     reg = CapabilityRegistry()
     reg.register(Capability(
@@ -269,6 +319,7 @@ def build_default_registry() -> CapabilityRegistry:
             "required": ["command"],
         },
         handler=_h_bash,
+        preconditions=[_pre_bash_non_empty],
     ))
     reg.register(Capability(
         name="write",
@@ -294,6 +345,7 @@ def build_default_registry() -> CapabilityRegistry:
             "required": ["path"],
         },
         handler=_h_read,
+        preconditions=[_pre_read_file_exists],
     ))
     reg.register(Capability(
         name="list",

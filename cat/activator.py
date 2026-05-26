@@ -15,12 +15,14 @@ exits. There is no "model decides done" path — closure rests on
 Criterion.predicate returning True (deterministic).
 """
 from __future__ import annotations
+import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from cat.capabilities import CapabilityRegistry, ToolResult, workdir_snapshot
 from cat.contracts import (
@@ -57,12 +59,27 @@ and the judge close steps.
 """
 
 
+TrajectorySignal = Literal["continue", "replan", "fail_early"]
+
+REPEAT_THRESHOLD = 3
+CONSECUTIVE_ERROR_THRESHOLD = 5
+STALL_THRESHOLD = 4
+
+
 @dataclass
 class _PlanStep:
     id: str
     description: str
     complete: bool = False
     last_reason: str = ""
+
+
+@dataclass
+class _ToolCallRecord:
+    tool: str
+    args_hash: str
+    is_error: bool
+    iteration: int
 
 
 @dataclass
@@ -74,6 +91,9 @@ class ActivatorRun:
     iterations: int = 0
     final_text: Optional[str] = None
     failure_reason: Optional[str] = None
+    tool_history: list[_ToolCallRecord] = field(default_factory=list)
+    last_plan_advance_at: int = 0
+    replan_count: int = 0
 
 
 class Activator:
@@ -151,6 +171,40 @@ class Activator:
 
             # Step 6 (judge): advisory — update checklist using judge per un-checked step
             self._update_plan_checklist(contract, run)
+
+            # Trajectory regulation: detect stuck loops, repeated errors, stalls
+            signal = self._check_trajectory(contract, run)
+            if signal == "replan":
+                self.recorder.append(TraceEvent(
+                    event_id=f"fail-{uuid.uuid4().hex[:6]}",
+                    parent_id=contract.id,
+                    ts=utcnow_iso(),
+                    kind="failure_attribution",
+                    payload={
+                        "layer": "trajectory_regulation",
+                        "description": "circuit breaker triggered replan",
+                        "iteration": run.iterations,
+                        "replan_count": run.replan_count + 1,
+                    },
+                ))
+                self._do_replan(contract, run)
+                continue
+            elif signal == "fail_early":
+                self.recorder.append(TraceEvent(
+                    event_id=f"fail-{uuid.uuid4().hex[:6]}",
+                    parent_id=contract.id,
+                    ts=utcnow_iso(),
+                    kind="failure_attribution",
+                    payload={
+                        "layer": "trajectory_regulation",
+                        "description": "trajectory stuck after replan, giving up",
+                        "iteration": run.iterations,
+                    },
+                ))
+                self._transition(contract, ContractState.FAILED,
+                                 "trajectory stuck after replan")
+                run.failure_reason = "circuit_breaker_fail"
+                break
 
         self.recorder.append(TraceEvent(
             event_id=f"step-{uuid.uuid4().hex[:6]}",
@@ -287,6 +341,7 @@ class Activator:
 
         # Discipline: only execute the FIRST tool call this turn.
         first = result.tool_calls[0]
+        first["arguments"] = self._realize_action(first["name"], first["arguments"], state)
         self.recorder.append(TraceEvent(
             event_id=f"act-{uuid.uuid4().hex[:6]}",
             parent_id=contract.id,
@@ -309,6 +364,23 @@ class Activator:
             tool_call_id=first["id"],
         )
         contract.cost.tool_calls += 1
+        self._record_tool_call(run, first["name"], first["arguments"], tool_result.is_error)
+
+        if tool_result.is_error:
+            layer = self._attribute_tool_failure(tool_result)
+            self.recorder.append(TraceEvent(
+                event_id=f"fail-{uuid.uuid4().hex[:6]}",
+                parent_id=contract.id,
+                ts=utcnow_iso(),
+                kind="failure_attribution",
+                payload={
+                    "layer": layer,
+                    "description": tool_result.output[:300],
+                    "tool": first["name"],
+                    "args": first["arguments"],
+                    "iteration": run.iterations,
+                },
+            ))
 
         # Feed the tool result back to the LLM thread.
         run.messages.append({
@@ -329,6 +401,107 @@ class Activator:
             })
 
         return True
+
+    # ── Trajectory Regulation (circuit breaker) ─────────────────────────────
+
+    def _record_tool_call(self, run: ActivatorRun, tool: str, args: dict, is_error: bool) -> None:
+        args_hash = hashlib.md5(json.dumps(args, sort_keys=True).encode()).hexdigest()[:10]
+        run.tool_history.append(_ToolCallRecord(
+            tool=tool, args_hash=args_hash,
+            is_error=is_error, iteration=run.iterations,
+        ))
+
+    def _check_trajectory(self, contract: Contract, run: ActivatorRun) -> TrajectorySignal:
+        if not run.tool_history:
+            return "continue"
+
+        last = run.tool_history[-1]
+        sig = last.tool + ":" + last.args_hash
+        recent = run.tool_history[-REPEAT_THRESHOLD:]
+        if len(recent) == REPEAT_THRESHOLD and all(
+            r.tool + ":" + r.args_hash == sig for r in recent
+        ):
+            return "replan"
+
+        tail = run.tool_history[-CONSECUTIVE_ERROR_THRESHOLD:]
+        if len(tail) == CONSECUTIVE_ERROR_THRESHOLD and all(r.is_error for r in tail):
+            return "replan"
+
+        completed_count = sum(1 for s in run.plan if s.complete)
+        if completed_count > 0:
+            run.last_plan_advance_at = run.iterations
+        if (run.iterations - run.last_plan_advance_at) >= STALL_THRESHOLD:
+            if run.replan_count > 0:
+                return "fail_early"
+            return "replan"
+
+        return "continue"
+
+    def _do_replan(self, contract: Contract, run: ActivatorRun) -> None:
+        run.replan_count += 1
+        stale_steps = ", ".join(s.id for s in run.plan if not s.complete)
+        self.recorder.append(TraceEvent(
+            event_id=f"replan-{uuid.uuid4().hex[:6]}",
+            parent_id=contract.id,
+            ts=utcnow_iso(),
+            kind="contract_decompose",
+            payload={
+                "contract_id": contract.id,
+                "reason": "circuit_breaker_replan",
+                "replan_count": run.replan_count,
+                "stale_steps": stale_steps,
+            },
+        ))
+        run.plan = []
+        self._decompose(contract, run)
+        self._init_executor_messages(contract, run)
+
+    # ── Failure Attribution (priority-ordered per LIFE-Harness taxonomy) ────
+
+    @staticmethod
+    def _attribute_tool_failure(result: ToolResult) -> str:
+        out = result.output.lower()
+        detail = result.detail or {}
+
+        if detail.get("precondition_failed"):
+            return "environment_contract"
+
+        if any(s in out for s in ("missing", "unknown tool", "invalid", "json", "type")):
+            return "action_realization"
+
+        if any(s in out for s in ("not found", "permission", "escapes workdir", "timeout")):
+            return "environment_contract"
+
+        return "residual_reasoning"
+
+    # ── Action Realization ──────────────────────────────────────────────────
+    # Normalizes tool-call arguments before invoking the capability.
+    # Catches common LLM formatting errors that would waste a tool call.
+
+    _MARKDOWN_FENCE_RE = re.compile(r"^```[\w]*\n?|```$", re.MULTILINE)
+
+    def _realize_action(self, tool_name: str, args: dict, state: State) -> dict:
+        args = dict(args)
+
+        if tool_name in ("write", "read", "list"):
+            path = args.get("path")
+            if isinstance(path, str):
+                args["path"] = path.replace("\\", "/").lstrip("./")
+
+        if tool_name == "write":
+            content = args.get("content")
+            if isinstance(content, str) and content.startswith("```"):
+                args["content"] = self._MARKDOWN_FENCE_RE.sub("", content).strip() + "\n"
+
+        if tool_name == "bash":
+            timeout = args.get("timeout_s")
+            if isinstance(timeout, str):
+                try:
+                    args["timeout_s"] = float(timeout)
+                except ValueError:
+                    del args["timeout_s"]
+
+        return args
 
     # ── Step 6: VERIFY ──────────────────────────────────────────────────────
 

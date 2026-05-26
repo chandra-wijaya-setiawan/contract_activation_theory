@@ -142,28 +142,125 @@ verifiable structured result.
 | Sub-tasks are stack frames | Sub-tasks are contracts with their own lifecycles |
 | Budget is loose (max_tokens) | Budget is a constraint on the contract |
 
-## v1 Scope
+## Roadmap
 
-The first runnable cut should demonstrate the loop end-to-end with the minimum
-that proves the abstraction is load-bearing:
+### Why coding first
 
-- `Contract`, `Criterion`, `Condition`, `Constraints` dataclasses.
-- An in-process `Activator` that drives the 7 steps.
-- A `World` / `State` snapshot the predicates read from.
-- One worked example: a user goal ("answer question X with citations") that
-  decomposes into a retrieval sub-contract and a synthesis sub-contract,
-  each with measurable criteria, all under a token budget.
+The coding domain is the right place to harden CAT before claiming generality.
+It has **two distinct validation gates** that most other domains lack:
 
-No persistence. No distribution. No concurrency. Just the loop, in memory,
-single-threaded, with a print-trace so the activation pattern is visible.
+1. **Deterministic oracle** — file existence, content predicates, test-suite
+   pass/fail. Unambiguous ground truth. This is the gate Phase 1 already uses.
+2. **Multi-turn nondeterministic execution** — the agent must navigate shell
+   state, compiler errors, dependency issues, and test failures across turns
+   where the next correct action is not fully predictable from the instruction
+   alone. This is where ReAct drifts and where discipline should pay off most.
 
-## Open questions (to resolve before v2)
+Established coding agents (Pi, Hermes, Claude Code) exercise both gates at
+scale. CAT must match or beat them on their home turf before the
+"loop discipline, not domain structure" claim is credible.
 
-- **Event sourcing**: should every state transition emit an event so the
-  history is replayable? Strong yes long-term; not required for v1.
-- **Speculative activation**: can a contract pre-activate capabilities while
-  still ELIGIBLE to reduce latency? Defer.
-- **Contract markets**: when multiple agents bid to fulfill a contract,
-  what's the auction protocol? Out of scope for v1.
-- **Failure propagation**: does a child's FAILED state automatically fail
-  the parent, or does the parent get to re-plan? Default: re-plan once, then fail.
+**Hard gate to v2:** CAT excels in the coding domain — demonstrated parity or
+advantage against at least one established coding agent on a recognized
+benchmark. Until this gate is met, no resources go toward other domains.
+
+---
+
+### v1.0 — Synthetic proof of mechanism (DONE, 2026-05-14)
+
+- Contract / Criterion / Activator / Capability abstractions, end-to-end.
+- ReAct control agent sharing the same LLM + tool stack.
+- 2 synthetic tasks (trivial 1-step, moderate 5-step), 12 trials.
+- Result: 6× fewer tool calls, 10× fewer tokens on 5-step task, solve parity.
+- Thesis confirmed: discipline reduces cost; gap widens with complexity.
+
+### v1.2 — Expand synthetic coverage
+
+- Add 3–5 synthetic tasks spanning coding sub-domains:
+  - **Bug fix** — inject a known bug, oracle checks the fix + no regressions.
+  - **Multi-file refactor** — rename/move across files, oracle checks
+    consistency.
+  - **Test generation** — given code, produce tests that hit specified
+    coverage, oracle runs pytest + coverage tool.
+- Harden the oracle framework: composable predicates (file content, exit code,
+  coverage threshold, AST checks).
+- Validate that CAT's cost advantage holds as step count increases (5 → 10 →
+  15+ steps). Establish the drift curve for ReAct.
+
+### v1.4 — Real benchmark integration
+
+- Integrate a recognized coding benchmark (SWE-bench Lite or terminal-bench
+  subset) so results are comparable to published agent scores.
+- **τ-bench integration** (Sierra Research, arxiv 2406.12045): add retail and/or
+  airline domain as a non-coding benchmark track. τ-bench uses ground-truth
+  database-state comparison — structurally identical to CAT's criterion
+  predicates (`(State) -> bool`), just over DB rows instead of files. This
+  early cross-domain probe pressure-tests generality before v2.0 formally
+  opens the door. Criterion adapter: map τ-bench goal-state annotations to
+  CAT fulfillment criteria; capability adapter: wrap τ-bench API tools as
+  CAT capabilities.
+- Adapt the oracle layer to consume external graders (SWE-bench grader,
+  τ-bench state comparator).
+- Run CAT vs ReAct on ≥ 30 benchmark instances per track. Measure solve rate,
+  token cost, tool calls, wall time. Report **pass^k** (k=4) for consistency.
+- Baseline comparison: run the same instances through Pi (stateless ReAct
+  baseline) and report head-to-head.
+
+### v1.6 — Failure handling and re-planning
+
+- Implement failure propagation: child FAILED → parent re-plans (once), then
+  fails. (Open question from v1 design, now resolved.)
+- Add SUSPENDED → re-ELIGIBLE flow for contracts blocked on external state
+  (e.g., waiting for a test run).
+- Stress-test on tasks that require recovery: wrong file written, test fails,
+  dependency missing.
+
+### v1.8 — Coding domain hardening (GATE)
+
+- Head-to-head against at least one established coding agent (Pi, Hermes, or
+  Claude Code) on a shared benchmark.
+- Target: ≥ parity on solve rate, measurable advantage on token efficiency or
+  cost.
+- **LIFE-Harness comparison** (arxiv 2605.22166, Xu et al. 2026): run CAT and
+  LIFE-Harness on shared τ-bench / τ²-bench tasks. LIFE-Harness reaches the
+  same 4-layer architecture (environment contracts, trajectory regulation,
+  procedural skills, action realization) from an empirical/bottom-up direction;
+  CAT prescribes the same structure top-down. Direct comparison tests whether
+  principled design matches or beats learned interventions.
+- **AgentBench subset** (THUDM, ICLR 2024): add OS (Linux shell, 144 tasks)
+  and DBBench (SQL, 261 tasks) as lightweight cross-domain benchmarks. Both
+  are deterministic, have published LIFE-Harness numbers, and map cleanly to
+  CAT criteria (file/exit-code checks, query-result comparison). ALFWorld
+  (household, 134 tasks) is optional low-cost addition.
+- Event sourcing: every state transition emits a replayable event. Enables
+  post-hoc analysis of where ReAct drifts vs where CAT stays on track.
+- Report **pass^k** (k=4) across all environments for consistency measurement.
+- Publish results and methodology (internal or external).
+- **Gate review:** results justify moving to multi-domain expansion.
+
+---
+
+### v2.0 — Domain-agnostic expansion (gated on v1.8)
+
+- Prestige benchmarks: **WebArena** (web browsing, 812 tasks), **OSWorld**
+  (desktop control, 369 tasks), **Spider 2.0** (enterprise SQL, 632 tasks).
+  These require heavier integration but are the recognized multi-domain
+  agent benchmarks.
+- Each new domain adds: task definitions, domain-specific capabilities,
+  oracles, and a ReAct baseline comparison.
+- Criterion adapters by state type:
+  - File system: `file_content(path) == expected` (OS, SWE-bench, OSWorld)
+  - Database rows: `db_state == gold_state` (τ-bench, DBBench, Spider 2.0)
+  - Web/DOM: `page_element(selector) == expected` (WebArena, WebShop)
+  - Object location: `object_at(room, surface)` (ALFWorld)
+- Validate that the cost/discipline advantage transfers across domains, not
+  just within coding.
+
+### v2.x — Open design questions (deferred)
+
+- **Speculative activation** — pre-activate capabilities while ELIGIBLE to
+  reduce latency.
+- **Contract markets** — auction protocol when multiple agents bid on a
+  contract.
+- **Persistence and distribution** — contracts that survive process restarts,
+  cross-agent handoff.
