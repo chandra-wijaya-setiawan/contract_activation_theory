@@ -1,6 +1,6 @@
 # Project Plan: CAT v1.0 – v2.0
 
-Status as of 2026-05-26. See DESIGN.md for theory and architecture.
+Status as of 2026-05-26 (updated). See DESIGN.md for theory and architecture.
 
 ## Completed
 
@@ -40,80 +40,50 @@ Status as of 2026-05-26. See DESIGN.md for theory and architecture.
 - Result: CAT 3.5x cheaper on hardest task (test-generation), lower variance.
   All tasks 100% solve rate for both agents.
 
----
-
-## v1.3 — terminal-bench deterministic criterion rerun
+### v1.3 — terminal-bench deterministic criterion rerun (DONE, 2026-05-26)
 
 Goal: Rerun v1.1's real Docker tasks with the deterministic test-runner
-criterion. Validates that the Phase 2 root cause analysis was correct before
-scaling to bigger benchmarks.
+criterion.
 
-**Changes already coded:**
+**Changes:**
 - `activator.py`: removed pre-activation `_verify_criteria` call → judge
   called once per tool call, not twice.
 - `tb_agents.py`: `_make_test_runner_criterion(session, test_cmd)` — runs
   `<test_cmd>; echo EXIT:$?`, parses exit code. Zero false-positive rate.
 
-**Run command:**
-```bash
-DOCKER_HOST=ssh://cpubox tb runs create \
-  --dataset-path tasks \
-  --task-id hello-world --task-id fix-pandas-version --task-id csv-to-parquet \
-  --agent-import-path cat.tb_agents:TbCatAgent \
-  --agent-kwarg model_name=openrouter/deepseek/deepseek-v4-flash \
-  --agent-kwarg test_cmd="python -m pytest tests/ -q" \
-  --n-attempts 3 --output-path data/tb-runs/cat-p3 --run-id cat-phase3
-```
+**Results:**
+- cat-p4 (3 tasks, 3 attempts): **CAT 100%** — regression fully recovered.
+- cat-p6 vs react-p6 (5 tasks, 2 attempts): **CAT 90% = ReAct 90%** — parity.
+- Root cause confirmed: deterministic criterion fixes premature closure.
 
-**Expected:** LLM calls/tool drops from 4x to ~1.3x (executor + 1 checklist
-judge/step). Solve rate recovers to match or exceed ReAct.
-
-**Criterion:** `exit_code == 0` from test runner — deterministic.
-
-**Prerequisite for v1.4:** If deterministic criterion doesn't recover CAT's
-solve rate on terminal-bench, SWE-bench won't help — same pattern, bigger
-tasks.
+**Lesson:** LLM judge is only safe called once at task end, not per tool call.
 
 ---
 
-## v1.4 — Real benchmark integration
+### v1.4 — SWE-bench verified (IN PROGRESS, 2026-05-26)
 
-Goal: Move from synthetic/terminal-bench tasks to recognized benchmarks with
-published leaderboards so CAT results are directly comparable to other agents.
+Goal: Validate CAT on real GitHub issues with deterministic pytest criterion.
 
-### Track A: SWE-bench Lite (coding)
+**Oracle:** `benchmarks/swe_bench.py:TbSweAgent` — applies SWE-bench's own
+`test_patch` + runs `FAIL_TO_PASS` tests via exit code. Proxy oracles for
+tasks whose tests require live network (httpbin etc.).
 
-**What:** 300 real GitHub issues from popular Python repos (django, flask,
-sympy, etc.). Each has a failing test. Agent produces a patch. SWE-bench
-grader runs the test suite.
+**Results so far:**
+- swe10 head-to-head (10 tasks, 1 attempt):
+  - **CAT (TbSweAgent): 3/10 = 30%** — 199K input tokens total
+  - **ReAct: 3/10 = 30%** — 1,006K input tokens total
+  - **CAT uses 5× fewer input tokens at equal solve rate**
+- swe30-cat (30 tasks, 1 attempt): **CAT 9/30 = 30%**
+- swe30-react (11/30 tasks complete): 7/11 = 64% (run in progress → swe30-react-2)
 
-**Engineering work:**
+**Next:** Complete swe30-react-2 (remaining 19 tasks) for full 30-task comparison.
+Add pass^k metric (3 reps per task) after solve rate is understood.
 
-1. **WSL/Docker setup** — SWE-bench runs in Docker on Linux. Must run from
-   WSL, not Windows host (see prior lesson). Set up a reproducible dev
-   environment with Docker-in-WSL.
+## v1.4 — tau-bench (planned)
 
-2. **SWE-bench task loader** (`cat/bench/swebench.py`)
-   - Parse SWE-bench Lite dataset (JSON lines with repo, commit, test patch,
-     instance_id).
-   - For each instance: spin up the Docker container, expose bash/write/read
-     as CAT capabilities pointing into the container.
-   - Map instance -> TaskSpec with oracle pointing to SWE-bench grader.
+Goal: Validate CAT on customer-service conversations (non-coding domain).
 
-3. **External grader adapter** (`cat/tasks.py`)
-   - Generalize `grade()` to dispatch to external graders (subprocess call to
-     SWE-bench evaluation harness) in addition to in-process predicates.
-   - Return (pass, score) from the grader's JSON output.
-
-4. **Run configuration**
-   - Select >=30 instances from SWE-bench Lite (stratified by difficulty).
-   - Run CAT + ReAct, 4 reps each (pass^k metric).
-   - Total: 30 instances x 2 agents x 4 reps = 240 trials.
-
-**Risks:**
-- Docker container startup adds ~10-30s per trial -> wall time budget.
-- SWE-bench instances vary wildly in difficulty; need stratified sampling.
-- Some instances require long context (large files) -> may hit token budget.
+### tau-bench integration
 
 ### Track B: tau-bench (customer service, non-coding)
 
