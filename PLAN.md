@@ -61,7 +61,7 @@ criterion.
 
 ---
 
-### v1.4 — SWE-bench verified (IN PROGRESS, 2026-05-26)
+### v1.4 — SWE-bench verified (DONE, 2026-05-26)
 
 Goal: Validate CAT on real GitHub issues with deterministic pytest criterion.
 
@@ -69,16 +69,42 @@ Goal: Validate CAT on real GitHub issues with deterministic pytest criterion.
 `test_patch` + runs `FAIL_TO_PASS` tests via exit code. Proxy oracles for
 tasks whose tests require live network (httpbin etc.).
 
-**Results so far:**
-- swe10 head-to-head (10 tasks, 1 attempt):
-  - **CAT (TbSweAgent): 3/10 = 30%** — 199K input tokens total
-  - **ReAct: 3/10 = 30%** — 1,006K input tokens total
-  - **CAT uses 5× fewer input tokens at equal solve rate**
-- swe30-cat (30 tasks, 1 attempt): **CAT 9/30 = 30%**
-- swe30-react (11/30 tasks complete): 7/11 = 64% (run in progress → swe30-react-2)
+**Results — swe30 full head-to-head (30 tasks, 1 attempt each):**
 
-**Next:** Complete swe30-react-2 (remaining 19 tasks) for full 30-task comparison.
-Add pass^k metric (3 reps per task) after solve rate is understood.
+| Metric | CAT | ReAct |
+|---|---|---|
+| Solve rate | **9/30 = 30%** | **15/30 = 50%** |
+| Input tokens total | 1,602K | 5,025K |
+| Token cost ratio | 1× | **3.1× more expensive** |
+| Tokens per solved task | 178K | 335K |
+
+**Note:** swe30-cat used pre-v1.2 code (2026-05-16). ReAct is current code.
+CAT v1.2 improvements (F2 replan on deadlock, P2 criterion interval) should
+close some of the solve-rate gap in a rerun.
+
+**Win/loss breakdown:**
+- CAT only (3 tasks): django-12708, pytest-10081, pytest-6202
+- ReAct only (9 tasks): django-11239, django-12039, django-13315, django-14787,
+  matplotlib-24149, matplotlib-24970, requests-1142, sphinx-10323, sympy-15349
+- Both solve (6): django-10880, django-14434, django-16333, xarray-4966,
+  scikit-learn-14141, sympy-15875
+- Neither (12)
+
+**Root cause of CAT failures (ReAct-only wins):**
+- Partial fixes: CAT plan step judged "complete" before all test vars applied
+  (django-11239 example: fixed 2/4 SSL env vars). F2 replan should fix these.
+- Exploratory tasks: ReAct's free-form exploration finds the right code path;
+  CAT's pre-planned steps miss it (especially in large Django/sympy codebases).
+- Token savings per solved task: CAT 178K vs ReAct 335K (CAT still 1.9× cheaper
+  per solution even at lower solve rate).
+
+**Earlier swe10 head-to-head (10 tasks, 1 attempt):**
+- CAT (TbSweAgent): 3/10 = 30% — 199K input tokens total
+- ReAct: 3/10 = 30% — 1,006K input tokens total
+- CAT uses 5× fewer input tokens at equal solve rate
+
+**Next:** Re-run swe30-cat with v1.2+REPRESENT code to measure improvement.
+Then add pass^k metric (3 reps per task) for consistency measurement.
 
 ### v1.4b — terminal-bench-core full benchmark (2026-05-15, needs rerun)
 
