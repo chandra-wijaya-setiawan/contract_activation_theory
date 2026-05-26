@@ -281,6 +281,22 @@ tune circuit breaker) until gate criteria are met. Do NOT proceed to v2.0.
 
 ---
 
+## v1.9 — GAIA (near-verifiable open-ended tasks)
+
+Goal: Bridge between deterministic and subjective criteria before tackling
+fully open-ended benchmarks.
+
+**Why GAIA:** Multi-step research questions with exact-match or near-match
+answers (Wikipedia-grounded). Three difficulty levels. Tests whether CAT's
+plan-first discipline reduces unnecessary web lookups on hard questions.
+
+**Criterion design:**
+- Exact-string + normalized-string match as deterministic criterion.
+- Fall back to LLM judge only for Level 3 (hardest) questions.
+- Judge called **once at task end**, not per tool call.
+
+---
+
 ## v2.0 — Domain-agnostic expansion (gated on v1.8)
 
 Goal: Prove CAT's discipline advantage transfers across domains, not just
@@ -312,11 +328,16 @@ coding.
 
 2. **Per-benchmark adapters** — one module per benchmark under `cat/bench/`.
 
-3. **Cross-domain analysis** — do failure attribution patterns differ by
+3. **WebArena criterion design** — run WebArena's built-in evaluator
+   (programmatic where possible) + LLM judge on final page state only for
+   ambiguous cases. Judge called **once at task end**, not per tool call.
+   Human eval on a sample of 50 trials as a publication-level sanity check.
+
+4. **Cross-domain analysis** — do failure attribution patterns differ by
    domain? Does the circuit breaker fire more in some domains? Does the
    skill library transfer across domains?
 
-4. **Publication** — write up the full v1.0-v2.0 story: theory, synthetic
+5. **Publication** — write up the full v1.0-v2.0 story: theory, synthetic
    proof, real benchmarks, cross-domain validation.
 
 ---
