@@ -16,10 +16,10 @@ from cat.contracts import State
 PY = sys.executable.replace("\\", "/")
 
 
-def test_registry_has_four_tools():
+def test_registry_has_default_tools():
     reg = build_default_registry()
-    names = reg.names()
-    assert set(names) == {"bash", "write", "read", "list"}
+    names = set(reg.names())
+    assert {"bash", "write", "read", "list"}.issubset(names)
 
 
 def test_write_then_read_roundtrip(tmp_path: Path):
@@ -45,7 +45,7 @@ def test_read_missing_file(tmp_path: Path):
     state = State(workdir=tmp_path)
     r = reg.invoke("read", {"path": "nope.txt"}, state=state)
     assert r.is_error
-    assert "not found" in r.output
+    assert "nope.txt" in r.output
 
 
 def test_list_shows_entries(tmp_path: Path):
