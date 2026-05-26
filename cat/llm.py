@@ -189,6 +189,13 @@ Rules:
 edit file F. DO NOT include investigation or research steps (e.g. "identify", "check what \
 version", "examine", "determine"). The executor will run any needed diagnostics without \
 a dedicated plan step.
+- Be SPECIFIC about WHAT to change. If fixing a function, name the function and \
+the exact change required (e.g. "add PGSSLMODE env var to the ssl_params dict in \
+django/db/backends/postgresql/client.py"), not just "fix SSL handling".
+- If ENVIRONMENT facts include an INITIAL_TEST_FAILURE, use it to derive exact \
+changes needed — name the specific values, fields, or code paths the test expects.
+- If ENVIRONMENT facts provide an oracle test command, make your LAST step \
+"Run <oracle command> and confirm it exits 0."
 - If ENVIRONMENT facts are provided, your plan MUST be grounded in them. Use the actual \
 workdir, actual test command, and actual file paths shown — do not assume or invent them.
 - DO NOT execute anything. DO NOT include reasoning. Output ONLY the JSON object.
