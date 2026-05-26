@@ -265,17 +265,18 @@ class TbSweAgent(TbCatAgent):
             return []
         if passed:
             return []  # Already passing — nothing to inject
-        # Capture failure output: combine summary + last 1500 chars of output
-        failure_detail = evidence.summary or ""
-        extra = (evidence.detail or {}).get("output", "")
-        if extra:
-            failure_detail += f"\n\nTest output (last 1500 chars):\n{extra[-1500:]}"
+        # Get test output from state (criterion stores output in last_criterion_output)
+        test_output = state.kv.get("last_criterion_output", "")
+        # Keep the most informative tail: pytest failure details are at the end
+        failure_output = test_output[-2500:] if len(test_output) > 2500 else test_output
         return [Representation(
             key="initial_test_failure",
             value="tests fail before any changes",
             evidence=(
-                "ORACLE RUN BEFORE ANY CHANGES — use this to write targeted plan steps:\n\n"
-                + failure_detail
+                "ORACLE RUN BEFORE ANY CHANGES — use this to write targeted plan steps.\n"
+                "The following test output shows EXACTLY what is failing and what is expected.\n"
+                "Your plan steps must address these specific failures.\n\n"
+                + failure_output
             ),
         )]
 
