@@ -114,13 +114,24 @@ close some of the solve-rate gap in a rerun.
    injects failure output so planner generates targeted steps (e.g. exact env vars
    missing, not just "fix SSL handling").
 
+**Additional fixes (post v1.4, 2026-05-26):**
+4. Improved planner prompt: require specific function names/file paths and oracle
+   verification step as the plan's last step.
+5. F2 replan now probes `git diff HEAD` — shows partial changes to the new planner
+   so it can correct or build on prior edits rather than replanning from scratch.
+
 **Re-runs in progress (2026-05-26):**
-- swe10-cat-v12: v1.2 code, old oracle bug (3/10 done, comparing as baseline)
-- swe10-cat-v13: all fixes (oracle, REPRESENT, initial failure injection) — IN PROGRESS
+- swe10-cat-v12: v1.2 code, old oracle bug — PARTIAL: 0/4 = 0% (baseline)
+- swe10-cat-v13: oracle + initial failure injection (but empty output bug) — PARTIAL: 3/3 = 100% (sphinx-10323 was ReAct-only before!)
+- swe10-cat-v14: ALL fixes (oracle, initial failure, test output capture, planner prompt, git diff in replan) — IN PROGRESS
 - swe10-react baseline: 3/10 = 30% (swe10-react, May 17)
 
-**After swe10-cat-v13 completes:** Compare solve rates. If CAT approaches parity
-with ReAct, proceed to full swe30-cat-v13 rerun for definitive paper results.
+**Preliminary conclusion:** oracle fix + initial failure injection dramatically improves
+CAT solve rate. v13 partial results (3/3) vs v12 partial (0/4) confirm the bug was
+the dominant cause of CAT's 30% solve rate on swe30.
+
+**After swe10-cat-v14 completes:** Compare v14 vs v13 vs react (3/10=30%).
+If CAT ≥ parity, start swe30-cat-v14 for definitive paper results.
 
 ### v1.4b — terminal-bench-core full benchmark (2026-05-15, needs rerun)
 
