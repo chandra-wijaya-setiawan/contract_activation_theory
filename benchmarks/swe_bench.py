@@ -137,18 +137,38 @@ _b64_2317 = (
     "KQo="
 )
 
-_PROXY_ORACLES: dict[str, str] = {
-    "psf__requests-2317": (
+_b64_1142 = (
+    "aW1wb3J0IHN5cwpzeXMucGF0aC5pbnNlcnQoMCwgJy90ZXN0YmVkJykKaW1wb3J0IHJlcXVlc3RzCgpnZXRf"
+    "cmVxID0gcmVxdWVzdHMuUmVxdWVzdCgnR0VUJywgJ2h0dHA6Ly9leGFtcGxlLmNvbS9nZXQnKS5wcmVwYXJl"
+    "KCkKaGVhZF9yZXEgPSByZXF1ZXN0cy5SZXF1ZXN0KCdIRUFEJywgJ2h0dHA6Ly9leGFtcGxlLmNvbS9oZWFk"
+    "JykucHJlcGFyZSgpCgpvazEgPSAnQ29udGVudC1MZW5ndGgnIG5vdCBpbiBnZXRfcmVxLmhlYWRlcnMKb2sy"
+    "ID0gJ0NvbnRlbnQtTGVuZ3RoJyBub3QgaW4gaGVhZF9yZXEuaGVhZGVycwoKaWYgb2sxIGFuZCBvazI6CiAg"
+    "ICBwcmludCgnUEFTUycpCiAgICBzeXMuZXhpdCgwKQplbHNlOgogICAgcHJpbnQoJ0ZBSUw6IEdFVCBDb250"
+    "ZW50LUxlbmd0aDonLCBnZXRfcmVxLmhlYWRlcnMuZ2V0KCdDb250ZW50LUxlbmd0aCcpKQogICAgcHJpbnQo"
+    "J0ZBSUw6IEhFQUQgQ29udGVudC1MZW5ndGg6JywgaGVhZF9yZXEuaGVhZGVycy5nZXQoJ0NvbnRlbnQtTGVu"
+    "Z3RoJykpCiAgICBzeXMuZXhpdCgxKQo="
+)
+
+
+def _proxy_cmd(b64: str) -> str:
+    """Build a proxy oracle command from a base64-encoded Python script."""
+    return (
         "cd /testbed && "
         "python3 -c '"
         "import sys,base64,tempfile,os,subprocess; "
-        f"code=base64.b64decode(\"{_b64_2317}\"); "
+        f"code=base64.b64decode(\"{b64}\"); "
         "f=tempfile.NamedTemporaryFile(suffix=\".py\",delete=False); "
         "f.write(code); f.close(); "
         "r=subprocess.run([sys.executable,f.name]); "
         "os.unlink(f.name); sys.exit(r.returncode)"
         "'"
-    ),
+    )
+
+
+_PROXY_ORACLES: dict[str, str] = {
+    "psf__requests-2317": _proxy_cmd(_b64_2317),
+    # test_no_content_length requires httpbin; test via prepare() which is network-free
+    "psf__requests-1142": _proxy_cmd(_b64_1142),
 }
 
 
@@ -159,6 +179,7 @@ _PROXY_ORACLES: dict[str, str] = {
 _KNOWN_TASKS = [
     "psf__requests-2931",
     "psf__requests-2317",
+    "psf__requests-1142",
     "matplotlib__matplotlib-25775",
     "scikit-learn__scikit-learn-25102",
 ]
@@ -184,6 +205,11 @@ class TbSweAgent(TbCatAgent):
     Oracles are derived from SWE-bench's own test_patch and FAIL_TO_PASS
     fields — the same tests the harness uses.  No separate oracle truth.
 
+    For any task in the dataset cache, _resolve_test_cmd() auto-generates
+    the oracle command from the task's config.json (test_patch + FAIL_TO_PASS).
+    The ORACLE_CMDS dict provides pre-built commands for well-known tasks and
+    proxy oracles for tasks whose tests require live network.
+
     CLI usage:
         tb runs create --agent-import-path benchmarks.swe_bench:TbSweAgent ...
     """
@@ -197,6 +223,24 @@ class TbSweAgent(TbCatAgent):
     @staticmethod
     def name() -> str:
         return "cat-swe"
+
+    def _resolve_test_cmd(self, logging_dir) -> str:
+        """Auto-generate SWE-bench oracle for any task in the dataset cache.
+
+        Priority:
+          1. Pre-built ORACLE_CMDS entry (proxy oracles for network-dependent tests)
+          2. Dynamic oracle derived from config.json (test_patch + FAIL_TO_PASS)
+          3. Empty string → LLM judge fallback (last resort only)
+        """
+        # Check pre-built dict first (includes proxy oracles)
+        cmd = super()._resolve_test_cmd(logging_dir)
+        if cmd:
+            return cmd
+        # Dynamically build oracle from SWE-bench cache for any task
+        if logging_dir is not None:
+            task_id = logging_dir.parent.parent.name
+            return _swebench_oracle(task_id) or ""
+        return ""
 
 
 # ---------------------------------------------------------------------------
