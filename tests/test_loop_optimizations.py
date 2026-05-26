@@ -414,7 +414,8 @@ def test_f4_streak_resets_on_pass(workdir, recorder):
     contract = Contract.new(
         obligation="write done.txt",
         criteria=[crit],
-        constraints=Constraints(max_tool_calls=10, max_llm_calls=50, max_tokens_total=50_000),
+        # Budget: REPRESENT(9) + iter1(1) + git_diff_in_replan(1) + iter2(1) = 12 calls needed
+        constraints=Constraints(max_tool_calls=20, max_llm_calls=50, max_tokens_total=50_000),
     )
     state = State(workdir=workdir)
 

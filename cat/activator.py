@@ -221,7 +221,7 @@ class Activator:
                 if run.criterion_fail_streak >= replan_threshold:
                     if run.replan_count == 0:
                         # F2: first escape — call planner again with context of what was tried
-                        self._do_replan(contract, run)
+                        self._do_replan(contract, run, state)
                     elif not run.free_form:
                         # F3: second escape — drop plan, run free like ReAct
                         self._enter_free_form(contract, run)
@@ -516,7 +516,7 @@ class Activator:
 
     # ── F2: Dynamic replan ──────────────────────────────────────────────────
 
-    def _do_replan(self, contract: Contract, run: ActivatorRun) -> None:
+    def _do_replan(self, contract: Contract, run: ActivatorRun, state: State) -> None:
         """Call the planner again with a summary of what was tried.
 
         Replaces run.plan with a fresh plan grounded in prior-attempts context.
@@ -537,6 +537,27 @@ class Activator:
                 key="prior_attempts",
                 value="previous approach failed — generate a different plan",
                 evidence=evidence.strip(),
+            ))
+
+        # Probe git diff to show what changes were made so far.
+        # Gives the planner concrete evidence of partial progress — avoids
+        # replanning from scratch when the fix is close (e.g. wrong function edited).
+        diff_result = self.registry.invoke(
+            name="bash",
+            args={"command": "git diff HEAD --stat 2>/dev/null; git diff HEAD 2>/dev/null | head -80", "timeout_s": 15},
+            state=state,
+            recorder=self.recorder,
+            contract_id=contract.id,
+            tool_call_id=f"replan-diff-{uuid.uuid4().hex[:6]}",
+        )
+        contract.cost.tool_calls += 1
+        diff_text = diff_result.output.strip()
+        if diff_text and diff_text != "(no output)":
+            reps = [r for r in reps if r.key != "current_diff"]
+            reps.append(Representation(
+                key="current_diff",
+                value="files changed so far (git diff HEAD)",
+                evidence=f"Changes made so far (may be incomplete or incorrect):\n{diff_text[:2000]}",
             ))
 
         new_steps = call_planner(self.llm, contract.obligation, representations=reps)
