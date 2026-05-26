@@ -79,6 +79,25 @@ tasks whose tests require live network (httpbin etc.).
 **Next:** Complete swe30-react-2 (remaining 19 tasks) for full 30-task comparison.
 Add pass^k metric (3 reps per task) after solve rate is understood.
 
+### v1.4b — terminal-bench-core full benchmark (2026-05-15, needs rerun)
+
+80-task diverse benchmark (terminal-bench-core v0.1.1), 2 attempts each.
+Run with **pre-v1.2 code** — results will improve with current codebase.
+
+**Results (old code):**
+- cat-official (TbCatAgent, window_size=4): **34/160 = 21%**
+- react-official (TbReactAgent): **54/160 = 34%**
+- Gap: ReAct +13pp. 5 tasks where ReAct 2/2 but CAT 0/2.
+
+**cat-targeted-v2 (IN PROGRESS):** Re-running those 5 tasks with v1.2 code:
+  configure-git-webserver, crack-7z-hash.hard, extract-safely,
+  fix-pandas-version, git-workflow-hack.
+
+**v1.2 changes that should help:**
+- F2: replan on deadlock (planner re-decomposes when all steps done but criterion FAIL)
+- F3: planner forbidden from speculating about file paths — must use verified env facts
+- P2: criterion checked every 3 iterations (reduces false-positive judge calls)
+
 ## v1.4 — tau-bench (planned)
 
 Goal: Validate CAT on customer-service conversations (non-coding domain).
