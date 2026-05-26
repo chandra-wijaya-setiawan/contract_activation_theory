@@ -24,9 +24,7 @@ dist/
 *.egg
 
 # Run artifacts (traces, parquet, jsonl)
-data/runs/
-data/bench_runs/
-data/traces/
+data/
 *.parquet
 
 # OS / editor

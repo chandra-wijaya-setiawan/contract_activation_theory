@@ -1,0 +1,16 @@
+date,product,quantity,unit_price
+2024-01-03,Widget A,2,20.00
+2024-01-07,Widget B,1,50.00
+2024-01-10,Widget A,3,20.00
+2024-01-15,Widget C,5,10.00
+2024-01-18,Widget B,2,50.00
+2024-02-02,Widget B,3,50.00
+2024-02-08,Widget A,1,20.00
+2024-02-12,Widget B,1,
+2024-02-19,Widget A,2,20.00
+2024-02-22,Widget B,4,50.00
+2024-03-01,Widget A,3,20.00
+2024-03-05,Widget B,2,50.00
+2024-03-10,Widget C,4,10.00
+2024-03-14,Widget A,1,20.00
+2024-03-20,Widget C,2,
