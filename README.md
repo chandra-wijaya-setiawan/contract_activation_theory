@@ -157,5 +157,5 @@ tests/              # unit tests (mock LLM, no external deps)
 data/tb-runs/       # experiment outputs
 DESIGN.md           # full theory and architecture
 REPORT.md           # Phase 1 synthetic benchmark results
-ROADMAP.md          # experiment phases and findings
+PLAN.md             # project plan v1.0-v2.0
 ```

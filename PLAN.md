@@ -1,4 +1,4 @@
-# Project Plan: CAT v1.4 - v2.0
+# Project Plan: CAT v1.0 – v2.0
 
 Status as of 2026-05-26. See DESIGN.md for theory and architecture.
 
@@ -11,8 +11,22 @@ Status as of 2026-05-26. See DESIGN.md for theory and architecture.
   LLM + tool stack.
 - 2 synthetic tasks (hello-file 1-step, multi-step-refactor 5-step), 12 trials.
 - Result: CAT 6x fewer tool calls, 10x fewer tokens on 5-step task.
+- Criterion: deterministic Python predicate (file existence + content match).
 
-### v1.2 — Expand synthetic coverage (DONE, 2026-05-26)
+### v1.1 — terminal-bench, real Docker tasks (DONE, 2026-05-20)
+
+- Tasks: `hello-world`, `fix-pandas-version`, `csv-to-parquet` (Docker
+  containers via `ssh://cpubox`).
+- Result: **ReAct 88.9% vs CAT 55.6%.** CAT costs 4x more ($0.012 vs
+  $0.003/trial).
+- Root causes:
+  1. LLM judge called 3x per tool call (pre-activation + post-activation +
+     checklist) → 4 LLM calls per tool call vs ReAct's 1.
+  2. LLM judge fires on partial progress → premature contract closure.
+- Criterion: LLM judge on terminal pane output — wrong choice.
+- Lesson: deterministic criterion is mandatory for fair cost comparison.
+
+### v1.2 — Expand synthetic coverage + LIFE-Harness layers (DONE, 2026-05-26)
 
 - 3 new synthetic tasks: bug-fix (~8 steps), multi-file-rename (~10 steps),
   test-generation (~12 steps).
@@ -28,10 +42,44 @@ Status as of 2026-05-26. See DESIGN.md for theory and architecture.
 
 ---
 
+## v1.3 — terminal-bench deterministic criterion rerun
+
+Goal: Rerun v1.1's real Docker tasks with the deterministic test-runner
+criterion. Validates that the Phase 2 root cause analysis was correct before
+scaling to bigger benchmarks.
+
+**Changes already coded:**
+- `activator.py`: removed pre-activation `_verify_criteria` call → judge
+  called once per tool call, not twice.
+- `tb_agents.py`: `_make_test_runner_criterion(session, test_cmd)` — runs
+  `<test_cmd>; echo EXIT:$?`, parses exit code. Zero false-positive rate.
+
+**Run command:**
+```bash
+DOCKER_HOST=ssh://cpubox tb runs create \
+  --dataset-path tasks \
+  --task-id hello-world --task-id fix-pandas-version --task-id csv-to-parquet \
+  --agent-import-path cat.tb_agents:TbCatAgent \
+  --agent-kwarg model_name=openrouter/deepseek/deepseek-v4-flash \
+  --agent-kwarg test_cmd="python -m pytest tests/ -q" \
+  --n-attempts 3 --output-path data/tb-runs/cat-p3 --run-id cat-phase3
+```
+
+**Expected:** LLM calls/tool drops from 4x to ~1.3x (executor + 1 checklist
+judge/step). Solve rate recovers to match or exceed ReAct.
+
+**Criterion:** `exit_code == 0` from test runner — deterministic.
+
+**Prerequisite for v1.4:** If deterministic criterion doesn't recover CAT's
+solve rate on terminal-bench, SWE-bench won't help — same pattern, bigger
+tasks.
+
+---
+
 ## v1.4 — Real benchmark integration
 
-Goal: Move from synthetic tasks to recognized benchmarks with published
-leaderboards so CAT results are directly comparable to other agents.
+Goal: Move from synthetic/terminal-bench tasks to recognized benchmarks with
+published leaderboards so CAT results are directly comparable to other agents.
 
 ### Track A: SWE-bench Lite (coding)
 
@@ -50,7 +98,7 @@ grader runs the test suite.
      instance_id).
    - For each instance: spin up the Docker container, expose bash/write/read
      as CAT capabilities pointing into the container.
-   - Map instance → TaskSpec with oracle pointing to SWE-bench grader.
+   - Map instance -> TaskSpec with oracle pointing to SWE-bench grader.
 
 3. **External grader adapter** (`cat/tasks.py`)
    - Generalize `grade()` to dispatch to external graders (subprocess call to
@@ -63,9 +111,9 @@ grader runs the test suite.
    - Total: 30 instances x 2 agents x 4 reps = 240 trials.
 
 **Risks:**
-- Docker container startup adds ~10-30s per trial → wall time budget.
+- Docker container startup adds ~10-30s per trial -> wall time budget.
 - SWE-bench instances vary wildly in difficulty; need stratified sampling.
-- Some instances require long context (large files) → may hit token budget.
+- Some instances require long context (large files) -> may hit token budget.
 
 ### Track B: tau-bench (customer service, non-coding)
 
@@ -108,7 +156,7 @@ compares final database state against ground truth.
    - Total: 60 instances x 2 agents x 4 reps = 480 trials.
 
 **Risks:**
-- User simulator requires a second LLM call per conversation turn → doubles
+- User simulator requires a second LLM call per conversation turn -> doubles
   token cost and adds latency.
 - tau-bench policy rules are natural language, not predicates — need to decide
   whether to encode them as CAT Conditions or leave them in the system prompt.
@@ -149,12 +197,12 @@ contract on first unrecoverable error.
 
 1. **Failure propagation** (`cat/activator.py`)
    - When a child contract FAILs, parent gets one chance to re-plan.
-   - Parent's Activator detects child FAILED → decomposes again with failure
+   - Parent's Activator detects child FAILED -> decomposes again with failure
      context ("step X failed because Y, find alternative").
-   - If re-plan also fails → parent FAILs with full trace.
+   - If re-plan also fails -> parent FAILs with full trace.
    - Limit: exactly one re-plan per parent. No infinite retry loops.
 
-2. **SUSPENDED → re-ELIGIBLE flow** (`cat/contracts.py`)
+2. **SUSPENDED -> re-ELIGIBLE flow** (`cat/contracts.py`)
    - Contracts blocked on external state (test run in progress, API rate
      limit) transition to SUSPENDED.
    - When the blocking condition clears, contract becomes ELIGIBLE again.
@@ -213,8 +261,8 @@ domains.
 
 5. **Procedural skills (first cut)** (`cat/skills.py`)
    - Mine successful trajectories from v1.4-v1.6 runs.
-   - Extract common decomposition patterns (e.g., "read → diagnose → edit →
-     test → verify" for bug-fix tasks).
+   - Extract common decomposition patterns (e.g., "read -> diagnose -> edit ->
+     test -> verify" for bug-fix tasks).
    - Planner queries skill library before LLM call.
    - Cross-run memory: long-term store of what plans worked.
 
@@ -282,6 +330,27 @@ coding.
 - **Persistence and distribution** — contracts that survive process restarts,
   cross-agent handoff.
 - **Multi-agent** — multiple CAT agents collaborating on decomposed contracts.
+
+---
+
+## Metrics (all versions)
+
+All runs use `cat.metrics.RunMetrics` built from JSONL traces. Key tracked
+signals (aligned with OTel GenAI semantic conventions):
+
+| Signal | OTel field | Why it matters |
+|---|---|---|
+| `tokens_in/out` | `gen_ai.usage.input_tokens` | Primary cost driver |
+| `tokens_cache_read` | `gen_ai.usage.cache_read.*` | Prompt caching savings |
+| `llm_calls_by_role` | `gen_ai.operation` (extended) | Planner/executor/judge overhead split |
+| `tool_calls_by_name` | `gen_ai.tool.name` | Which tools dominate |
+| `tool_errors` | — | Reliability signal |
+| `wall_s_llm / wall_s_tools` | `gen_ai.client.operation.duration` | Where time is spent |
+| `max_prompt_tokens` | — | Context window pressure |
+| `judge_overhead_fraction` | CAT-specific | Judge as % of total tokens |
+| `criterion_checks` | CAT-specific | How often criterion evaluated |
+| `plan_completion_rate` | CAT-specific | Did executor follow the plan? |
+| `budget_*_used_pct` | CAT-specific | Budget utilization per constraint |
 
 ---
 
