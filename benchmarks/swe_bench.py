@@ -43,6 +43,7 @@ import os
 import re
 from pathlib import Path
 
+from cat.contracts import Representation
 from cat.tb_agents import TbCatAgent
 
 # ---------------------------------------------------------------------------
@@ -241,6 +242,42 @@ class TbSweAgent(TbCatAgent):
             task_id = logging_dir.parent.parent.name
             return _swebench_oracle(task_id) or ""
         return ""
+
+    def _initial_representations(self, session, criterion, state) -> list:
+        """Run the oracle before planning and inject the failure output.
+
+        Gives the planner concrete evidence of exactly which assertions fail
+        and what values are expected — enabling targeted step decomposition
+        (e.g. "add PGSSLMODE and PGSSLROOTCERT env vars" instead of the
+        generic "fix SSL env var handling").
+
+        If the tests already pass (no fix needed), returns [] so the planner
+        doesn't get confused by a "no failure" message.
+        Skips if no oracle is available (LLM judge fallback tasks).
+        """
+        from cat.contracts import Evidence
+        # Only run if this criterion is an oracle (deterministic, not LLM judge)
+        if not getattr(criterion, "is_oracle", False):
+            return []
+        try:
+            passed, evidence = criterion.predicate(state)
+        except Exception:
+            return []
+        if passed:
+            return []  # Already passing — nothing to inject
+        # Capture failure output: combine summary + last 1500 chars of output
+        failure_detail = evidence.summary or ""
+        extra = (evidence.detail or {}).get("output", "")
+        if extra:
+            failure_detail += f"\n\nTest output (last 1500 chars):\n{extra[-1500:]}"
+        return [Representation(
+            key="initial_test_failure",
+            value="tests fail before any changes",
+            evidence=(
+                "ORACLE RUN BEFORE ANY CHANGES — use this to write targeted plan steps:\n\n"
+                + failure_detail
+            ),
+        )]
 
 
 # ---------------------------------------------------------------------------

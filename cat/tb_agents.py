@@ -190,6 +190,20 @@ class TbCatAgent(BaseAgent):
             return self._test_cmd.get(task_id, "")
         return ""
 
+    def _initial_representations(
+        self,
+        session: TmuxSession,
+        criterion: "Criterion",
+        state: "State",
+    ) -> "list":
+        """Return Representation objects to inject before the REPRESENT step.
+
+        Subclasses override this to prepend task-specific context (e.g.
+        initial test failure output) so the planner sees it before generating
+        its decomposition.  Default returns [].
+        """
+        return []
+
     def perform_task(
         self,
         instruction: str,
@@ -222,6 +236,11 @@ class TbCatAgent(BaseAgent):
                 constraints=constraints,
             )
             state = State(workdir=workdir)
+
+            # Inject task-specific context before REPRESENT (subclass hook).
+            pre_reps = self._initial_representations(session, criterion, state)
+            if pre_reps:
+                contract.representations = pre_reps
 
             activator = Activator(
                 llm=llm,

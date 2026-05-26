@@ -157,8 +157,11 @@ class Activator:
         # Step 1: INGEST — already done by caller passing in `contract`.
 
         # Step 2: REPRESENT — establish verified facts before any planning.
+        # Pre-set representations (injected by caller before activator.run) are
+        # preserved: REPRESENT probes are appended, not overwritten.
         representer = Representer(registry=self.registry, recorder=self.recorder)
-        contract.representations = representer.represent(contract, state)
+        pre_reps = list(contract.representations or [])
+        contract.representations = pre_reps + representer.represent(contract, state)
 
         # Post-REPRESENT: if a test oracle was discovered, inject it as the primary criterion.
         self._maybe_inject_oracle_criterion(contract)
