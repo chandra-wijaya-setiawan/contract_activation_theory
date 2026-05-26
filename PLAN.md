@@ -90,14 +90,25 @@ Run with **pre-v1.2 code** — results will improve with current codebase.
 - react-official (TbReactAgent): **54/160 = 34%**
 - Gap: ReAct +13pp. 5 tasks where ReAct 2/2 but CAT 0/2.
 
-**cat-targeted-v2 (IN PROGRESS):** Re-running those 5 tasks with v1.2 code:
-  configure-git-webserver, crack-7z-hash.hard, extract-safely,
-  fix-pandas-version, git-workflow-hack.
+**cat-targeted-v2 (DONE, 2026-05-26):** Re-running those 5 tasks with v1.2 code.
 
-**v1.2 changes that should help:**
-- F2: replan on deadlock (planner re-decomposes when all steps done but criterion FAIL)
-- F3: planner forbidden from speculating about file paths — must use verified env facts
-- P2: criterion checked every 3 iterations (reduces false-positive judge calls)
+**Results:**
+- configure-git-webserver: 0/2 FAIL (timed out — multi-service setup still too hard)
+- crack-7z-hash.hard: 0/2 FAIL (timed out — password-cracking needs REPRESENT improvement)
+- extract-safely: 0/2 FAIL (agent doesn't write /app/solution.txt)
+- fix-pandas-version: 1/2 PASS → Pass@2=100% ✓ (v1.2 fixed this one)
+- git-workflow-hack: 0/2 FAIL (timed out)
+- **Overall: 1/5 improved by v1.2 code**
+
+**Root cause analysis:**
+- fix-pandas-version: F2/F3 replan improvements let agent find the right fix path.
+- crack-7z-hash.hard: REPRESENT step too generic — doesn't probe archive type or detect
+  password protection before planning. New probes (file_types, notes) added in v1.3a
+  representer.py should improve future runs.
+- extract-safely: agent doesn't know output must go to /app/solution.txt — needs
+  better task-specific REPRESENT or more literal instruction parsing.
+- configure-git-webserver, git-workflow-hack: long multi-step tasks; timeout is
+  the binding constraint (360s for complex Docker setup tasks).
 
 ## v1.4 — tau-bench (planned)
 

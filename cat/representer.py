@@ -34,6 +34,13 @@ _ANSI_ESC = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 # sentinel, which is short and reliably captured.
 _PROBE_WRITE_CMD = (
     "(pwd && echo '---' && ls -1) > /tmp/cat_r_workdir.txt 2>&1; "
+    # Detailed file listing: sizes, permissions, hidden files — reveals archives, executables, etc.
+    "(ls -la 2>/dev/null | head -35) > /tmp/cat_r_ls_la.txt 2>&1; "
+    # File-type probe on non-text files — detects 7z/zip archives, ELF binaries, etc.
+    # Runs `file` only on regular files to avoid errors on directories.
+    "(find . -maxdepth 1 -type f | head -20 | xargs file 2>/dev/null | head -20) > /tmp/cat_r_filetypes.txt 2>&1; "
+    # README / notes files often contain task hints, passwords, or environment setup instructions.
+    "(cat README* readme* NOTES* notes* HINTS* hints* 2>/dev/null | head -60) > /tmp/cat_r_notes.txt 2>&1; "
     "find . -maxdepth 3 \\( "
     "-name 'run_tests.sh' -o -name 'run-tests.sh' "
     "-o -name 'pytest.ini' -o -name 'setup.py' "
@@ -57,6 +64,9 @@ _PROBE_WRITE_CMD = (
 # of how much other output preceded it.
 _PROBE_READS: list[tuple[str, str]] = [
     ("workdir",      "clear; head -40 /tmp/cat_r_workdir.txt"),
+    ("ls_detail",    "clear; head -35 /tmp/cat_r_ls_la.txt"),
+    ("file_types",   "clear; head -20 /tmp/cat_r_filetypes.txt"),
+    ("notes",        "clear; head -60 /tmp/cat_r_notes.txt"),
     ("test_scripts", "clear; head -15 /tmp/cat_r_scripts.txt"),
     ("test_command", "clear; head -20 /tmp/cat_r_cmd.txt"),
     ("git_state",    "clear; head -10 /tmp/cat_r_git.txt"),

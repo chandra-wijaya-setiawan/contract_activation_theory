@@ -656,7 +656,7 @@ def test_p1_window_prunes_oldest_turn(workdir, recorder):
     contract = Contract.new(
         obligation="write done.txt",
         criteria=[crit],
-        constraints=Constraints(max_tool_calls=10, max_llm_calls=50, max_tokens_total=100_000),
+        constraints=Constraints(max_tool_calls=20, max_llm_calls=50, max_tokens_total=100_000),
     )
     state = State(workdir=workdir)
 
@@ -700,7 +700,7 @@ def test_p1_messages_bounded_by_window(workdir, recorder):
     contract = Contract.new(
         obligation="do work",
         criteria=[crit],
-        # REPRESENT uses 4 probes before the executor loop; give enough budget for
+        # REPRESENT uses 9 tool calls before the executor loop; give enough budget for
         # 12 executor iterations on top of those.
         constraints=Constraints(max_tool_calls=100, max_llm_calls=80, max_tokens_total=500_000),
     )
