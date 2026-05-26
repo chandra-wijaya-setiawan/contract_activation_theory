@@ -103,8 +103,24 @@ close some of the solve-rate gap in a rerun.
 - ReAct: 3/10 = 30% — 1,006K input tokens total
 - CAT uses 5× fewer input tokens at equal solve rate
 
-**Next:** Re-run swe30-cat with v1.2+REPRESENT code to measure improvement.
-Then add pass^k metric (3 reps per task) for consistency measurement.
+**Critical bugs fixed (2026-05-26):**
+1. `TbSweAgent._resolve_test_cmd()`: only 4/30 tasks had deterministic oracle;
+   26/30 used LLM judge → root cause of 30% solve rate.
+   Fix: dynamic oracle from config.json for any task in the dataset cache.
+2. REPRESENT step: missing `file_types` and `notes` probes → planner blind to
+   archive types and task-specific hints (root cause of crack-7z, extract-safely).
+3. Planner had no context of what the test failure looked like before planning.
+   Fix: `TbSweAgent._initial_representations()` runs oracle once pre-REPRESENT,
+   injects failure output so planner generates targeted steps (e.g. exact env vars
+   missing, not just "fix SSL handling").
+
+**Re-runs in progress (2026-05-26):**
+- swe10-cat-v12: v1.2 code, old oracle bug (3/10 done, comparing as baseline)
+- swe10-cat-v13: all fixes (oracle, REPRESENT, initial failure injection) — IN PROGRESS
+- swe10-react baseline: 3/10 = 30% (swe10-react, May 17)
+
+**After swe10-cat-v13 completes:** Compare solve rates. If CAT approaches parity
+with ReAct, proceed to full swe30-cat-v13 rerun for definitive paper results.
 
 ### v1.4b — terminal-bench-core full benchmark (2026-05-15, needs rerun)
 
