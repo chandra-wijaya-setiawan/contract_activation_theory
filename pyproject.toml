@@ -24,7 +24,7 @@ bench = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["cat*"]
+include = ["cat*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

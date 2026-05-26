@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Type
 
 from cat.agents import Agent, AgentResult, CatAgent, ReactAgent
-from cat.tasks import Outcome, TaskSpec, grade as synthetic_grade, resolve_task
+from cat.tasks import Outcome, TaskSpec, all_task_ids, grade as synthetic_grade, resolve_task
 from cat.trace import Recorder
 
 
@@ -52,6 +52,13 @@ def run_one(
     run_root = out_dir / run_id
     work = run_root / "work"
     work.mkdir(parents=True, exist_ok=True)
+
+    seed = task.meta.get("seed")
+    if isinstance(seed, dict):
+        for rel_path, content in seed.items():
+            p = work / rel_path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(content.encode("utf-8"))
 
     agent_cls = AGENTS[agent_name]
     agent = agent_cls(model=model, max_iterations=max_iterations)

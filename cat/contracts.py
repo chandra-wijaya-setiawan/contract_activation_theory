@@ -99,12 +99,18 @@ class Criterion:
 
     `check(state)` is the only path to satisfaction — even a "LLM-judge" criterion
     delegates to a child contract that *produces* state observable by a predicate.
+
+    is_oracle=True marks a test-runner criterion as authoritative: when any oracle
+    criterion exists, the Activator runs ONLY oracle criteria during VERIFY and
+    skips LLM-judge criteria entirely. This ensures the contract closes on real
+    test results, not on model opinion.
     """
     id: str
     description: str
     predicate: CriterionPredicate
     satisfied: bool = False
     last_evidence: Optional[Evidence] = None
+    is_oracle: bool = False
 
     def check(self, state: "State") -> bool:
         ok, ev = self.predicate(state)
@@ -131,6 +137,26 @@ class State:
 
 
 @dataclass
+class Representation:
+    """A verified fact about the current world state, established before decomposition.
+
+    Representations ground the obligation in reality — a contract formed without
+    them is formally incomplete (Hart & Moore: obligations contingent on unverified
+    state of nature). The Representer runs a fixed probe set and populates these
+    before the planner sees the obligation.
+
+    key      — what fact is being established (e.g. "workdir", "test_command")
+    value    — concise verified value (first meaningful line of evidence)
+    evidence — raw probe output that warrants the claim
+    probed_at — UNIX timestamp of the probe run
+    """
+    key: str
+    value: str
+    evidence: str
+    probed_at: float = field(default_factory=time.time)
+
+
+@dataclass
 class Contract:
     """A first-class obligation. The unit of discipline.
 
@@ -154,6 +180,7 @@ class Contract:
     priority: int = 0
     state_reason: Optional[str] = None    # why we transitioned (last)
     depth: int = 0                        # nesting depth from root
+    representations: list[Representation] = field(default_factory=list)  # Step 2: REPRESENT
 
     @classmethod
     def new(

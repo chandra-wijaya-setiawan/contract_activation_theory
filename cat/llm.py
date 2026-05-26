@@ -35,6 +35,7 @@ _PRICING: dict[str, tuple[float, float]] = {
     "deepseek/deepseek-v4-flash": (0.20, 0.50),
     "deepseek/deepseek-v4-pro": (0.85, 2.50),
     "deepseek/deepseek-chat-v3.1": (0.27, 1.10),
+    "deepseek/deepseek-chat-v3-0324": (0.27, 1.10),
     "anthropic/claude-haiku-4-5": (1.00, 5.00),
     "openai/gpt-4o-mini": (0.15, 0.60),
 }
@@ -184,12 +185,18 @@ Rules:
 - Each step MUST be testable by examining files, command outputs, or exit codes.
 - Steps must be ordered: each step's success precondition is the previous step's completion.
 - Prefer 3-8 steps. Fewer if the task is trivial. More only if truly necessary.
+- Each step must describe a concrete state change or action: install X, write Y, run Z, \
+edit file F. DO NOT include investigation or research steps (e.g. "identify", "check what \
+version", "examine", "determine"). The executor will run any needed diagnostics without \
+a dedicated plan step.
+- If ENVIRONMENT facts are provided, your plan MUST be grounded in them. Use the actual \
+workdir, actual test command, and actual file paths shown — do not assume or invent them.
 - DO NOT execute anything. DO NOT include reasoning. Output ONLY the JSON object.
 
 Output a JSON object with this exact shape:
 {
   "steps": [
-    {"id": "s1", "description": "<one short imperative sentence>"},
+    {"id": "s1", "description": "<one short imperative sentence describing an action>"},
     {"id": "s2", "description": "..."}
   ]
 }
@@ -212,11 +219,29 @@ Output ONLY a JSON object:
 """
 
 
-def call_planner(llm: LLM, obligation: str) -> list[dict[str, str]]:
-    """Returns a list of {"id", "description"} step dicts. Empty list on parse failure."""
+def call_planner(
+    llm: LLM,
+    obligation: str,
+    representations: "Optional[list[Any]]" = None,
+) -> list[dict[str, str]]:
+    """Returns a list of {"id", "description"} step dicts. Empty list on parse failure.
+
+    `representations` is an optional list of Representation objects (from cat.contracts).
+    When provided, an ENVIRONMENT section is appended to the user message so the planner
+    produces grounded, non-speculative steps.
+    """
+    env_section = ""
+    if representations:
+        lines: list[str] = []
+        for r in representations:
+            evidence_lines = r.evidence.strip().splitlines()
+            evidence_preview = "\n    ".join(ln for ln in evidence_lines[:12] if ln.strip())
+            lines.append(f"  {r.key}:\n    {evidence_preview}")
+        env_section = "\n\nENVIRONMENT (verified facts — ground your plan in these):\n" + "\n\n".join(lines)
+
     messages = [
         {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-        {"role": "user", "content": f"OBLIGATION:\n{obligation}"},
+        {"role": "user", "content": f"OBLIGATION:\n{obligation}{env_section}"},
     ]
     result = llm.chat(
         messages=messages,

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from cat.runner import AGENTS, run_one
-from cat.tasks import Outcome
+from cat.tasks import Outcome, all_task_ids
 
 
 def _stat(values: list[float]) -> tuple[float, float]:
@@ -67,7 +67,7 @@ def run_matrix(
                         "error": outcome.error,
                         "run_id": outcome.run_id,
                     })
-                    print(f"    → {outcome.verdict} loops={outcome.n_loops} tools={outcome.tool_calls} "
+                    print(f"    -> {outcome.verdict} loops={outcome.n_loops} tools={outcome.tool_calls} "
                           f"tokens={outcome.tokens_in}/{outcome.tokens_out} usd=${outcome.usd:.5f} "
                           f"wall={outcome.wall_s:.1f}s", flush=True)
                 except Exception as exc:  # noqa: BLE001
@@ -81,7 +81,7 @@ def run_matrix(
                         "error": f"{type(exc).__name__}: {exc}",
                         "run_id": None,
                     })
-                    print(f"    → ERROR {type(exc).__name__}: {exc}", flush=True)
+                    print(f"    -> ERROR {type(exc).__name__}: {exc}", flush=True)
 
     # Aggregate per (task, agent)
     agg: dict[tuple[str, str], dict[str, Any]] = {}
@@ -175,7 +175,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="cat.compare")
-    p.add_argument("--tasks", nargs="+", default=["hello-file", "multi-step-refactor"])
+    p.add_argument("--tasks", nargs="+", default=all_task_ids())
     p.add_argument("--agents", nargs="+", default=list(AGENTS.keys()))
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--model", default="openrouter/deepseek/deepseek-v4-flash")
@@ -203,7 +203,7 @@ def main() -> int:
     (sum_dir / f"{stamp}_summary.md").write_text(md, encoding="utf-8")
 
     print()
-    print("─" * 60)
+    print("-" * 60)
     print(md)
     return 0
 

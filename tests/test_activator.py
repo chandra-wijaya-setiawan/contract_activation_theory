@@ -230,3 +230,187 @@ def test_activator_records_contract_state_transitions(workdir, recorder):
     assert "eligible" in states_visited
     assert "active" in states_visited
     assert "fulfilled" in states_visited
+
+
+# ── Criterion history + feedback injection (new feature) ─────────────────────
+
+
+def test_criterion_history_populated_on_fail(workdir, recorder):
+    """Each real criterion FAIL appends (iter_num, evidence) to run.criterion_history."""
+    crit = deterministic_criterion(
+        id="never",
+        description="file.txt must exist",
+        predicate=lambda s: False,
+    )
+    contract = Contract.new(
+        obligation="create file.txt",
+        criteria=[crit],
+        # Representer now makes 6 tool calls (1 write + 5 reads including eval_command).
+        # Budget must be large enough to survive REPRESENT plus a few executor turns.
+        constraints=Constraints(max_tool_calls=20, max_llm_calls=50, max_tokens_total=10_000),
+    )
+    state = State(workdir=workdir)
+    llm = ScriptedLLM(
+        planner_steps=["create file.txt"],
+        executor_turns=[
+            _ScriptedTurn(tool_calls=[{"name": "write", "arguments": {"path": f"f{i}.txt", "content": "x"}}])
+            for i in range(5)
+        ],
+        judge_default_complete=False,
+    )
+    act = Activator(
+        llm=llm,
+        registry=build_default_registry(),
+        recorder=recorder,
+        criterion_check_interval=1,
+        max_criterion_fails=100,  # prevent replan so we get clean history
+    )
+    run = act.run(contract, state)
+    recorder.finalize()
+
+    assert len(run.criterion_history) >= 1
+    for iter_num, evidence in run.criterion_history:
+        assert isinstance(iter_num, int)
+        assert "FAIL" in evidence
+        assert "file.txt must exist" in evidence
+
+
+def test_build_criterion_context_deduplicates():
+    """Repeated identical evidence lines are collapsed; different lines are shown once each."""
+    act = Activator.__new__(Activator)  # _build_criterion_context doesn't use self
+
+    class _FakeRun:
+        criterion_history = [
+            (3,  "FAIL: file.txt must exist"),
+            (6,  "FAIL: file.txt must exist"),
+            (9,  "FAIL: file.txt must exist"),
+            (12, "FAIL: wrong content in file"),
+        ]
+
+    ctx = act._build_criterion_context(_FakeRun())
+    assert "CRITERION FEEDBACK" in ctx
+    # Dedup: "file.txt must exist" appears once, rest collapsed
+    assert ctx.count("FAIL: file.txt must exist") == 1
+    assert "repeated 2x" in ctx
+    # Different evidence is shown
+    assert "FAIL: wrong content in file" in ctx
+    # Ends with the instruction
+    assert "Do not repeat" in ctx
+
+
+def test_build_criterion_context_empty_when_no_history():
+    """Returns empty string when no criterion failures have been recorded yet."""
+    act = Activator.__new__(Activator)
+
+    class _EmptyRun:
+        criterion_history: list = []
+
+    assert act._build_criterion_context(_EmptyRun()) == ""
+
+
+def test_replan_receives_criterion_context(workdir, recorder):
+    """When the replan fires, the planner call's user message contains CRITERION FEEDBACK."""
+    planner_messages: list[list[dict]] = []
+
+    class _CapturingLLM(ScriptedLLM):
+        def chat(self, messages, *, role_tag="executor", **kwargs):
+            if role_tag == "planner":
+                planner_messages.append(list(messages))
+            return super().chat(messages, role_tag=role_tag, **kwargs)
+
+    crit = deterministic_criterion(
+        id="never",
+        description="impossible condition",
+        predicate=lambda s: False,
+    )
+    contract = Contract.new(
+        obligation="do the impossible",
+        criteria=[crit],
+        constraints=Constraints(max_tool_calls=30, max_llm_calls=200, max_tokens_total=100_000),
+    )
+    state = State(workdir=workdir)
+    llm = _CapturingLLM(
+        planner_steps=["step one"],
+        executor_turns=[
+            _ScriptedTurn(tool_calls=[{"name": "write", "arguments": {"path": f"f{i}.txt", "content": "x"}}])
+            for i in range(30)
+        ],
+        judge_default_complete=False,
+    )
+    # max_criterion_fails=4 → replan_threshold=2; replan fires after 2 consecutive fails
+    act = Activator(
+        llm=llm,
+        registry=build_default_registry(),
+        recorder=recorder,
+        criterion_check_interval=1,
+        max_criterion_fails=4,
+        max_iterations=30,
+    )
+    act.run(contract, state)
+    recorder.finalize()
+
+    # At least two planner calls: initial decompose + the replan
+    assert len(planner_messages) >= 2, (
+        f"expected initial + replan planner call, got {len(planner_messages)}"
+    )
+    # The replan call's messages must include criterion feedback
+    replan_content = " ".join(m.get("content", "") for m in planner_messages[1])
+    assert "CRITERION FEEDBACK" in replan_content, (
+        "replan prompt did not contain criterion feedback"
+    )
+    assert "impossible condition" in replan_content, (
+        "replan prompt did not include the failing criterion description"
+    )
+
+
+def test_free_form_prompt_includes_criterion_context(workdir, recorder):
+    """When entering free-form mode the executor prompt contains CRITERION FEEDBACK."""
+    executor_messages: list[list[dict]] = []
+
+    class _CapturingLLM(ScriptedLLM):
+        def chat(self, messages, *, role_tag="executor", **kwargs):
+            if role_tag == "executor":
+                executor_messages.append(list(messages))
+            return super().chat(messages, role_tag=role_tag, **kwargs)
+
+    crit = deterministic_criterion(
+        id="never",
+        description="impossible condition",
+        predicate=lambda s: False,
+    )
+    contract = Contract.new(
+        obligation="do the impossible",
+        criteria=[crit],
+        constraints=Constraints(max_tool_calls=30, max_llm_calls=200, max_tokens_total=100_000),
+    )
+    state = State(workdir=workdir)
+    llm = _CapturingLLM(
+        planner_steps=["step one"],
+        executor_turns=[
+            _ScriptedTurn(tool_calls=[{"name": "write", "arguments": {"path": f"f{i}.txt", "content": "x"}}])
+            for i in range(30)
+        ],
+        judge_default_complete=False,
+    )
+    # With max_criterion_fails=4: replan fires at fail streak=2, free-form at streak=2 again
+    act = Activator(
+        llm=llm,
+        registry=build_default_registry(),
+        recorder=recorder,
+        criterion_check_interval=1,
+        max_criterion_fails=4,
+        max_iterations=30,
+    )
+    act.run(contract, state)
+    recorder.finalize()
+
+    # Find the first executor call whose prompt contains FREE-FORM (the free-form entry message)
+    free_form_calls = [
+        msgs for msgs in executor_messages
+        if any("FREE-FORM" in (m.get("content") or "") for m in msgs)
+    ]
+    assert free_form_calls, "expected at least one free-form executor prompt"
+    all_content = " ".join(m.get("content", "") for m in free_form_calls[0])
+    assert "CRITERION FEEDBACK" in all_content, (
+        "free-form prompt did not contain criterion feedback"
+    )

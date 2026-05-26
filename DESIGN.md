@@ -18,6 +18,7 @@ Execution is the exception, not the default. The default state is dormancy.
 | **Capability** | A latent action the agent can invoke (tool call, sub-contract spawn, computation). Not invoked unless a contract requires it. |
 | **Activation** | The transient grant of execution rights to a capability on behalf of a contract. |
 | **Cost** | Scalar (or vector) over resources: tokens, time, money, side-effects. Selection prefers minimum cost. |
+| **Representation** | A verified statement of fact about the current state of the world, established before contract formation, upon which the contract's obligations are grounded. A contract formed on absent or false representations is formally incomplete: its obligations are contingent on conditions that were never established. |
 
 ## Contract Lifecycle
 
@@ -54,13 +55,14 @@ re-enters the evaluation pool when something changes.
 The loop the user supplied, restated as the runtime's evaluation cycle:
 
 ```
-1. INGEST    receive or detect a contract (external request, event, decomposition)
-2. DECOMPOSE break contract into measurable fulfillment criteria + sub-contracts
-3. EVALUATE  check eligibility: conditions, constraints, resource availability
-4. SELECT    among eligible paths, pick the minimum-cost fulfillment plan
-5. ACTIVATE  grant execution to the chosen capabilities/tools
-6. VERIFY    measure criteria; confirm contract is satisfied
-7. CLOSE     mark FULFILLED, SUSPEND, or re-enter EVALUATE
+1. INGEST      receive or detect a contract (external request, event, decomposition)
+2. REPRESENT   establish verified facts about the current world state
+3. DECOMPOSE   break contract into criteria + sub-contracts, grounded in representations
+4. EVALUATE    check eligibility: conditions, constraints, resource availability
+5. SELECT      among eligible paths, pick the minimum-cost fulfillment plan
+6. ACTIVATE    grant execution to the chosen capabilities/tools
+7. VERIFY      measure criteria; confirm contract is satisfied
+8. CLOSE       mark FULFILLED, SUSPEND, or re-enter EVALUATE
 ```
 
 The loop is **not a thread**. It is a fixed-point evaluator driven by:
@@ -90,13 +92,49 @@ class Contract:
     priority: int
     created_at: Timestamp
     deadline: Timestamp | None
+    representations: list[Representation]   # facts established before decomposition
 ```
 
 Criteria and conditions are **callables over a State snapshot**, not strings to
 be interpreted. This keeps the runtime small and forces the model author to be
 explicit about what "satisfied" means.
 
-## Decomposition (Step 2)
+## Representation (Step 2)
+
+Representation is the only step that runs unconditionally before any obligation is
+decomposed. It is not planning. It is not exploration. It is **fact-finding** —
+the agent probes the environment to establish what is verifiably true right now.
+
+A representation is a `(key, value, evidence)` triple:
+
+- `key` — the fact being established (e.g. `"workdir"`, `"test_command"`, `"repo_state"`)
+- `value` — the verified value (e.g. `"/testbed"`, `"pytest tests/ -q"`, `"clean"`)
+- `evidence` — the raw output that proves it (bash output, file content, etc.)
+
+```python
+@dataclass
+class Representation:
+    key: str
+    value: str
+    evidence: str       # raw probe output — the warrant for the claim
+    probed_at: Timestamp
+```
+
+Representations are **minimal and deterministic** — the agent runs a fixed probe
+set, not open-ended exploration. The probe set may be generic (works for any task)
+or task-type-aware (SWE-bench vs data pipeline). Either way it completes in a
+bounded number of tool calls before the planner sees anything.
+
+The DECOMPOSE step receives the obligation **and** the representations. Plan steps
+must be consistent with what representations say is true. A step that contradicts
+a representation is invalid before it executes — this is enforced at plan
+construction time, not discovered at runtime.
+
+This is what makes the contract non-incomplete in the formal sense: obligations
+are grounded in verified facts, not assumptions about a world the agent has not
+yet observed.
+
+## Decomposition (Step 3)
 
 Decomposition is the only step where the agent uses *judgment* (typically an
 LLM). Everything else is mechanical. The decomposer is itself a contract:
@@ -109,7 +147,7 @@ LLM). Everything else is mechanical. The decomposer is itself a contract:
 This makes decomposition uniform with every other capability. There is no
 "special" planning code outside the contract abstraction.
 
-## Selection (Step 4) — minimum-cost path
+## Selection (Step 5) — minimum-cost path
 
 Given a set of eligible contracts and a set of plans per contract, the selector
 picks the plan minimizing expected cost subject to constraints. v1 uses a
@@ -120,7 +158,7 @@ explicit rules the user can read.
 If selection is itself non-trivial (auctions, fairness), it gets its own
 contract.
 
-## Verification (Step 6)
+## Verification (Step 7)
 
 Every criterion is a pure predicate `(State) -> bool` plus an evidence
 attachment `(State) -> Evidence`. A contract is only marked FULFILLED when
@@ -141,6 +179,7 @@ verifiable structured result.
 | Failure = exception | Failure = explicit contract state with reason |
 | Sub-tasks are stack frames | Sub-tasks are contracts with their own lifecycles |
 | Budget is loose (max_tokens) | Budget is a constraint on the contract |
+| Obligation acted on as-received | Obligation grounded in representations before decomposition |
 
 ## v1 Scope
 
