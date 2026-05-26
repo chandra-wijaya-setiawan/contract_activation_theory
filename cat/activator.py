@@ -539,6 +539,21 @@ class Activator:
                 evidence=evidence.strip(),
             ))
 
+        # Inject latest oracle failure output so the planner sees exact test errors
+        # after partial changes (not just the initial pre-run failure).
+        last_test_output = state.kv.get("last_criterion_output", "")
+        if last_test_output:
+            reps = [r for r in reps if r.key != "latest_test_failure"]
+            reps.append(Representation(
+                key="latest_test_failure",
+                value="oracle output after most recent changes (still failing)",
+                evidence=(
+                    "LATEST TEST FAILURE (after your changes so far):\n"
+                    "Use this to understand what still needs to be fixed.\n\n"
+                    + last_test_output[-2000:]
+                ),
+            ))
+
         # Probe git diff to show what changes were made so far.
         # Gives the planner concrete evidence of partial progress — avoids
         # replanning from scratch when the fix is close (e.g. wrong function edited).
