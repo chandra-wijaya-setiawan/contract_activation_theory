@@ -120,18 +120,30 @@ close some of the solve-rate gap in a rerun.
 5. F2 replan now probes `git diff HEAD` — shows partial changes to the new planner
    so it can correct or build on prior edits rather than replanning from scratch.
 
-**Re-runs in progress (2026-05-26):**
-- swe10-cat-v12: v1.2 code, old oracle bug — PARTIAL: 0/4 = 0% (baseline)
-- swe10-cat-v13: oracle + initial failure injection (but empty output bug) — PARTIAL: 3/3 = 100% (sphinx-10323 was ReAct-only before!)
-- swe10-cat-v14: ALL fixes (oracle, initial failure, test output capture, planner prompt, git diff in replan) — IN PROGRESS
-- swe10-react baseline: 3/10 = 30% (swe10-react, May 17)
+**Re-run results (2026-05-26, DONE):**
 
-**Preliminary conclusion:** oracle fix + initial failure injection dramatically improves
-CAT solve rate. v13 partial results (3/3) vs v12 partial (0/4) confirm the bug was
-the dominant cause of CAT's 30% solve rate on swe30.
+| Run | Code | Solve rate | Notes |
+|---|---|---|---|
+| swe10-react | vanilla ReAct | **3/10 = 30%** | baseline |
+| swe10-cat-v12 | old code, old oracle bug | **1/10 = 10%** | confirms oracle was critical |
+| swe10-cat-v13 | oracle fix + init failure (empty output bug) | **3/10 = 30%** | matches react, solves different tasks |
+| **swe10-cat-v14** | **ALL fixes** | **5/10 = 50%** | **+67% over react!** |
 
-**After swe10-cat-v14 completes:** Compare v14 vs v13 vs react (3/10=30%).
-If CAT ≥ parity, start swe30-cat-v14 for definitive paper results.
+**v14 win/loss breakdown (vs swe10-react):**
+- v14-only wins: scikit-learn-14141, sphinx-10323 (react failed both)
+- Both solve: pytest-6202, matplotlib-26342, sympy-15875
+- Neither: requests-2931, astropy-8872, django-12039, sympy-12489, xarray-4966 (parse_error)
+
+**Token efficiency:**
+- React: 140,381 tokens/solved task
+- CAT v14: 100,089 tokens/solved task (28% cheaper per solution)
+
+**Conclusion:** All 5 improvements combined pushed CAT from 30% (react parity) to 50%
+(+20pp over react). The oracle fix alone wasn't enough (v13 = 30% = react). The test
+output capture fix for the planner was the tipping point (scikit-learn: 29K tokens
+PASS in v14 vs 206K tokens FAIL in v13).
+
+**Next step: Start swe30-cat-v14** for definitive 30-task paper results with all fixes.
 
 ### v1.4b — terminal-bench-core full benchmark (2026-05-15, needs rerun)
 
