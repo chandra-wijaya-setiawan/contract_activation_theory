@@ -54,6 +54,7 @@ criterion.
 **Results:**
 - cat-p4 (3 tasks, 3 attempts): **CAT 100%** — regression fully recovered.
 - cat-p6 vs react-p6 (5 tasks, 2 attempts): **CAT 90% = ReAct 90%** — parity.
+- cat-v13b vs react-v13 (3 tasks, 3 attempts, fresh): **CAT 88.9% = ReAct 88.9%** — exact parity. Pass@2 = 100%.
 - Root cause confirmed: deterministic criterion fixes premature closure.
 
 **Lesson:** LLM judge is only safe called once at task end, not per tool call.
