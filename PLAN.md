@@ -143,7 +143,32 @@ close some of the solve-rate gap in a rerun.
 output capture fix for the planner was the tipping point (scikit-learn: 29K tokens
 PASS in v14 vs 206K tokens FAIL in v13).
 
-**Next step: Start swe30-cat-v14** for definitive 30-task paper results with all fixes.
+---
+
+### swe30-cat-v14 — definitive 30-task rerun with all fixes (DONE, 2026-05-27)
+
+**Results — swe30-cat-v14 vs react baseline (30 tasks, 1 attempt each):**
+
+| Metric | CAT v14 | CAT v0 | ReAct |
+|---|---|---|---|
+| Solve rate | **13/30 = 43.3%** | 9/30 = 30% | 15/30 = 50% |
+| Tokens per solved task | **92K** | 178K | 354K |
+| Token efficiency vs React | **3.8× cheaper** | 2.0× cheaper | baseline |
+
+**Win/loss breakdown (CAT v14 vs React):**
+- CAT v14 only (4 tasks react fails): matplotlib-26342, scikit-learn-26194, pytest-10081, pytest-6202
+- Shared wins (9 tasks): django-10880, django-14787, django-16333, matplotlib-24149, matplotlib-24970, requests-1142, xarray-4966, scikit-learn-14141, sphinx-10323
+- React only (6 tasks): django-11239, django-12039, django-13315, django-14434, sympy-15349, sympy-15875
+- ERR? (parse error): sympy-17318
+
+**New wins vs CAT v0 (7 tasks):** django-14787, matplotlib-24149, matplotlib-24970, matplotlib-26342, requests-1142, scikit-learn-26194, sphinx-10323
+
+**Regressions vs CAT v0 (3 tasks):**
+- django-14434 (v0=PASS): tool timeouts in Docker container — infrastructure issue
+- django-12708 (v0=PASS): deterministic oracle, agent stuck in different approach
+- sympy-15875 (v0=PASS): LLM judge task, new planner generated harder plan
+
+**Conclusion:** v14 fixes push solve rate from 30% → 43.3% (+44% relative), with 3.8× token efficiency advantage over React. CAT uniquely solves 4 tasks that React cannot. Gap to React narrowed from 20pp (v0) to 6.7pp (v14). Main weakness: LLM judge tasks where planner over-specifies and gets stuck.
 
 ### v1.4b — terminal-bench-core full benchmark (2026-05-15, needs rerun)
 
