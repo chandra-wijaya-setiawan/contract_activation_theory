@@ -64,16 +64,17 @@ class ScriptedLLM:
         self.calls: list[dict] = []
 
     def chat(self, messages, *, tools=None, tool_choice=None, response_format=None,
-             max_tokens=None, temperature=0.2, role_tag="executor") -> LLMResult:
+             max_tokens=None, temperature=0.2, role_tag="executor",
+             parent_event_id=None) -> LLMResult:
         self.calls.append({"role_tag": role_tag, "n_messages": len(messages)})
 
-        if role_tag == "planner":
+        if role_tag in ("planner", "stipulator"):
             payload = {"steps": [{"id": f"s{i+1}", "description": d}
                                   for i, d in enumerate(self.planner_steps)]}
             return LLMResult(text=json.dumps(payload), tokens_in=20, tokens_out=20,
                              model=self.model)
 
-        if role_tag == "judge":
+        if role_tag in ("judge", "attestor"):
             try:
                 verdict = next(self._judge_verdicts)
             except StopIteration:
@@ -100,21 +101,54 @@ class ScriptedLLM:
                          model=self.model, usd=0.0001)
 
 
+class _MockExecResult:
+    """Fake docker SDK ExecResult."""
+    def __init__(self, exit_code: int, output: bytes | str):
+        self.exit_code = exit_code
+        self.output = output.encode() if isinstance(output, str) else output
+
+
+class _MockContainer:
+    """Fake docker SDK Container for 1.6.6.1 docker-exec criterion path."""
+    def __init__(self, outputs: list[tuple[int, str]]):
+        self._outputs: Iterator[tuple[int, str]] = iter(outputs)
+        self.execs: list[list[str]] = []
+
+    def exec_run(self, cmd, workdir=None, demux=False, stdout=True, stderr=True):
+        self.execs.append(cmd)
+        try:
+            exit_code, out = next(self._outputs)
+        except StopIteration:
+            exit_code, out = 1, ""
+        return _MockExecResult(exit_code, out)
+
+
 class MockSession:
-    """Fake TmuxSession for testing test-runner criterion."""
+    """Fake TmuxSession for testing test-runner criterion.
+
+    Post-1.6.6.1 the criterion uses session.container.exec_run, not tmux —
+    so MockSession now wraps a MockContainer. Keeps the old tmux methods as
+    no-ops for any tests that still reach for them.
+    """
 
     def __init__(self, pane_outputs: list[str]):
-        self._outputs: Iterator[str] = iter(pane_outputs)
+        # Outputs translate into (exit_code, output) pairs:
+        # legacy `EXIT:0` sentinel → exit_code 0; `EXIT:N` → exit_code N.
+        import re
+        exec_outputs: list[tuple[int, str]] = []
+        for o in pane_outputs:
+            m = re.search(r"EXIT:(\d+)", o)
+            exec_outputs.append((int(m.group(1)) if m else 0, o))
+        self.container = _MockContainer(exec_outputs)
+        # Tmux compat (no-ops):
         self.sent: list[list] = []
 
     def send_keys(self, keys, block=True, max_timeout_sec=90):
         self.sent.append(keys)
 
     def capture_pane(self) -> str:
-        try:
-            return next(self._outputs)
-        except StopIteration:
-            return "EXIT:1"
+        # No longer used by _make_test_runner_criterion post-1.6.6.1
+        return ""
 
 
 @pytest.fixture
@@ -354,238 +388,11 @@ def test_p2_csv_to_parquet_criterion_checks_reduced(workdir, recorder):
 
 
 # ---------------------------------------------------------------------------
-# F4 — fix-pandas scenario: criterion fail streak exits loop early
+# F-series escape hatches (F2 replan, F3 free-form, F4 streak-exit) were
+# removed in v1.5. The single remaining response to criterion-unreachable
+# is the SUSPENDED transition at max_iterations — covered in
+# tests/test_activator.py::test_max_iterations_transitions_to_SUSPENDED.
 # ---------------------------------------------------------------------------
-
-def test_f4_criterion_unreachable_exits_loop(workdir, recorder):
-    """After max_criterion_fails consecutive FAILs, loop exits with criterion_unreachable."""
-    crit = deterministic_criterion(
-        id="never-pass",
-        description="always false",
-        predicate=lambda s: False,
-    )
-    contract = Contract.new(
-        obligation="fix environment",
-        criteria=[crit],
-        constraints=Constraints(max_tool_calls=100, max_llm_calls=200, max_tokens_total=500_000),
-    )
-    state = State(workdir=workdir)
-
-    # Executor keeps making tool calls indefinitely; streak should stop it
-    llm = ScriptedLLM(
-        planner_steps=["upgrade package"],
-        executor_turns=[
-            _ScriptedTurn(tool_calls=[{"name": "write",
-                                       "arguments": {"path": f"f{i}.txt", "content": "x"}}])
-            for i in range(50)
-        ],
-        judge_default=True,
-    )
-    act = Activator(
-        llm=llm,
-        registry=build_default_registry(),
-        recorder=recorder,
-        max_iterations=50,
-        max_criterion_fails=5,
-        criterion_check_interval=1,
-    )
-    run = act.run(contract, state)
-    recorder.finalize()
-
-    assert contract.state == ContractState.FAILED
-    assert run.failure_reason == "criterion_unreachable"
-    # Should stop at iteration 5 (one per-iteration check × 5 streak), not 50
-    assert run.iterations <= 6
-
-
-def test_f4_streak_resets_on_pass(workdir, recorder):
-    """Streak resets to 0 when criterion passes; no false criterion_unreachable.
-
-    Uses judge_default=False so F2 (replan) never fires, isolating streak logic.
-    Writes the target file on the second tool call; criterion passes on iter 2.
-    """
-    wrote = workdir / "done.txt"
-
-    def predicate(state: State) -> tuple[bool, Evidence]:
-        ok = wrote.exists()
-        return ok, Evidence(summary="done" if ok else "not done")
-
-    crit = Criterion(id="done", description="done.txt exists", predicate=predicate)
-    contract = Contract.new(
-        obligation="write done.txt",
-        criteria=[crit],
-        # Budget: REPRESENT(9) + iter1(1) + git_diff_in_replan(1) + iter2(1) = 12 calls needed
-        constraints=Constraints(max_tool_calls=20, max_llm_calls=50, max_tokens_total=50_000),
-    )
-    state = State(workdir=workdir)
-
-    llm = ScriptedLLM(
-        planner_steps=["write done.txt"],
-        executor_turns=[
-            # iter 1: write a dummy file → criterion FAIL (streak=1)
-            _ScriptedTurn(tool_calls=[{"name": "write",
-                                       "arguments": {"path": "tmp.txt", "content": "x"}}]),
-            # iter 2: write done.txt → criterion PASS (streak resets to 0)
-            _ScriptedTurn(tool_calls=[{"name": "write",
-                                       "arguments": {"path": "done.txt", "content": "done"}}]),
-        ],
-        judge_default=False,   # steps never complete → F2 never fires
-    )
-    act = Activator(
-        llm=llm,
-        registry=build_default_registry(),
-        recorder=recorder,
-        max_iterations=10,
-        max_criterion_fails=3,  # higher than failures (1) before pass
-        criterion_check_interval=1,
-    )
-    run = act.run(contract, state)
-    recorder.finalize()
-
-    assert contract.state == ContractState.FULFILLED
-    assert run.criterion_fail_streak == 0  # reset after pass
-
-
-# ---------------------------------------------------------------------------
-# F2 — fix-pandas scenario: re-plan on all-steps-complete + criterion FAIL
-# ---------------------------------------------------------------------------
-
-def test_f2_replan_injected_when_deadlocked(workdir, recorder):
-    """When all steps are judge-complete but criterion still FAIL, a recovery message
-    is appended and step flags are reset."""
-    crit = deterministic_criterion(
-        id="never",
-        description="never satisfied",
-        predicate=lambda s: False,
-    )
-    contract = Contract.new(
-        obligation="fix pandas",
-        criteria=[crit],
-        constraints=Constraints(max_tool_calls=20, max_llm_calls=100, max_tokens_total=200_000),
-    )
-    state = State(workdir=workdir)
-
-    llm = ScriptedLLM(
-        planner_steps=["upgrade pandas", "verify version"],
-        executor_turns=[
-            _ScriptedTurn(tool_calls=[{"name": "write",
-                                       "arguments": {"path": "step.txt", "content": "x"}}])
-            for _ in range(10)
-        ],
-        judge_default=True,   # judge always says steps are complete → triggers deadlock
-    )
-    act = Activator(
-        llm=llm,
-        registry=build_default_registry(),
-        recorder=recorder,
-        max_iterations=20,
-        max_criterion_fails=20,   # high — don't let streak end it; we want F2 to fire
-        criterion_check_interval=1,
-    )
-    run = act.run(contract, state)
-    recorder.finalize()
-
-    # F2 should have injected at least one recovery message (tracked via replan_count,
-    # not via run.messages since P1 pruning may have dropped the raw recovery message)
-    assert run.replan_count >= 1
-
-
-def test_f2_replan_capped_at_two(workdir, recorder):
-    """Re-plan is injected at most twice; after that, streak or budget ends the run."""
-    crit = deterministic_criterion(
-        id="impossible",
-        description="never passes",
-        predicate=lambda s: False,
-    )
-    contract = Contract.new(
-        obligation="impossible",
-        criteria=[crit],
-        constraints=Constraints(max_tool_calls=50, max_llm_calls=200, max_tokens_total=500_000),
-    )
-    state = State(workdir=workdir)
-
-    llm = ScriptedLLM(
-        planner_steps=["step one"],
-        executor_turns=[
-            _ScriptedTurn(tool_calls=[{"name": "write",
-                                       "arguments": {"path": f"f{i}.txt", "content": "x"}}])
-            for i in range(40)
-        ],
-        judge_default=True,
-    )
-    act = Activator(
-        llm=llm,
-        registry=build_default_registry(),
-        recorder=recorder,
-        max_iterations=40,
-        max_criterion_fails=50,  # don't let streak stop it — cap test is for F2
-        criterion_check_interval=1,
-    )
-    run = act.run(contract, state)
-    recorder.finalize()
-
-    assert run.replan_count <= 2
-
-
-def test_f2_fix_pandas_full_scenario(workdir, recorder):
-    """Fix-pandas scenario: planner emits action steps (F3), executor upgrades
-    package, judge marks done, criterion FAIL triggers replan (F2), then streak
-    fires (F4) — whole sequence stays within budget."""
-    crit = deterministic_criterion(
-        id="tests-pass",
-        description="pytest exit 0",
-        predicate=lambda s: False,   # simulate pytest always failing (tests/ missing)
-    )
-    contract = Contract.new(
-        obligation="Upgrade pandas so dtype_backend is supported",
-        criteria=[crit],
-        constraints=Constraints(
-            max_tool_calls=30,
-            max_llm_calls=100,
-            max_tokens_total=200_000,
-            max_usd=5.0,
-        ),
-    )
-    state = State(workdir=workdir)
-
-    llm = ScriptedLLM(
-        planner_steps=[
-            "Upgrade pandas to >=2.0 to support dtype_backend",
-            "Upgrade pyarrow to >=7.0 to satisfy pandas 2.0 dependency",
-            "Run the data processor script to confirm it works",
-        ],
-        executor_turns=[
-            _ScriptedTurn(tool_calls=[{"name": "bash",
-                                       "arguments": {"command": "pip install pandas>=2.0"}}]),
-            _ScriptedTurn(tool_calls=[{"name": "bash",
-                                       "arguments": {"command": "pip install pyarrow>=7.0"}}]),
-            _ScriptedTurn(tool_calls=[{"name": "bash",
-                                       "arguments": {"command": "python -m src.data_processor"}}]),
-        ] + [
-            _ScriptedTurn(tool_calls=[{"name": "bash",
-                                       "arguments": {"command": f"diagnostic_{i}"}}])
-            for i in range(15)
-        ],
-        judge_default=True,   # all steps immediately complete
-    )
-    act = Activator(
-        llm=llm,
-        registry=build_default_registry(),
-        recorder=recorder,
-        max_iterations=30,
-        max_criterion_fails=5,         # F4: exits after 5 consecutive criterion FAILs
-        criterion_check_interval=1,
-    )
-    run = act.run(contract, state)
-    recorder.finalize()
-
-    # Should fail via criterion_unreachable or replan+streak, not budget
-    assert contract.state == ContractState.FAILED
-    # Must not have burned through all 30 iterations
-    assert run.iterations < 20
-    # At least one replan attempt
-    assert run.replan_count >= 1
-
 
 # ---------------------------------------------------------------------------
 # P1 — Sliding window + prior attempts log
@@ -723,7 +530,6 @@ def test_p1_messages_bounded_by_window(workdir, recorder):
         recorder=recorder,
         max_iterations=12,
         window_size=window,
-        max_criterion_fails=50,  # don't let streak stop it
     )
     run = act.run(contract, state)
     recorder.finalize()

@@ -476,7 +476,8 @@ def _build_from_events(events: list[dict]) -> RunMetrics:
                 m.tool_errors += 1
 
         # ── CAT loop ─────────────────────────────────────────────────────
-        elif kind == "capability_activate":
+        elif kind in ("capability_perform", "capability_invoke", "capability_activate"):
+            # capability_perform is the v1.6.2.9 name (was: capability_invoke / capability_activate).
             m.iterations += 1
 
         elif kind == "criterion_check":
@@ -490,7 +491,8 @@ def _build_from_events(events: list[dict]) -> RunMetrics:
                 if p.get("satisfied") and m.criterion_first_satisfied is None:
                     m.criterion_first_satisfied = m.iterations
 
-        elif kind == "contract_decompose":
+        elif kind in ("contract_stipulate", "contract_decompose"):
+            # contract_stipulate is the new name (PRD 1.6.2.9); accept both.
             steps = p.get("steps", [])
             m.plan_steps_total += len(steps)
 

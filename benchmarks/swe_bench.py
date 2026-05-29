@@ -90,29 +90,64 @@ def _swebench_oracle(
     config = json.loads(config_path.read_text())
     test_patch: str = config.get("test_patch", "")
     fail_to_pass: list[str] = json.loads(config.get("FAIL_TO_PASS", "[]"))
+    # 1.6.6.6 — include PASS_TO_PASS so the oracle matches the harness verifier.
+    # The harness checks BOTH sets; previously our oracle only checked
+    # FAIL_TO_PASS, allowing the agent to satisfy the failing tests while
+    # silently regressing existing ones (matplotlib-24149 case).
+    pass_to_pass: list[str] = json.loads(config.get("PASS_TO_PASS", "[]"))
 
     # Extract only added lines from the patch for body analysis
     added_lines = "\n".join(
         line[1:] for line in test_patch.splitlines() if line.startswith("+")
     )
 
-    safe_tests = [
+    safe_fail = [
         t for t in fail_to_pass
         if not _test_func_needs_network(t.split("::")[-1], added_lines)
     ]
+    safe_pass = [
+        t for t in pass_to_pass
+        if not _test_func_needs_network(t.split("::")[-1], added_lines)
+    ]
 
-    if not safe_tests:
+    if not safe_fail:
         return ""
 
-    patch_b64 = base64.b64encode(test_patch.encode()).decode()
-    test_ids = " ".join(safe_tests)
+    # Cap PASS_TO_PASS at a reasonable number so we don't run 1000s of tests
+    # on every oracle check. Pick a random-but-deterministic sample.
+    # 30 is a reasonable balance: enough to catch obvious regressions,
+    # not so many that the oracle takes minutes.
+    MAX_REGRESSION_SAMPLE = 30
+    if len(safe_pass) > MAX_REGRESSION_SAMPLE:
+        # Hash-based deterministic subsample keyed by task_id
+        import hashlib
+        h = int(hashlib.sha256(task_id.encode()).hexdigest()[:8], 16)
+        # Stable rotation over the sorted list
+        sorted_pass = sorted(safe_pass)
+        start = h % len(sorted_pass)
+        safe_pass = (sorted_pass[start:] + sorted_pass[:start])[:MAX_REGRESSION_SAMPLE]
 
-    # Apply patch (idempotent — git apply --ignore-whitespace tolerates
-    # already-applied hunks) then run the safe FAIL_TO_PASS subset.
-    # No pipes around pytest: exit code flows through to EXIT:$? sentinel.
+    patch_b64 = base64.b64encode(test_patch.encode()).decode()
+    test_ids = " ".join(safe_fail + safe_pass)
+
+    # 1.6.6.4 fix: restore canonical test files BEFORE applying test_patch.
+    # Why: during a run the performer may have edited files under tests/ (a
+    # mistake — see PRD 1.6.6.5 prompt fix). If we don't restore, the agent's
+    # oracle sees a broken test setup (pytest exit_code=2) even when the
+    # source-code fix is correct. The harness's post-test verifier already
+    # does this restore implicitly; aligning the agent's oracle with the
+    # harness eliminates the divergence.
+    #
+    # `git checkout -- tests/` (and similar globs) restore any tracked test
+    # files the agent touched. Then test_patch applies cleanly.
     return (
         f"cd /testbed && "
+        # Restore canonical test state (silently ignore if those paths don't exist)
+        f"git checkout -- tests/ 2>/dev/null; "
+        f"git checkout -- 'test_*' 'tests_*' '*_tests' 2>/dev/null; "
+        # Apply the canonical test_patch (idempotent for already-applied hunks)
         f"echo '{patch_b64}' | base64 -d | git apply --ignore-whitespace - 2>/dev/null; "
+        # Run the safe FAIL_TO_PASS subset; no pipes around pytest (exit code preservation)
         f"PYTHONPATH=/testbed pytest {test_ids} -x -q --tb=short"
     )
 
@@ -218,7 +253,6 @@ class TbSweAgent(TbCatAgent):
     def __init__(self, **kwargs: object) -> None:
         kwargs.setdefault("test_cmd", ORACLE_CMDS)
         kwargs.setdefault("max_iterations", 60)
-        kwargs.setdefault("max_criterion_fails", 20)
         super().__init__(**kwargs)
 
     @staticmethod
@@ -244,32 +278,61 @@ class TbSweAgent(TbCatAgent):
         return ""
 
     def _initial_representations(self, session, criterion, state) -> list:
-        """Run the oracle before planning and inject the failure output.
+        """Inject SWE-bench convention + (when failing) the oracle's failure output.
 
-        Gives the planner concrete evidence of exactly which assertions fail
-        and what values are expected — enabling targeted step decomposition
-        (e.g. "add PGSSLMODE and PGSSLROOTCERT env vars" instead of the
-        generic "fix SSL env var handling").
+        Two facts the stipulator needs to plan correctly:
 
-        If the tests already pass (no fix needed), returns [] so the planner
-        doesn't get confused by a "no failure" message.
-        Skips if no oracle is available (LLM judge fallback tasks).
+        1. SWE-bench convention (1.6.6.11): the harness supplies the regression
+           test via test_patch. The agent must NOT plan to add tests — those
+           steps are impossible for the performer (who is forbidden from
+           editing test files) and cannot be attested. Without this guidance
+           the stipulator plans "add a regression test for …" as step 1 and
+           the loop deadlocks on it (see django-13315 trace, 2026-05-28).
+
+        2. Initial test failure (existing): exact assertion/value details so
+           plan steps can be targeted (e.g. "add PGSSLMODE env var" not "fix
+           SSL handling").
+
+        Skips the failure injection if no oracle is available (LLM judge
+        fallback) or tests already pass.
         """
         from cat.contracts import Evidence
-        # Only run if this criterion is an oracle (deterministic, not LLM judge)
+
+        # Fact 1 (always present for SWE-bench): the harness-test convention.
+        reps = [Representation(
+            key="swe_bench_test_convention",
+            value="harness supplies the regression test",
+            evidence=(
+                "SWE-BENCH CONVENTION — read carefully before planning:\n"
+                "  • The benchmark harness applies the regression test patch automatically "
+                "before running the oracle. You do NOT need to add tests.\n"
+                "  • Your plan must contain ONLY steps that modify SOURCE CODE "
+                "(e.g. files under django/, sphinx/, sympy/, src/, lib/), "
+                "plus a final 'run oracle command' step.\n"
+                "  • DO NOT plan steps like 'add a regression test', 'write a test for…', "
+                "or 'create a test method'. Those steps are impossible: the performer "
+                "is forbidden from editing test files, and the attestor will never "
+                "approve a non-existent test as complete.\n"
+                "  • If the issue description mentions a test scenario, treat it as a "
+                "specification of the BUG, not as a step in your plan. Fix the source "
+                "code so the harness-supplied test will pass."
+            ),
+        )]
+
+        # Fact 2 (only if oracle exists and currently fails): the failure details.
         if not getattr(criterion, "is_oracle", False):
-            return []
+            return reps
         try:
             passed, evidence = criterion.predicate(state)
         except Exception:
-            return []
+            return reps
         if passed:
-            return []  # Already passing — nothing to inject
+            return reps  # Already passing — nothing to inject
         # Get test output from state (criterion stores output in last_criterion_output)
         test_output = state.kv.get("last_criterion_output", "")
         # Keep the most informative tail: pytest failure details are at the end
         failure_output = test_output[-2500:] if len(test_output) > 2500 else test_output
-        return [Representation(
+        reps.append(Representation(
             key="initial_test_failure",
             value="tests fail before any changes",
             evidence=(
@@ -278,7 +341,8 @@ class TbSweAgent(TbCatAgent):
                 "Your plan steps must address these specific failures.\n\n"
                 + failure_output
             ),
-        )]
+        ))
+        return reps
 
 
 # ---------------------------------------------------------------------------

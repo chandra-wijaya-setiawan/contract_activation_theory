@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from cat.contracts import State
-from cat.trace import FailureLayer, Recorder, TraceEvent, utcnow_iso
+from cat.trace import Recorder, TraceEvent, utcnow_iso
+import base64
 
 
 OUTPUT_CAP_BYTES = 8_000
@@ -46,16 +47,12 @@ class ToolResult:
     wall_s: float = 0.0
 
 
-Precondition = Callable[[dict[str, Any], State], Optional[str]]
-
-
 @dataclass
 class Capability:
     name: str
     description: str
     json_schema: dict[str, Any]
     handler: Callable[[dict[str, Any], State], ToolResult]
-    preconditions: list[Precondition] = field(default_factory=list)
 
 
 class CapabilityRegistry:
@@ -73,8 +70,8 @@ class CapabilityRegistry:
     def names(self) -> list[str]:
         return list(self._caps)
 
-    def tool_schemas(self) -> list[dict[str, Any]]:
-        """OpenAI-compatible tool schemas for chat.completions(tools=...)."""
+    def tool_schemas(self, only: Optional[set[str]] = None) -> list[dict[str, Any]]:
+        """OpenAI-compatible tool schemas. If `only` is given, restrict to that grant."""
         return [
             {
                 "type": "function",
@@ -85,6 +82,7 @@ class CapabilityRegistry:
                 },
             }
             for c in self._caps.values()
+            if only is None or c.name in only
         ]
 
     def invoke(
@@ -95,6 +93,7 @@ class CapabilityRegistry:
         recorder: Optional[Recorder] = None,
         contract_id: Optional[str] = None,
         tool_call_id: Optional[str] = None,
+        parent_event_id: Optional[str] = None,
     ) -> ToolResult:
         cap = self._caps.get(name)
         if cap is None:
@@ -102,32 +101,16 @@ class CapabilityRegistry:
 
         call_id = tool_call_id or f"tc-{uuid.uuid4().hex[:8]}"
 
-        for pre in cap.preconditions:
-            violation = pre(args, state)
-            if violation is not None:
-                if recorder is not None:
-                    recorder.append(TraceEvent(
-                        event_id=f"fail-{uuid.uuid4().hex[:6]}",
-                        parent_id=contract_id,
-                        ts=utcnow_iso(),
-                        kind="failure_attribution",
-                        payload={
-                            "layer": "environment_contract",
-                            "description": violation,
-                            "tool": name,
-                            "args": args,
-                        },
-                    ))
-                return ToolResult(
-                    tool=name, is_error=True,
-                    output=f"[PRECONDITION] {violation}",
-                    detail={"precondition_failed": True, "failure_layer": "environment_contract"},
-                )
+        # parent_event_id chains the tool_call to its triggering event (the
+        # capability_invoke that issued it, or the REPRESENT probe write).
+        # Falls back to contract_id only for legacy / test callers; new code
+        # should always pass parent_event_id.
+        tc_parent = parent_event_id if parent_event_id is not None else contract_id
 
         if recorder is not None:
             recorder.append(TraceEvent(
                 event_id=call_id,
-                parent_id=contract_id,
+                parent_id=tc_parent,
                 ts=utcnow_iso(),
                 kind="tool_call",
                 payload={"tool": name, "args": args, "tool_call_id": call_id},
@@ -309,29 +292,6 @@ def _h_str_replace(args: dict[str, Any], state: State) -> ToolResult:
                       output=f"replaced 1 occurrence in {resolved.relative_to(state.workdir.resolve())}")
 
 
-# ── Preconditions for built-in capabilities ───────────────────────────────
-
-
-def _pre_read_file_exists(args: dict[str, Any], state: State) -> Optional[str]:
-    path = args.get("path")
-    if not isinstance(path, str) or not path:
-        return "missing 'path' argument"
-    try:
-        resolved = _resolve_inside_workdir(path, state.workdir)
-    except ValueError:
-        return f"path '{path}' is outside workdir"
-    if not resolved.exists():
-        return f"file '{path}' does not exist; use 'list' to see available files"
-    return None
-
-
-def _pre_bash_non_empty(args: dict[str, Any], state: State) -> Optional[str]:
-    cmd = str(args.get("command", "")).strip()
-    if not cmd:
-        return "empty command"
-    return None
-
-
 def build_default_registry() -> CapabilityRegistry:
     reg = CapabilityRegistry()
     reg.register(Capability(
@@ -346,7 +306,6 @@ def build_default_registry() -> CapabilityRegistry:
             "required": ["command"],
         },
         handler=_h_bash,
-        preconditions=[_pre_bash_non_empty],
     ))
     reg.register(Capability(
         name="write",
@@ -372,7 +331,6 @@ def build_default_registry() -> CapabilityRegistry:
             "required": ["path"],
         },
         handler=_h_read,
-        preconditions=[_pre_read_file_exists],
     ))
     reg.register(Capability(
         name="list",
@@ -632,3 +590,720 @@ def workdir_snapshot(workdir: Path, max_entries: int = 30) -> str:
     except Exception as exc:  # noqa: BLE001
         lines.append(f"(snapshot error: {exc})")
     return "\n".join(lines) or "(empty workdir)"
+
+
+# ── Docker exec registry (PRD 1.6.6.1) ─────────────────────────────────────
+#
+# Replaces tmux-based execution for non-interactive benchmarks (primarily
+# SWE-bench). Each tool dispatches via docker SDK's `container.exec_run()` —
+# a direct subprocess in the container. No tmux capture, no sentinel
+# scraping, no pane viewport limits.
+#
+# This is the "right execution backend per domain" choice (see DESIGN.md
+# "Benchmark-adapter pattern"). The tmux registry stays available for
+# benchmarks whose tasks genuinely need an interactive shell.
+
+
+def build_docker_registry(container: "object", default_workdir: str = "/testbed") -> "CapabilityRegistry":
+    """Build a CapabilityRegistry that routes all tool calls through `docker exec`.
+
+    `container` must be a docker SDK `Container` (e.g., from a
+    `terminal_bench.terminal.tmux_session.TmuxSession.container`).
+
+    Tools provided (parallel to the tmux registry):
+      bash         — `docker exec` of a shell command
+      read         — `docker exec cat <path>`
+      list         — `docker exec ls -la <path>`
+      write        — base64-encoded `echo | base64 -d > <path>` in-container
+      str_replace  — temp Python script via base64, exec'd in-container
+
+    Reliability win vs tmux: no `clear` + `capture_pane` + sentinel-regex
+    round-trip per call; exit codes come directly from `exec_run`.
+    """
+
+    def _exec(cmd_argv: list[str], workdir: str = default_workdir) -> tuple[int, str]:
+        """Run a docker exec; return (exit_code, combined_output_str)."""
+        try:
+            res = container.exec_run(
+                cmd=cmd_argv,
+                workdir=workdir,
+                demux=False,
+                stdout=True,
+                stderr=True,
+            )
+            output = ""
+            if res.output is not None:
+                output = res.output.decode("utf-8", errors="replace") \
+                    if isinstance(res.output, (bytes, bytearray)) else str(res.output)
+            return int(res.exit_code or 0), output
+        except Exception as exc:  # noqa: BLE001
+            return -1, f"docker exec error: {type(exc).__name__}: {exc}"
+
+    def _bash(args: dict, state: State) -> ToolResult:
+        cmd = str(args.get("command", "")).strip()
+        if not cmd:
+            return ToolResult(tool="bash", is_error=True, output="empty command")
+        timeout_s = float(args.get("timeout_s", 60.0))
+        # bash -lc = login shell → sources /etc/profile + ~/.bashrc so PATH
+        # includes the container's conda env (testbed) and pytest, python, etc.
+        # are findable. Without this, docker exec inherits only ENV vars set
+        # at container build time, which can miss interpreter PATHs (sphinx,
+        # some sympy envs). See PRD 1.6.6 follow-up note.
+        wrapped = f"timeout {int(timeout_s)} bash -lc {shlex.quote(cmd)}"
+        exit_code, output = _exec(["sh", "-c", wrapped])
+        return ToolResult(
+            tool="bash",
+            is_error=(exit_code != 0),
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+            detail={"returncode": exit_code, "command": cmd},
+        )
+
+    def _read(args: dict, state: State) -> ToolResult:
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return ToolResult(tool="read", is_error=True, output="missing 'path'")
+        exit_code, output = _exec(["cat", path])
+        if exit_code != 0:
+            return ToolResult(tool="read", is_error=True, output=output[:OUTPUT_CAP_BYTES])
+        return ToolResult(
+            tool="read",
+            is_error=False,
+            output=_truncate(output, READ_CAP_BYTES),
+            detail={"bytes": len(output.encode("utf-8", errors="replace"))},
+        )
+
+    def _list(args: dict, state: State) -> ToolResult:
+        path = str(args.get("path", "."))
+        exit_code, output = _exec(["ls", "-la", path])
+        return ToolResult(
+            tool="list",
+            is_error=(exit_code != 0),
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+        )
+
+    def _write(args: dict, state: State) -> ToolResult:
+        path = args.get("path")
+        content = args.get("content", "")
+        if not isinstance(path, str) or not path:
+            return ToolResult(tool="write", is_error=True, output="missing 'path'")
+        b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        parent = str(Path(path).parent) or "."
+        # mkdir then write — single shell command to keep it atomic.
+        cmd = f"mkdir -p {shlex.quote(parent)} && echo {b64} | base64 -d > {shlex.quote(path)}"
+        exit_code, output = _exec(["sh", "-c", cmd])
+        if exit_code != 0:
+            return ToolResult(tool="write", is_error=True, output=output[:OUTPUT_CAP_BYTES])
+        return ToolResult(
+            tool="write",
+            is_error=False,
+            output=f"wrote {len(content)} chars to {path}",
+            detail={"path": path, "bytes": len(content.encode('utf-8'))},
+        )
+
+    def _str_replace(args: dict, state: State) -> ToolResult:
+        path = args.get("path")
+        old_str = args.get("old_str", "")
+        new_str = args.get("new_str", "")
+        if not isinstance(path, str) or not path:
+            return ToolResult(tool="str_replace", is_error=True, output="missing 'path'")
+        if not old_str:
+            return ToolResult(tool="str_replace", is_error=True, output="missing 'old_str'")
+        # Write a small Python script into /tmp via base64, then exec it.
+        # Avoids fragile shell quoting on arbitrary old_str / new_str.
+        old_b64 = base64.b64encode(old_str.encode("utf-8")).decode("ascii")
+        new_b64 = base64.b64encode(new_str.encode("utf-8")).decode("ascii")
+        script_text = (
+            "import base64, sys\n"
+            f"old = base64.b64decode('{old_b64}').decode('utf-8')\n"
+            f"new = base64.b64decode('{new_b64}').decode('utf-8')\n"
+            f"path = {path!r}\n"
+            "try:\n"
+            "    content = open(path).read()\n"
+            "except FileNotFoundError:\n"
+            "    print(f'ERROR: file not found: {path}'); sys.exit(2)\n"
+            "n = content.count(old)\n"
+            "if n == 0:\n"
+            "    print('ERROR: old_str not found in file'); sys.exit(2)\n"
+            "if n > 1:\n"
+            "    print(f'ERROR: {n} matches — make old_str more specific'); sys.exit(3)\n"
+            "open(path, 'w').write(content.replace(old, new, 1))\n"
+            f"print(f'OK: replaced 1 occurrence in {path}')\n"
+        )
+        script_b64 = base64.b64encode(script_text.encode("utf-8")).decode("ascii")
+        tmp = f"/tmp/cat_edit_{uuid.uuid4().hex[:8]}.py"
+        # Stage the script then execute, all in one shell call.
+        stage_and_run = (
+            f"echo {script_b64} | base64 -d > {tmp} && python3 {tmp}; rc=$?; rm -f {tmp}; exit $rc"
+        )
+        exit_code, output = _exec(["sh", "-c", stage_and_run])
+        return ToolResult(
+            tool="str_replace",
+            is_error=(exit_code != 0),
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+            detail={"returncode": exit_code, "path": path},
+        )
+
+    def _rg(args: dict, state: State) -> ToolResult:
+        """ripgrep-flavored search; falls back to `grep -rn` when rg unavailable.
+
+        1.6.6.2 — sharper search primitive than `bash("grep ...")`. Same
+        interface whether rg is installed or not; the wrapper picks at
+        invoke-time. On large codebases (Django, sympy) ripgrep is 10-100×
+        faster than grep.
+
+        1.6.6.10 — `context: int` adds -C N (both rg and grep), so callers can
+        ask for N lines of surrounding context in one call instead of grep
+        then read.
+        """
+        pattern = args.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            return ToolResult(tool="rg", is_error=True, output="missing 'pattern'")
+        paths = args.get("paths") or "."
+        if isinstance(paths, list):
+            paths_str = " ".join(shlex.quote(str(p)) for p in paths)
+        else:
+            paths_str = shlex.quote(str(paths))
+        flags = str(args.get("flags") or "")
+        ctx = args.get("context")
+        if isinstance(ctx, (int, float)) and int(ctx) > 0:
+            # -C is supported by both rg and POSIX grep, so a single flag works
+            # for the fallback path too.
+            flags = (flags + f" -C {int(ctx)}").strip()
+        rg_cmd = f"rg {flags} -- {shlex.quote(pattern)} {paths_str}"
+        grep_cmd = f"grep -rn {flags} -- {shlex.quote(pattern)} {paths_str}"
+        sh = f"if command -v rg >/dev/null 2>&1; then {rg_cmd}; else {grep_cmd}; fi"
+        exit_code, output = _exec(["bash", "-lc", sh])
+        # grep returns 1 on "no matches"; treat that as not-an-error
+        is_err = (exit_code not in (0, 1))
+        return ToolResult(
+            tool="rg",
+            is_error=is_err,
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+            detail={"returncode": exit_code, "pattern": pattern, "paths": paths},
+        )
+
+    def _apply_patch(args: dict, state: State) -> ToolResult:
+        """Apply a unified-diff patch via `git apply --reject`.
+
+        1.6.6.7 — closes the django-13315-style gap where the agent's plan said
+        "apply this patch" but it had to hand-craft a heredoc + git apply call.
+        Hermes-style: patch is a first-class tool, takes a unified-diff blob.
+
+        --reject keeps partial application: hunks that don't match get written
+        to .rej files instead of aborting the whole patch. The agent can then
+        read the .rej and fix the surviving hunks. --whitespace=fix
+        absorbs trailing-whitespace mismatches which kill ~10% of diffs.
+        """
+        patch = args.get("patch")
+        if not isinstance(patch, str) or not patch.strip():
+            return ToolResult(tool="apply_patch", is_error=True, output="missing 'patch' (unified diff)")
+        workdir = str(args.get("workdir") or default_workdir)
+        # Stage the diff via base64 to avoid quoting/heredoc fragility.
+        b64 = base64.b64encode(patch.encode("utf-8")).decode("ascii")
+        tmp = f"/tmp/cat_patch_{uuid.uuid4().hex[:8]}.diff"
+        # Write patch → git apply --reject → capture .rej files → exit
+        sh = (
+            f"echo {b64} | base64 -d > {tmp} && "
+            f"cd {shlex.quote(workdir)} && "
+            f"git apply --reject --whitespace=fix {tmp}; rc=$?; "
+            # List any .rej files so the agent can see partial application.
+            f"echo '---REJECTS---'; "
+            f"find . -name '*.rej' -newer {tmp} 2>/dev/null | head -20; "
+            f"rm -f {tmp}; exit $rc"
+        )
+        exit_code, output = _exec(["bash", "-lc", sh])
+        # exit 0 = all hunks applied; nonzero = some rejected (still useful)
+        return ToolResult(
+            tool="apply_patch",
+            is_error=(exit_code != 0),
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+            detail={"returncode": exit_code, "workdir": workdir},
+        )
+
+    def _multi_edit(args: dict, state: State) -> ToolResult:
+        """Apply N (old → new) replacements atomically against the original file.
+
+        1.6.6.8 — Pi-style multi-block edit. Each {old_text, new_text} matches
+        against the ORIGINAL file contents, not incrementally. This means:
+          • edits can be in any order
+          • line numbers don't drift between hunks
+          • each old_text must be unique in the original (or replace_all)
+        If any edit fails to match (0 or >1 hits), the WHOLE call is aborted —
+        no partial writes. Cuts N-call cost of N-hunk fixes to 1 call.
+        """
+        path = args.get("path")
+        edits = args.get("edits")
+        if not isinstance(path, str) or not path:
+            return ToolResult(tool="multi_edit", is_error=True, output="missing 'path'")
+        if not isinstance(edits, list) or not edits:
+            return ToolResult(tool="multi_edit", is_error=True,
+                              output="missing 'edits' (list of {old_text, new_text})")
+        # Encode the whole edits list once via base64-JSON, applied by a small
+        # Python script in-container. Avoids per-edit shell quoting.
+        edits_json = json.dumps(edits)
+        edits_b64 = base64.b64encode(edits_json.encode("utf-8")).decode("ascii")
+        script_text = (
+            "import base64, json, sys\n"
+            f"path = {path!r}\n"
+            f"edits = json.loads(base64.b64decode('{edits_b64}').decode('utf-8'))\n"
+            "try:\n"
+            "    original = open(path).read()\n"
+            "except FileNotFoundError:\n"
+            "    print(f'ERROR: file not found: {path}'); sys.exit(2)\n"
+            "# Validate every edit against the ORIGINAL (Pi semantics).\n"
+            "applied = []\n"
+            "for i, e in enumerate(edits):\n"
+            "    old = e.get('old_text', e.get('oldText', ''))\n"
+            "    new = e.get('new_text', e.get('newText', ''))\n"
+            "    if not isinstance(old, str) or not old:\n"
+            "        print(f'ERROR: edit {i}: missing old_text'); sys.exit(3)\n"
+            "    n = original.count(old)\n"
+            "    if n == 0:\n"
+            "        print(f'ERROR: edit {i}: old_text not found'); sys.exit(3)\n"
+            "    if n > 1:\n"
+            "        print(f'ERROR: edit {i}: old_text matches {n} locations — make it more specific'); sys.exit(3)\n"
+            "    applied.append((old, new))\n"
+            "# All validated; apply sequentially (each match against current state,\n"
+            "# but since each old was unique in the ORIGINAL and edits must not\n"
+            "# overlap, this is equivalent to the atomic semantics).\n"
+            "content = original\n"
+            "for old, new in applied:\n"
+            "    if content.count(old) != 1:\n"
+            "        print(f'ERROR: edits overlap — old_text appears {content.count(old)} times after prior edits'); sys.exit(4)\n"
+            "    content = content.replace(old, new, 1)\n"
+            "open(path, 'w').write(content)\n"
+            "print(f'OK: applied {len(applied)} edits to {path}')\n"
+        )
+        script_b64 = base64.b64encode(script_text.encode("utf-8")).decode("ascii")
+        tmp = f"/tmp/cat_medit_{uuid.uuid4().hex[:8]}.py"
+        stage_and_run = (
+            f"echo {script_b64} | base64 -d > {tmp} && python3 {tmp}; rc=$?; rm -f {tmp}; exit $rc"
+        )
+        exit_code, output = _exec(["sh", "-c", stage_and_run])
+        return ToolResult(
+            tool="multi_edit",
+            is_error=(exit_code != 0),
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+            detail={"returncode": exit_code, "path": path, "n_edits": len(edits)},
+        )
+
+    def _git_status(args: dict, state: State) -> ToolResult:
+        """`git status -sb` inside the workdir. 1.6.6.9 — first-class git
+        orientation so the agent doesn't have to craft bash for it."""
+        workdir = str(args.get("workdir") or default_workdir)
+        sh = f"cd {shlex.quote(workdir)} && git status -sb"
+        exit_code, output = _exec(["bash", "-lc", sh])
+        return ToolResult(
+            tool="git_status",
+            is_error=(exit_code != 0),
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+            detail={"returncode": exit_code, "workdir": workdir},
+        )
+
+    def _git_diff(args: dict, state: State) -> ToolResult:
+        """`git diff [--staged] [path]` inside the workdir. 1.6.6.9 — lets
+        the agent see its accumulated changes between iterations as a tool
+        result (which the trace records), rather than buried in bash."""
+        workdir = str(args.get("workdir") or default_workdir)
+        path = args.get("path")
+        staged = bool(args.get("staged", False))
+        parts = ["git diff"]
+        if staged:
+            parts.append("--staged")
+        if isinstance(path, str) and path:
+            parts.append("--")
+            parts.append(shlex.quote(path))
+        sh = f"cd {shlex.quote(workdir)} && {' '.join(parts)}"
+        exit_code, output = _exec(["bash", "-lc", sh])
+        return ToolResult(
+            tool="git_diff",
+            is_error=(exit_code != 0),
+            output=_truncate(output, READ_CAP_BYTES),  # diffs can be large
+            detail={"returncode": exit_code, "workdir": workdir, "path": path, "staged": staged},
+        )
+
+    def _symbol_nav(action: str, args: dict, state: State, tool_name: str) -> ToolResult:
+        """Shared dispatcher for goto_def / find_refs / outline (1.7.0).
+
+        Stages a small jedi-backed script into the container via base64, then
+        runs it. Lazy-installs jedi if not present (pip --user). Returns the
+        script's JSON output as the tool output.
+        """
+        root = str(args.get("root") or default_workdir)
+        payload = {"action": action, "root": root, **args}
+        payload_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+        script_text = (
+            "import base64, json, os, subprocess, sys\n"
+            f"args = json.loads(base64.b64decode('{payload_b64}').decode('utf-8'))\n"
+            "try:\n"
+            "    import jedi\n"
+            "except ImportError:\n"
+            "    subprocess.check_call([sys.executable, '-m', 'pip', 'install',\n"
+            "        '--quiet', '--disable-pip-version-check', '--user', 'jedi>=0.19'])\n"
+            "    sys.path.insert(0, os.path.expanduser('~/.local/lib/python%d.%d/site-packages' % sys.version_info[:2]))\n"
+            "    import jedi\n"
+            "root = args['root']\n"
+            "project = jedi.Project(root)\n"
+            "action = args['action']\n"
+            "out = []\n"
+            "def _to_row(n):\n"
+            "    p = str(n.module_path) if n.module_path else ''\n"
+            "    return {'path': p, 'line': n.line, 'col': n.column, 'type': n.type, 'name': n.name}\n"
+            "if action == 'goto_def':\n"
+            "    name = args['name']\n"
+            "    seen = set()\n"
+            "    for hit in list(project.search(name))[:30]:\n"
+            "        try:\n"
+            "            for d in hit.goto(follow_imports=True):\n"
+            "                row = _to_row(d)\n"
+            "                key = (row['path'], row['line'], row['name'])\n"
+            "                if key in seen: continue\n"
+            "                seen.add(key)\n"
+            "                if row['name'] == name or row['name'].endswith('.' + name):\n"
+            "                    out.append(row)\n"
+            "        except Exception as e:\n"
+            "            continue\n"
+            "    out = out[:20]\n"
+            "elif action == 'find_refs':\n"
+            "    name = args['name']\n"
+            "    defs = []\n"
+            "    for hit in list(project.search(name))[:10]:\n"
+            "        if hit.name == name:\n"
+            "            try:\n"
+            "                defs.extend(hit.goto(follow_imports=True))\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "    if not defs:\n"
+            "        print(json.dumps({'error': f'no definition found for {name!r}'})); sys.exit(0)\n"
+            "    d = defs[0]\n"
+            "    if not d.module_path:\n"
+            "        print(json.dumps({'error': 'definition has no module_path'})); sys.exit(0)\n"
+            "    script = jedi.Script(path=str(d.module_path), project=project)\n"
+            "    refs = script.get_references(d.line, d.column, scope='project')\n"
+            "    for r in refs[:50]:\n"
+            "        row = _to_row(r)\n"
+            "        try:\n"
+            "            lines = open(row['path']).read().splitlines()\n"
+            "            row['snippet'] = lines[row['line']-1].strip()[:120] if row['line'] <= len(lines) else ''\n"
+            "        except Exception:\n"
+            "            row['snippet'] = ''\n"
+            "        out.append(row)\n"
+            "elif action == 'outline':\n"
+            "    path = args['path']\n"
+            "    if not os.path.isabs(path):\n"
+            "        path = os.path.join(root, path)\n"
+            "    script = jedi.Script(path=path, project=project)\n"
+            "    names = script.get_names(all_scopes=False, definitions=True, references=False)\n"
+            "    for n in names:\n"
+            "        out.append({'name': n.name, 'type': n.type, 'line': n.line})\n"
+            "print(json.dumps(out, indent=2))\n"
+        )
+        script_b64 = base64.b64encode(script_text.encode("utf-8")).decode("ascii")
+        tmp = f"/tmp/cat_symnav_{uuid.uuid4().hex[:8]}.py"
+        sh = (
+            f"echo {script_b64} | base64 -d > {tmp} && "
+            f"python3 {tmp}; rc=$?; rm -f {tmp}; exit $rc"
+        )
+        exit_code, output = _exec(["bash", "-lc", sh])
+        return ToolResult(
+            tool=tool_name,
+            is_error=(exit_code != 0),
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+            detail={"returncode": exit_code, "action": action},
+        )
+
+    def _goto_def(args: dict, state: State) -> ToolResult:
+        name = args.get("name")
+        if not isinstance(name, str) or not name:
+            return ToolResult(tool="goto_def", is_error=True, output="missing 'name'")
+        return _symbol_nav("goto_def", args, state, "goto_def")
+
+    def _find_refs(args: dict, state: State) -> ToolResult:
+        name = args.get("name")
+        if not isinstance(name, str) or not name:
+            return ToolResult(tool="find_refs", is_error=True, output="missing 'name'")
+        return _symbol_nav("find_refs", args, state, "find_refs")
+
+    def _outline(args: dict, state: State) -> ToolResult:
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return ToolResult(tool="outline", is_error=True, output="missing 'path'")
+        return _symbol_nav("outline", args, state, "outline")
+
+    def _fd(args: dict, state: State) -> ToolResult:
+        """fd-flavored file finder; falls back to `find` when fd unavailable."""
+        pattern = args.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            return ToolResult(tool="fd", is_error=True, output="missing 'pattern'")
+        paths = args.get("paths") or "."
+        if isinstance(paths, list):
+            paths_str = " ".join(shlex.quote(str(p)) for p in paths)
+        else:
+            paths_str = shlex.quote(str(paths))
+        flags = str(args.get("flags") or "")
+        fd_cmd = f"fd {flags} -- {shlex.quote(pattern)} {paths_str}"
+        # find's syntax differs; use -iname for a sensible default mapping
+        find_cmd = (
+            f"find {paths_str} -iname {shlex.quote(pattern if any(c in pattern for c in '*?[') else '*' + pattern + '*')}"
+            + (f" {flags}" if flags else "")
+        )
+        sh = f"if command -v fd >/dev/null 2>&1; then {fd_cmd}; else {find_cmd}; fi"
+        exit_code, output = _exec(["bash", "-lc", sh])
+        return ToolResult(
+            tool="fd",
+            is_error=(exit_code != 0),
+            output=_truncate(output, OUTPUT_CAP_BYTES),
+            detail={"returncode": exit_code, "pattern": pattern, "paths": paths},
+        )
+
+    reg = CapabilityRegistry()
+    reg.register(Capability(
+        name="bash",
+        description=(
+            "Run a shell command inside the container via docker exec. "
+            "Returns stdout+stderr; is_error=true on non-zero exit. "
+            "Use this for grep/find/sed/python/pytest/etc. "
+            "The command is wrapped in a `timeout` so it cannot hang past timeout_s."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "shell command to execute"},
+                "timeout_s": {"type": "number", "description": "seconds before timeout (default 60)"},
+            },
+            "required": ["command"],
+        },
+        handler=_bash,
+    ))
+    reg.register(Capability(
+        name="read",
+        description="Read a file from inside the container (cat). Output capped at 64KB.",
+        json_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "absolute path inside the container"},
+            },
+            "required": ["path"],
+        },
+        handler=_read,
+    ))
+    reg.register(Capability(
+        name="list",
+        description="List directory contents inside the container (ls -la).",
+        json_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "path to list (default '.')"},
+            },
+        },
+        handler=_list,
+    ))
+    reg.register(Capability(
+        name="write",
+        description="Write content to a file inside the container (creates parent dirs, overwrites existing).",
+        json_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "absolute path inside the container"},
+                "content": {"type": "string", "description": "full file contents (UTF-8)"},
+            },
+            "required": ["path", "content"],
+        },
+        handler=_write,
+    ))
+    reg.register(Capability(
+        name="str_replace",
+        description=(
+            "Edit an existing file inside the container by replacing an exact string. "
+            "old_str must match exactly once — make it specific enough (include surrounding lines). "
+            "Prefer this over `write` for patching existing files."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "absolute path inside the container"},
+                "old_str": {"type": "string", "description": "exact string to find (must appear exactly once)"},
+                "new_str": {"type": "string", "description": "replacement string (empty string to delete)"},
+            },
+            "required": ["path", "old_str"],
+        },
+        handler=_str_replace,
+    ))
+    # 1.6.6.2 — first-class ripgrep + fd (with grep/find fallbacks)
+    reg.register(Capability(
+        name="rg",
+        description=(
+            "Recursive search via ripgrep (falls back to `grep -rn` if rg is not installed). "
+            "Prefer this over `bash(\"grep ...\")` for code search — much faster on large codebases. "
+            "Returns matches with line numbers."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "regex/pattern to search for"},
+                "paths":   {"type": ["string", "array"],
+                            "description": "path or list of paths to search (default '.')"},
+                "flags":   {"type": "string", "description": "extra flags, e.g. '-i' for case-insensitive"},
+                "context": {"type": "integer",
+                            "description": "lines of surrounding context per match (-C N). Default 0."},
+            },
+            "required": ["pattern"],
+        },
+        handler=_rg,
+    ))
+    reg.register(Capability(
+        name="fd",
+        description=(
+            "Find files by name via fd (falls back to `find -iname` if fd is not installed). "
+            "Prefer this over `bash(\"find ...\")`. "
+            "Pattern can be a substring (auto-globbed) or shell glob (*, ?, [...])."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "name pattern (substring or glob)"},
+                "paths":   {"type": ["string", "array"],
+                            "description": "path or list of paths to search (default '.')"},
+                "flags":   {"type": "string", "description": "extra flags (fd or find compatible)"},
+            },
+            "required": ["pattern"],
+        },
+        handler=_fd,
+    ))
+    # 1.6.6.7 — apply_patch (Hermes-style first-class patch tool)
+    reg.register(Capability(
+        name="apply_patch",
+        description=(
+            "Apply a unified-diff patch in the workdir via `git apply --reject --whitespace=fix`. "
+            "Use this for multi-hunk edits instead of crafting a heredoc + bash. "
+            "Hunks that don't match are written to .rej files (partial apply); "
+            "the tool result lists any .rej files so you can fix and retry."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "patch":   {"type": "string", "description": "unified-diff text (the contents of a .patch file)"},
+                "workdir": {"type": "string", "description": f"directory to apply in (default {default_workdir})"},
+            },
+            "required": ["patch"],
+        },
+        handler=_apply_patch,
+    ))
+    # 1.6.6.8 — multi_edit (Pi-style atomic multi-block edit)
+    reg.register(Capability(
+        name="multi_edit",
+        description=(
+            "Apply N (old_text → new_text) replacements to one file atomically. "
+            "Each old_text matches against the ORIGINAL file (not after prior edits), "
+            "so order doesn't matter and line numbers can't drift. "
+            "Every old_text must appear exactly once in the original; otherwise the whole call aborts. "
+            "Prefer this over multiple `str_replace` calls when fixing several hunks in one file."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "path":  {"type": "string", "description": "absolute path inside the container"},
+                "edits": {
+                    "type": "array",
+                    "description": "list of replacements; each {old_text, new_text}",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {"type": "string", "description": "exact string to find (unique in original)"},
+                            "new_text": {"type": "string", "description": "replacement (empty to delete)"},
+                        },
+                        "required": ["old_text", "new_text"],
+                    },
+                },
+            },
+            "required": ["path", "edits"],
+        },
+        handler=_multi_edit,
+    ))
+    # 1.6.6.9 — git_status / git_diff first-class
+    reg.register(Capability(
+        name="git_status",
+        description=(
+            "Show repo status (git status -sb) for the workdir. "
+            "Use between iterations to see which files you've touched."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "workdir": {"type": "string", "description": f"directory (default {default_workdir})"},
+            },
+        },
+        handler=_git_status,
+    ))
+    reg.register(Capability(
+        name="git_diff",
+        description=(
+            "Show accumulated diff (git diff [--staged] [path]) for the workdir. "
+            "Use to inspect your own edits as a single coherent change. "
+            "Output capped at 64KB."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "workdir": {"type": "string", "description": f"directory (default {default_workdir})"},
+                "path":    {"type": "string", "description": "limit diff to a path (optional)"},
+                "staged":  {"type": "boolean", "description": "use --staged (default false)"},
+            },
+        },
+        handler=_git_diff,
+    ))
+    # 1.7.0 — symbol_nav: structural code navigation via jedi
+    reg.register(Capability(
+        name="goto_def",
+        description=(
+            "Find where a Python symbol is defined (class, function, variable). "
+            "Returns up to 20 {path, line, col, type, name} hits. "
+            "Prefer this over `rg(\"def foo|class foo\")` — works through imports and "
+            "respects Python scoping."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "symbol name to locate (function, class, variable)"},
+                "root": {"type": "string", "description": f"project root for the search (default {default_workdir})"},
+            },
+            "required": ["name"],
+        },
+        handler=_goto_def,
+    ))
+    reg.register(Capability(
+        name="find_refs",
+        description=(
+            "Find all references to a Python symbol across the project. "
+            "Returns up to 50 {path, line, col, snippet} hits. "
+            "Prefer this over `rg(name)` for 'who calls X' / 'where is X used' questions — "
+            "filters out string matches and respects Python scoping."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "symbol name to find references of"},
+                "root": {"type": "string", "description": f"project root (default {default_workdir})"},
+            },
+            "required": ["name"],
+        },
+        handler=_find_refs,
+    ))
+    reg.register(Capability(
+        name="outline",
+        description=(
+            "List top-level classes, functions, and module-level names in a Python file "
+            "(structural outline). Returns {name, type, line} per entry. "
+            "Prefer this over `read` when you only need to know what's in a file."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "file path (relative to root or absolute)"},
+                "root": {"type": "string", "description": f"project root (default {default_workdir})"},
+            },
+            "required": ["path"],
+        },
+        handler=_outline,
+    ))
+    return reg

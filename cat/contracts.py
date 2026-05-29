@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 
 class ContractState(str, Enum):
@@ -27,6 +27,54 @@ class ContractState(str, Enum):
     FULFILLED = "fulfilled"    # criteria met, closed
     FAILED = "failed"          # constraint violated or unrecoverable error
     EXPIRED = "expired"        # TTL / deadline passed without fulfillment
+
+
+# ── Admission-gate decision types ──────────────────────────────────────────
+
+AdmissionFailureType = Literal["boundary", "environment", "capacity"]
+PolicyResponse = Literal["FAIL", "SUSPEND", "ESCALATE", "ASK_USER"]
+
+
+@dataclass
+class ContractPolicy:
+    """Per-contract response to each admission-failure type (Step 4 ACTIVATE).
+
+    Defaults (root contract from autonomous caller):
+        boundary    → FAIL    (definition bug; only re-submission helps)
+        environment → SUSPEND (dormant; re-admit when world changes)
+        capacity    → FAIL    (envelope too small for this contract)
+
+    A root contract from a human user can declare ASK_USER on environment
+    fail; a sub-contract can declare ESCALATE_TO_PARENT.
+    """
+    on_boundary_fail: PolicyResponse = "FAIL"
+    on_environment_fail: PolicyResponse = "SUSPEND"
+    on_capacity_fail: PolicyResponse = "FAIL"
+
+    def response_for(self, failure_type: AdmissionFailureType) -> PolicyResponse:
+        if failure_type == "boundary":
+            return self.on_boundary_fail
+        if failure_type == "environment":
+            return self.on_environment_fail
+        return self.on_capacity_fail
+
+
+@dataclass
+class AdmissionDecision:
+    """Outcome of the admission gate. Either ok=True (admit) or carries
+    failure_type + reason for the policy to consult."""
+    ok: bool
+    failure_type: Optional[AdmissionFailureType] = None
+    reason: str = ""
+    grant: set[str] = field(default_factory=set)   # capabilities granted on pass
+
+    @classmethod
+    def admit(cls, grant: set[str]) -> "AdmissionDecision":
+        return cls(ok=True, grant=grant)
+
+    @classmethod
+    def reject(cls, failure_type: AdmissionFailureType, reason: str) -> "AdmissionDecision":
+        return cls(ok=False, failure_type=failure_type, reason=reason)
 
 
 @dataclass
@@ -181,6 +229,10 @@ class Contract:
     state_reason: Optional[str] = None    # why we transitioned (last)
     depth: int = 0                        # nesting depth from root
     representations: list[Representation] = field(default_factory=list)  # Step 2: REPRESENT
+    policy: ContractPolicy = field(default_factory=ContractPolicy)       # Step 4: ACTIVATE admission policy
+    grant: set[str] = field(default_factory=set)                         # capabilities granted at admission
+    suspend_reason: Optional[str] = None       # set when state=SUSPENDED
+    re_entry_condition: Optional[str] = None   # what must change for re-admission
 
     @classmethod
     def new(
@@ -223,6 +275,7 @@ class Contract:
 _ALLOWED_TRANSITIONS: dict[ContractState, set[ContractState]] = {
     ContractState.LATENT: {
         ContractState.ELIGIBLE,
+        ContractState.SUSPENDED,    # admission gate may suspend on environment fail
         ContractState.FAILED,
         ContractState.EXPIRED,
     },

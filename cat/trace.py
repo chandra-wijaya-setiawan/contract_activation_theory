@@ -26,21 +26,16 @@ EventKind = Literal[
     "tool_result",
     "llm_usage",
     "step_end",
-    # CAT-specific
-    "contract_state",        # state transition: payload = {contract_id, from, to, reason}
-    "contract_represent",    # representer ran probes: payload = {contract_id, representations}
-    "contract_decompose",    # planner emitted criteria + sub-contracts
-    "criterion_check",       # verifier ran a criterion: {criterion_id, satisfied, evidence}
-    "capability_activate",   # capability invoked under a contract
-    "failure_attribution",   # root-cause layer for a failed tool/step
-]
-
-
-FailureLayer = Literal[
-    "action_realization",    # tool call was malformed (bad args, wrong format)
-    "environment_contract",  # tool call violated precondition / usage protocol
-    "trajectory_regulation", # agent looped, stalled, or failed to recover
-    "residual_reasoning",    # model made a bad decision despite correct interface
+    # CAT-specific — new contract-vocabulary names (per PRD 1.6.2.9):
+    "contract_state",          # state transition: payload = {contract_id, from, to, reason}
+    "contract_represent",      # surveyor ran probes: payload = {contract_id, representations}
+    "contract_stipulate",      # stipulator emitted plan (was: contract_decompose)
+    "contract_admit",          # Step 4 ACTIVATE: admission gate decision
+    "criterion_check",         # verifier ran a criterion
+    "capability_perform",      # Step 6 PERFORM: one performance act (was: capability_invoke)
+    # Legacy aliases (kept readable for pre-rename traces):
+    "contract_decompose",      # legacy alias for contract_stipulate
+    "capability_invoke",       # legacy alias for capability_perform
 ]
 
 
@@ -119,14 +114,31 @@ class Recorder:
             self.traj.tokens_in += int(p.get("in", 0))
             self.traj.tokens_out += int(p.get("out", 0))
             self.traj.usd += float(p.get("usd", 0.0))
-        elif event.kind == "capability_activate":
+        elif event.kind == "capability_perform" or event.kind == "capability_invoke":
+            # accept both for backward-compat with legacy traces
             self.traj.n_loops += 1
 
     def finalize(self) -> Trajectory:
         self.traj.ended_at = utcnow_iso()
         self._fh.close()
         self._write_parquet()
+        self._write_dag()
         return self.traj
+
+    def _write_dag(self) -> None:
+        """1.6.2: emit dag.json next to the JSONL trace.
+
+        Imported lazily to avoid a cyclic import (cat.dag → cat.trace).
+        Best-effort: failures are swallowed so a malformed trace never breaks
+        the run.
+        """
+        try:
+            from cat.dag import RunDAG
+            dag = RunDAG.from_jsonl(self.jsonl_path)
+            dag_path = self.jsonl_path.with_suffix(".dag.json")
+            dag.write_json(dag_path)
+        except Exception:
+            pass
 
     def _write_parquet(self) -> None:
         import pyarrow as pa

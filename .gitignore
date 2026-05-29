@@ -1,5 +1,6 @@
 # Claude Code local overrides (personal, never commit)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Python
 __pycache__/

@@ -1,15 +1,16 @@
 """LLM client: OpenAI-compatible (OpenRouter) chat + tool-calling, with token
 harvest into TraceEvents.
 
-Three roles used by the Activator:
-    1. EXECUTOR — given obligation + history + tool schemas, emits one tool call
-       (or a final text). Drives concrete progress.
-    2. PLANNER — given obligation, decomposes into an ordered checklist of
-       natural-language steps (Plan). Decoration that conditions the executor;
-       does not bypass the criterion check.
-    3. JUDGE — given a step description + state summary, advises whether the
-       step appears complete and what is still missing. Advisory only — the
-       final verdict is always a deterministic Criterion.predicate.
+Three contract-vocabulary roles used by the Activator (see PRD 1.6.2.9):
+    1. PERFORMER (was "executor") — given obligation + history + tool schemas,
+       emits one tool call (or a final text). Carries out the performance act.
+    2. STIPULATOR (was "planner") — given obligation, articulates the
+       performance terms as an ordered checklist (Plan). Strategic; does not
+       bypass the criterion check.
+    3. ATTESTOR (was "judge") — given a step description + state summary,
+       attests whether the step appears complete and what is still missing.
+       Advisory only — the final verdict is always a deterministic
+       Criterion.predicate.
 
 Pricing is OpenRouter usage when present; otherwise estimated from a small
 table. Estimates exist so cost is non-zero even when the provider omits a
@@ -102,6 +103,7 @@ class LLM:
         max_tokens: Optional[int] = None,
         temperature: float = 0.2,
         role_tag: str = "executor",
+        parent_event_id: Optional[str] = None,
     ) -> LLMResult:
         """One chat completion. Records llm_usage TraceEvent on success."""
         kwargs: dict[str, Any] = {
@@ -154,9 +156,13 @@ class LLM:
         )
 
         if self.recorder is not None:
+            # parent_event_id (per-call) takes precedence over self.parent_event_id
+            # (LLM-instance default). Each chat call chains to the event that
+            # triggered it (e.g., a capability_invoke or contract_decompose).
+            chat_parent = parent_event_id if parent_event_id is not None else self.parent_event_id
             self.recorder.append(TraceEvent(
                 event_id=f"llm-{uuid.uuid4().hex[:8]}",
-                parent_id=self.parent_event_id,
+                parent_id=chat_parent,
                 ts=utcnow_iso(),
                 kind="llm_usage",
                 payload={
@@ -177,9 +183,10 @@ class LLM:
 # ── Role helpers ────────────────────────────────────────────────────────────
 
 
-PLANNER_SYSTEM_PROMPT = """\
-You are the PLANNER role in a contract-disciplined agent. Your job is to decompose \
-a user obligation into an ordered checklist of concrete, verifiable steps. \
+STIPULATOR_SYSTEM_PROMPT = """\
+You are the STIPULATOR role in a contract-disciplined agent. Your job is to \
+stipulate the performance terms of a user obligation as an ordered checklist of \
+concrete, verifiable steps. \
 
 Rules:
 - Each step MUST be testable by examining files, command outputs, or exit codes.
@@ -210,8 +217,8 @@ Output a JSON object with this exact shape:
 """
 
 
-JUDGE_SYSTEM_PROMPT = """\
-You are the JUDGE role in a contract-disciplined agent. You receive a STEP \
+ATTESTOR_SYSTEM_PROMPT = """\
+You are the ATTESTOR role in a contract-disciplined agent. You receive a STEP \
 description and a STATE SUMMARY (recent tool outputs + workdir snapshot). \
 
 Your job: decide whether the step appears COMPLETE based on the evidence.
@@ -226,16 +233,17 @@ Output ONLY a JSON object:
 """
 
 
-def call_planner(
+def call_stipulator(
     llm: LLM,
     obligation: str,
     representations: "Optional[list[Any]]" = None,
-) -> list[dict[str, str]]:
-    """Returns a list of {"id", "description"} step dicts. Empty list on parse failure.
+    parent_event_id: Optional[str] = None,
+) -> tuple[list[dict[str, str]], LLMResult]:
+    """Plan + raw LLMResult so the caller can charge full cost to the contract.
 
-    `representations` is an optional list of Representation objects (from cat.contracts).
-    When provided, an ENVIRONMENT section is appended to the user message so the planner
-    produces grounded, non-speculative steps.
+    Returns (steps, result). `steps` is a list of {"id", "description"} dicts
+    (empty on parse failure). `result` carries tokens, usd, wall_s — the caller
+    is responsible for charging them to contract.cost via _charge_llm().
     """
     env_section = ""
     if representations:
@@ -247,42 +255,68 @@ def call_planner(
         env_section = "\n\nENVIRONMENT (verified facts — ground your plan in these):\n" + "\n\n".join(lines)
 
     messages = [
-        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+        {"role": "system", "content": STIPULATOR_SYSTEM_PROMPT},
         {"role": "user", "content": f"OBLIGATION:\n{obligation}{env_section}"},
     ]
     result = llm.chat(
         messages=messages,
         response_format={"type": "json_object"},
-        role_tag="planner",
+        role_tag="stipulator",
         temperature=0.1,
+        parent_event_id=parent_event_id,
     )
     if not result.text:
-        return []
+        return [], result
     try:
         data = json.loads(result.text)
     except json.JSONDecodeError:
-        return []
-    steps = data.get("steps") or []
-    return [{"id": str(s.get("id", f"s{i+1}")), "description": str(s.get("description", ""))}
-            for i, s in enumerate(steps) if isinstance(s, dict) and s.get("description")]
+        return [], result
+    raw_steps = data.get("steps") or []
+    steps = [
+        {"id": str(s.get("id", f"s{i+1}")), "description": str(s.get("description", ""))}
+        for i, s in enumerate(raw_steps)
+        if isinstance(s, dict) and s.get("description")
+    ]
+    return steps, result
 
 
-def call_judge(llm: LLM, step_description: str, state_summary: str) -> tuple[bool, str]:
-    """Returns (complete, reason). Conservative on parse failure (complete=False)."""
+def call_attestor(
+    llm: LLM, step_description: str, state_summary: str,
+    parent_event_id: Optional[str] = None,
+) -> tuple[bool, str, LLMResult]:
+    """Verdict + raw LLMResult so the caller can charge full cost to the contract.
+
+    Returns (complete, reason, result). Conservative on parse failure
+    (complete=False). The caller is responsible for charging result's tokens,
+    usd, and wall_s to contract.cost via _charge_llm().
+    """
     messages = [
-        {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+        {"role": "system", "content": ATTESTOR_SYSTEM_PROMPT},
         {"role": "user", "content": f"STEP: {step_description}\n\nSTATE SUMMARY:\n{state_summary}"},
     ]
     result = llm.chat(
         messages=messages,
         response_format={"type": "json_object"},
-        role_tag="judge",
+        role_tag="attestor",
         temperature=0.0,
+        parent_event_id=parent_event_id,
     )
     if not result.text:
-        return False, "judge returned no text"
+        return False, "attestor returned no text", result
     try:
         data = json.loads(result.text)
-        return bool(data.get("complete", False)), str(data.get("reason", ""))[:300]
+        return (
+            bool(data.get("complete", False)),
+            str(data.get("reason", ""))[:300],
+            result,
+        )
     except json.JSONDecodeError:
-        return False, "judge JSON parse error"
+        return False, "attestor JSON parse error", result
+
+
+# Backward-compat aliases (read-only — DO NOT remove until v1.7+)
+# Allow tests and external code referencing the old names to keep working.
+call_planner = call_stipulator
+call_judge = call_attestor
+PLANNER_SYSTEM_PROMPT = STIPULATOR_SYSTEM_PROMPT
+JUDGE_SYSTEM_PROMPT = ATTESTOR_SYSTEM_PROMPT

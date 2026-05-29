@@ -24,7 +24,7 @@ from terminal_bench.agents.failure_mode import FailureMode
 from terminal_bench.terminal.tmux_session import TmuxSession
 
 from cat.activator import Activator
-from cat.capabilities import build_tmux_registry
+from cat.capabilities import build_docker_registry, build_tmux_registry
 from cat.contracts import Constraints, Contract, Criterion, Evidence, State
 from cat.llm import LLM, call_judge
 from cat.trace import Recorder, TraceEvent, utcnow_iso
@@ -89,46 +89,52 @@ def _make_terminal_criterion(llm: LLM, instruction: str) -> Criterion:
 
 
 def _make_test_runner_criterion(session: TmuxSession, test_cmd: str) -> Criterion:
-    """Deterministic criterion: run a test command and check its exit code.
+    """Deterministic criterion: run a test command via docker exec; check exit code.
 
-    Zero false-positive rate — the contract closes only when the tests
-    actually pass, not when the model thinks they might.  Use this for any
-    task that ships with a test suite (terminal-bench, SWE-bench, etc.).
+    Post-1.6.6.1: bypasses tmux entirely. Goes through `container.exec_run`
+    for direct subprocess execution with structured exit code and output.
+    No sentinel scraping, no pane viewport limits, no `send_keys` round-trips.
 
-    The test command exit code is captured by running it inside a subshell
-    and echoing a sentinel:
-        <test_cmd>; echo "EXIT:$?"
-    Then we parse the last EXIT:N from the pane.
-
-    Output is written to state.kv["last_criterion_output"] (not "terminal_output")
-    so the judge's context is not polluted with pytest output.
+    Output is written to state.kv["last_criterion_output"] so the attestor's
+    context is not polluted with pytest output.
     """
-    import re
-
     def predicate(state: State) -> tuple[bool, Evidence]:
-        probe = f"{test_cmd}; echo EXIT:$?"
-        # Interrupt any long-running command in the pane (e.g. grep / find /)
-        # before sending the oracle probe.  block=False + sleep avoids the
-        # scenario where blocked output flushing eats into the oracle timeout:
-        # we fire Ctrl+C, give the shell 2 s to settle, then run the probe.
-        session.send_keys(["C-c"], block=False)
-        time.sleep(2)
         try:
-            session.send_keys([probe, "Enter"], block=True, max_timeout_sec=120)
-        except TimeoutError:
-            return False, Evidence(summary=f"test runner timed out: {test_cmd}")
-        output = session.capture_pane()
-        state.kv["last_criterion_output"] = output   # isolated — does not overwrite terminal_output
-        matches = re.findall(r"EXIT:(\d+)", output)
-        if not matches:
-            return False, Evidence(summary="no EXIT code in pane", detail={"output": output[-300:]})
-        exit_code = int(matches[-1])
+            # Use `bash -lc` (login shell) so PATH/conda-env is sourced;
+            # some SWE-bench testbeds keep pytest in a conda env not on the
+            # default docker-exec PATH. See 1.6.6.1 follow-up.
+            res = session.container.exec_run(
+                cmd=["bash", "-lc", test_cmd],
+                workdir="/testbed",
+                demux=False,
+                stdout=True,
+                stderr=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, Evidence(
+                summary=f"oracle docker exec error: {type(exc).__name__}: {exc}",
+                detail={"test_cmd": test_cmd},
+            )
+        output = ""
+        if res.output is not None:
+            output = (
+                res.output.decode("utf-8", errors="replace")
+                if isinstance(res.output, (bytes, bytearray))
+                else str(res.output)
+            )
+        state.kv["last_criterion_output"] = output
+        exit_code = int(res.exit_code or 0)
         passed = (exit_code == 0)
         return passed, Evidence(
             summary=f"test exit_code={exit_code} {'PASS' if passed else 'FAIL'}",
-            detail={"exit_code": exit_code, "test_cmd": test_cmd},
+            detail={"exit_code": exit_code, "test_cmd": test_cmd, "output": output[-2000:]},
         )
-    return Criterion(id="test-runner", description=f"exit_code==0 for: {test_cmd}", predicate=predicate, is_oracle=True)
+    return Criterion(
+        id="test-runner",
+        description=f"exit_code==0 for: {test_cmd}",
+        predicate=predicate,
+        is_oracle=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +160,6 @@ class TbCatAgent(BaseAgent):
         max_iterations: int = 30,
         test_cmd: "Union[str, dict[str, str]]" = "",
         criterion_check_interval: int = 3,
-        max_criterion_fails: int = 12,
         window_size: int = 4,
         **kwargs,
     ) -> None:
@@ -162,7 +167,6 @@ class TbCatAgent(BaseAgent):
         self._model_name = model_name
         self._max_iterations = max_iterations
         self._criterion_check_interval = criterion_check_interval
-        self._max_criterion_fails = max_criterion_fails
         self._window_size = window_size
         # test_cmd may be:
         #   str  — same command for all tasks (or "" to fall back to LLM judge)
@@ -190,6 +194,16 @@ class TbCatAgent(BaseAgent):
             return self._test_cmd.get(task_id, "")
         return ""
 
+    def _use_tmux_backend(self) -> bool:
+        """Subclasses opt in to the tmux execution backend if their tasks need
+        an interactive shell (e.g., crack-7z-hash, configure-git-webserver).
+
+        Default False (post-1.6.6.1): use docker exec for non-interactive
+        tasks like SWE-bench / AgentBench OS. The tmux backend remains
+        available but is no longer the default.
+        """
+        return False
+
     def _initial_representations(
         self,
         session: TmuxSession,
@@ -216,7 +230,13 @@ class TbCatAgent(BaseAgent):
         with tempfile.TemporaryDirectory() as tmpdir:
             workdir = Path(tmpdir)
             llm = LLM(model=self._model_name, recorder=recorder)
-            registry = build_tmux_registry(session)
+            # 1.6.6.1: prefer the docker exec backend for non-interactive tasks
+            # (SWE-bench, AgentBench OS, etc.). Falls back to tmux only when
+            # the subclass explicitly requests it via `_use_tmux_backend()`.
+            if self._use_tmux_backend():
+                registry = build_tmux_registry(session)
+            else:
+                registry = build_docker_registry(session.container)
             resolved_cmd = self._resolve_test_cmd(logging_dir)
             if resolved_cmd:
                 criterion = _make_test_runner_criterion(session, resolved_cmd)
@@ -227,7 +247,12 @@ class TbCatAgent(BaseAgent):
                 max_tokens_total=500_000,
                 max_tool_calls=self._max_iterations,
                 max_llm_calls=3 * self._max_iterations,
-                max_wall_s=900.0,
+                # 2700s = 45 min; harness cap is 3000s (50 min). The 5-min
+                # buffer lets the contract self-close via the admission-locked
+                # deadline_ts before the harness reaps the container. Result:
+                # failure_mode=unset with explicit state_reason instead of
+                # silent agent_timeout. See PLAN.md 1.5.15.
+                max_wall_s=2700.0,
                 max_usd=5.0,
             )
             contract = Contract.new(
@@ -248,13 +273,20 @@ class TbCatAgent(BaseAgent):
                 recorder=recorder,
                 max_iterations=self._max_iterations,
                 criterion_check_interval=self._criterion_check_interval,
-                max_criterion_fails=self._max_criterion_fails,
                 window_size=self._window_size,
             )
             activator.run(contract, state)
 
         if isinstance(recorder, Recorder):
             recorder.finalize()
+            # 1.5.18: per-task auto-emit. Cheap — heuristic only (no LLM here
+            # because we don't want every task to make an extra LLM call on
+            # the agent's critical path). Run-level reports re-attribute with
+            # LLM via `python -m cat.run_report <dir>`.
+            try:
+                self._emit_task_kpi(recorder, contract)
+            except Exception as exc:  # noqa: BLE001 — never fail the task on KPI emit
+                pass  # silently skip if anything goes wrong; the trace is still written
 
         tokens_in, tokens_out = _recorder_totals(recorder)
         return TbResult(
@@ -262,6 +294,51 @@ class TbCatAgent(BaseAgent):
             total_output_tokens=tokens_out,
             failure_mode=FailureMode.NONE,
         )
+
+    def _emit_task_kpi(self, recorder: "Recorder", contract: "Contract") -> None:
+        """Write task_kpi.json next to the trace JSONL. Heuristic attribution only."""
+        import json as _json
+        from cat.metrics import RunMetrics
+        from cat.attribution import attribute_task
+
+        jsonl_path = recorder.jsonl_path
+        metrics = RunMetrics.from_jsonl(jsonl_path)
+        events = [ev.model_dump() for ev in recorder.traj.events]
+        # Outcome from contract state (no harness verdict available at this point)
+        outcome = {
+            "fulfilled": "PASS",
+            "failed": "FAIL",
+            "suspended": "SUSPENDED",
+            "expired": "FAIL",
+        }.get(contract.state.value, "FAIL")
+        attribution = attribute_task(
+            contract.id, metrics, events, outcome=outcome, llm=None,
+        )
+        out_path = jsonl_path.with_name(jsonl_path.stem + ".task_kpi.json")
+        out_path.write_text(_json.dumps({
+            "task_id": getattr(recorder, "task_id", ""),
+            "outcome": outcome,
+            "metrics": {
+                "iterations": metrics.iterations,
+                "tool_calls": metrics.tool_calls,
+                "llm_calls": metrics.llm_calls,
+                "tokens_in": metrics.tokens_in,
+                "tokens_out": metrics.tokens_out,
+                "usd": metrics.usd,
+                "wall_s": metrics.wall_s,
+                "plan_steps_completed": metrics.plan_steps_completed,
+                "plan_steps_total": metrics.plan_steps_total,
+            },
+            "attribution": {
+                "primary": attribution.primary,
+                "rationale": attribution.rationale,
+                "layers": [
+                    {"layer": l.layer, "status": l.status, "evidence": l.evidence}
+                    for l in attribution.layers
+                ],
+                "method": attribution.method,
+            },
+        }, indent=2))
 
 
 # ---------------------------------------------------------------------------

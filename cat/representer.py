@@ -175,33 +175,46 @@ class Representer:
         self.registry = registry
         self.recorder = recorder
 
-    def represent(self, contract: Contract, state: State) -> list[Representation]:
+    def represent(
+        self, contract: Contract, state: State, parent_event_id: "str | None" = None,
+    ) -> list[Representation]:
         # Phase 1: run all probes and write to temp files.
-        self.registry.invoke(
+        # tool_call chains to the LATENT state event (parent_event_id) so the
+        # trace forms a real DAG, not a flat fan-out from contract.id.
+        write_result = self.registry.invoke(
             name="bash",
             args={"command": _PROBE_WRITE_CMD, "timeout_s": 30},
             state=state,
             recorder=self.recorder,
             contract_id=contract.id,
             tool_call_id="rep-write",
+            parent_event_id=parent_event_id,
         )
         contract.cost.tool_calls += 1
+        contract.cost.wall_s += float(write_result.wall_s)
 
-        # Phase 2: read each file back in isolation (clear resets the viewport).
+        # Phase 2: read each file back in isolation. Each read chains from the
+        # previous probe (sequential causality) — forms a linear chain of
+        # probe events that all summarize into contract_represent.
+        prev_tc_id: str = "rep-write"
         reps: list[Representation] = []
         for key, read_cmd in _PROBE_READS:
+            tc_id = f"rep-read-{key}"
             result = self.registry.invoke(
                 name="bash",
                 args={"command": read_cmd, "timeout_s": 10},
                 state=state,
                 recorder=self.recorder,
                 contract_id=contract.id,
-                tool_call_id=f"rep-read-{key}",
+                tool_call_id=tc_id,
+                parent_event_id=prev_tc_id,
             )
             contract.cost.tool_calls += 1
+            contract.cost.wall_s += float(result.wall_s)
             evidence = result.output.strip()
             value = _first_meaningful_line(evidence)
             reps.append(Representation(key=key, value=value, evidence=evidence))
+            prev_tc_id = tc_id
 
         # Derive judge strategy from probe outputs — no new tool calls.
         reps.append(_derive_judge_strategy(reps))
@@ -227,9 +240,11 @@ class Representer:
             ),
         ))
 
+        # contract_represent summarizes all the probes; chain from the last
+        # probe (the rep-read-eval_command tool_call).
         self.recorder.append(TraceEvent(
             event_id=f"rep-{contract.id[:8]}",
-            parent_id=contract.id,
+            parent_id=prev_tc_id,
             ts=utcnow_iso(),
             kind="contract_represent",
             payload={
@@ -240,3 +255,7 @@ class Representer:
             },
         ))
         return reps
+
+    def represent_event_id(self, contract: Contract) -> str:
+        """Stable event_id for the contract_represent summary event."""
+        return f"rep-{contract.id[:8]}"

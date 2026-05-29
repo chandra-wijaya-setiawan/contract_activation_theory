@@ -72,7 +72,12 @@ def _load(path: Path) -> list[dict]:
 
 def _is_cat(events: list[dict]) -> bool:
     kinds = {e["kind"] for e in events}
-    return bool(kinds & {"contract_state", "contract_decompose", "capability_activate"})
+    return bool(kinds & {
+        "contract_state",
+        # accept both new (PRD 1.6.2.9) and legacy event names:
+        "contract_stipulate", "contract_decompose",
+        "capability_perform", "capability_invoke", "capability_activate",
+    })
 
 
 # ── data structures ───────────────────────────────────────────────────────────
@@ -112,8 +117,7 @@ class Iteration:
 
 @dataclass
 class PlanVersion:
-    replan_idx: int          # 0 = initial, 1 = first replan, …
-    free_form: bool
+    replan_idx: int          # 0 = initial (CAT v1.5 only emits the initial plan; replan removed)
     steps: list[tuple[str, str]]  # (id, description)
     first_iter: int          # iteration number when this plan was issued
 
@@ -196,20 +200,18 @@ def _parse_cat(events: list[dict]) -> ParsedTrace:
             for r in p.get("representations", []):
                 trace.representations.append(Representation(r["key"], r["value"]))
 
-        elif kind == "contract_decompose":
+        elif kind in ("contract_stipulate", "contract_decompose"):
             steps = [(s["id"], s["description"]) for s in p.get("steps", [])]
             replan_idx = p.get("replan", 0) or 0
-            free_form = bool(p.get("free_form", False))
             # first_iter: next iteration that hasn't been assigned yet
             first_iter = current_iter_num + 1
             trace.plan_versions.append(PlanVersion(
                 replan_idx=replan_idx,
-                free_form=free_form,
                 steps=steps,
                 first_iter=first_iter,
             ))
 
-        elif kind == "capability_activate":
+        elif kind in ("capability_perform", "capability_invoke"):
             in_represent_phase = False
             num = int(p.get("iteration", current_iter_num + 1))
             current_iter_num = num
@@ -438,9 +440,7 @@ def render(trace: ParsedTrace, width: int = 100, full_output: bool = False) -> s
     if trace.is_cat and trace.plan_versions:
         for pv in trace.plan_versions:
             lines.append("")
-            if pv.free_form:
-                lines.append(f"PLAN (free-form, iter {pv.first_iter}+):")
-            elif pv.replan_idx > 0:
+            if pv.replan_idx > 0:
                 lines.append(f"PLAN (replan #{pv.replan_idx}, iter {pv.first_iter}+):")
             else:
                 lines.append("PLAN (initial):")
@@ -469,8 +469,6 @@ def render(trace: ParsedTrace, width: int = 100, full_output: bool = False) -> s
         if trace.is_cat and active_plan:
             pending = [sid for sid, _ in active_plan.steps if sid not in completed_steps]
             step_label = f"step={pending[0]}" if pending else "all-steps-done"
-            if active_plan.free_form:
-                step_label = "free-form"
             hdr = f"  iter {it.num:02d}  {step_label}"
         else:
             hdr = f"  iter {it.num:02d}"

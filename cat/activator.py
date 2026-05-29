@@ -1,23 +1,32 @@
-"""Activator — the 8-step loop that drives contracts to completion.
+"""Activator — the 8-step CAT loop (contract-vocabulary names per PRD 1.6.2.9).
 
-The eight steps from DESIGN.md:
-    1. INGEST    receive contract
-    2. REPRESENT run bounded probes; establish verified facts before planning
-    3. DECOMPOSE planner emits checklist of steps, grounded in representations
-    4. EVALUATE  check budget + conditions
-    5. SELECT    pick capability path (v1: always executor LLM with tools)
-    6. ACTIVATE  executor emits one tool call → capability runs
-    7. VERIFY    deterministic criteria + (optional) judge per step
-    8. CLOSE     fulfilled / failed / suspended
+The eight steps:
 
-This is NOT a `while True`. The loop is bounded by every Constraint on the
-Contract; any violation transitions to FAILED with an explicit reason and
-exits. There is no "model decides done" path — closure rests on
-Criterion.predicate returning True (deterministic).
+    1. INGEST      receive contract (LATENT)
+    2. REPRESENT   bounded probes establish verified facts (no LLM)
+    3. STIPULATE   stipulator emits ordered performance terms (1 LLM call)
+    4. ACTIVATE    admission gate (one-shot):
+                     boundary check
+                     environment fit
+                     capacity check
+                     capability grant
+                   → LATENT → ACTIVE on pass
+                   → consult contract.policy on fail (FAIL / SUSPEND / ESCALATE / ASK_USER)
+    5. SELECT      pick capability from grant (v1: fixed performer LLM)
+    6. PERFORM     one LLM call → one tool call → one tool result
+                   (performer LLM deliberates + carries out the performance act)
+    7. VERIFY      run criterion; per-step attestor advises
+    8. DISCHARGE   FULFILLED / SUSPENDED / FAILED / re-enter at 5
+
+Steps 1-4 are activation. Steps 5-8 are discharge, looped under the grant
+from Step 4 until terminal.
+
+The loop is not a `while True`. It is bounded by every Constraint and by
+the admission gate; criterion-unreachable transitions to SUSPENDED with a
+reason, not to a streak-counted escape ladder.
 """
 from __future__ import annotations
 import json
-import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -26,38 +35,68 @@ from typing import Optional
 
 from cat.capabilities import CapabilityRegistry, ToolResult, workdir_snapshot
 from cat.contracts import (
+    AdmissionDecision,
     Contract,
     ContractState,
     Cost,
     Criterion,
     State,
 )
-from cat.llm import LLM, call_judge, call_planner
+from cat.llm import LLM, LLMResult, call_attestor, call_stipulator
 from cat.representer import Representer
 from cat.trace import Recorder, TraceEvent, utcnow_iso
 
 
-EXECUTOR_SYSTEM_PROMPT = """\
-You are the EXECUTOR role in a contract-disciplined agent.
+PERFORMER_SYSTEM_PROMPT = """\
+You are the PERFORMER role in a contract-disciplined agent.
 
 You will be given:
 - the OBLIGATION you must fulfill
-- an ordered PLAN of verifiable steps
-- a CHECKLIST showing which plan steps are already complete
+- an ordered PLAN of verifiable steps (the contract's stipulations)
+- a CHECKLIST showing which plan steps are already attested complete
 - the LAST TOOL RESULT (if any)
 - a list of available TOOLS (use them by emitting tool_calls)
 - the BUDGET STATUS
 
 Rules:
-1. Take exactly ONE concrete action per turn (one tool call) OR emit a brief text \
-"DONE" only when every plan step is checked complete.
+1. Take exactly ONE concrete performance act per turn (one tool call) OR emit \
+a brief text "DONE" only when every plan step is checked complete.
 2. Address the FIRST un-checked step. Do not skip ahead.
 3. Be terse. Do not narrate. Do not re-state the plan. Just act.
 4. If a tool returns an error, diagnose and try a corrected action; do NOT repeat \
 the same failing call.
-5. NEVER claim a step is complete on your own — only the deterministic criteria \
-and the judge close steps.
+5. NEVER claim a step is complete on your own — only the deterministic criterion \
+and the attestor close steps.
+6. DO NOT edit files under tests/ directories or matching test_*.py / *_test.py \
+patterns. Those files are the verification harness — your job is to change the \
+SOURCE CODE so tests pass. Modifying test files breaks the oracle's view of \
+your fix and is almost never the correct intervention.
+
+Tool-selection guidance (prefer the SPECIFIC tool over `bash`; one call is \
+cheaper than ten):
+- `goto_def(name)` to locate a Python class/function/variable definition — \
+  follows imports, respects scoping. NOT `rg("def foo|class foo")`.
+- `find_refs(name)` to find all references to a symbol — filters strings/\
+  comments and respects scoping. NOT `rg(name)`.
+- `outline(path)` to see a file's top-level classes/functions WITHOUT reading \
+  the whole file. NOT `read(path)` when you only want structure.
+- `rg(pattern, context=N)` for textual code search with N lines of context — \
+  NOT `bash("grep ...")`.
+- `fd(pattern)` to locate files by name — NOT `bash("find ...")`.
+- `multi_edit(path, edits=[...])` when fixing several hunks in one file in a \
+  single call (atomic against the original; order-independent). For a single \
+  hunk, `str_replace` is fine.
+- `apply_patch(patch=<unified diff>)` to apply a multi-file diff in one call. \
+  Hunks that don't match end up in .rej files (partial apply); the tool \
+  result lists them.
+- `git_status` / `git_diff` to inspect your accumulated changes between \
+  iterations — first-class tools, not `bash("git ...")`.
+- `bash` remains available for everything else (pytest, package install, \
+  one-off shell ops).
 """
+
+# Backward-compat alias (do not remove until v1.7+)
+EXECUTOR_SYSTEM_PROMPT = PERFORMER_SYSTEM_PROMPT
 
 
 @dataclass
@@ -77,23 +116,23 @@ class ActivatorRun:
     iterations: int = 0
     final_text: Optional[str] = None
     failure_reason: Optional[str] = None
-    criterion_fail_streak: int = 0   # F4: consecutive criterion FAILs
-    replan_count: int = 0            # F2/F3: replans issued (0=initial, 1=replanned, 2=free-form)
-    free_form: bool = False          # F3: True once plan is dropped to single free-form step
-    consecutive_nonwrite: int = 0    # W1: consecutive non-write tool calls (write resets it)
-    prior_attempts: list[str] = field(default_factory=list)   # P1: compressed log of dropped turns
-    _recent_turns: list[list[dict]] = field(default_factory=list)  # P1: raw recent turn message groups
-    criterion_history: list[tuple[int, str]] = field(default_factory=list)  # (iter, evidence) for each FAIL
+    suspend_reason: Optional[str] = None
+    prior_attempts: list[str] = field(default_factory=list)            # P1: compressed log of dropped turns
+    _recent_turns: list[list[dict]] = field(default_factory=list)       # P1: raw recent turn snapshots
+    grant: set[str] = field(default_factory=set)                        # capabilities granted at admission
+    # 1.6.1: event-id landmarks — track causal parents for DAG discipline
+    last_state_event_id: str = ""                                       # most recent contract_state event
+    last_perform_event_id: str = ""                                      # most recent capability_perform event
+    last_stipulate_event_id: str = ""                                   # contract_stipulate event (admission's parent)
+    last_admit_event_id: str = ""                                       # contract_admit event
+    last_iter_anchor: str = ""                                          # last event in the current iteration chain
 
 
 def _extract_turn_summary(msgs: list[dict], turn_num: int) -> str:
     """Compress one turn's messages to a single line for the prior-attempts log.
 
     Format: 't01 bash("pip install pandas") → ERR: pip not found'
-
-    This is deterministic — no LLM call. We extract the first tool call's name +
-    key argument, and the first line of the tool result (success or error).
-    Returns "" if the turn has no tool call (e.g. executor said DONE).
+    Returns "" if the turn has no tool call.
     """
     tool_name = arg_preview = outcome = ""
     for msg in msgs:
@@ -135,171 +174,277 @@ class Activator:
         registry: CapabilityRegistry,
         recorder: Recorder,
         max_iterations: int = 40,
-        max_criterion_fails: int = 12,    # F4: exit if criterion fails this many times in a row
-        criterion_check_interval: int = 1, # P2: only probe criterion every N iterations
-        window_size: int = 4,              # P1: raw turns to keep; older turns → prior_attempts log
+        criterion_check_interval: int = 1,
+        window_size: int = 4,
     ):
         self.llm = llm
         self.registry = registry
         self.recorder = recorder
         self.max_iterations = max_iterations
-        self.max_criterion_fails = max_criterion_fails
         self.criterion_check_interval = criterion_check_interval
         self.window_size = window_size
 
     # ── Public entry ────────────────────────────────────────────────────────
 
     def run(self, contract: Contract, state: State) -> ActivatorRun:
-        """Run the 8-step loop on `contract` until terminal state. Returns the run record."""
+        """Run the 8-step loop on `contract` until terminal state."""
         run = ActivatorRun(contract=contract, state=state)
-        self._record_state(contract, ContractState.LATENT)
+        self._record_state(contract, ContractState.LATENT, run)
 
-        # Step 1: INGEST — already done by caller passing in `contract`.
+        # Step 1: INGEST — done by caller passing in `contract`.
 
-        # Step 2: REPRESENT — establish verified facts before any planning.
-        # Pre-set representations (injected by caller before activator.run) are
-        # preserved: REPRESENT probes are appended, not overwritten.
+        # Step 2: REPRESENT — verified facts before any planning.
+        # Probes chain from the LATENT state event for proper DAG causality.
         representer = Representer(registry=self.registry, recorder=self.recorder)
         pre_reps = list(contract.representations or [])
-        contract.representations = pre_reps + representer.represent(contract, state)
+        contract.representations = pre_reps + representer.represent(
+            contract, state, parent_event_id=run.last_state_event_id,
+        )
+        represent_event_id = representer.represent_event_id(contract)
 
         # Post-REPRESENT: if a test oracle was discovered, inject it as the primary criterion.
         self._maybe_inject_oracle_criterion(contract)
 
-        # Step 3: DECOMPOSE — planner receives obligation + representations.
-        self._decompose(contract, run)
+        # Step 3: STIPULATE — planner sees obligation + representations.
+        # Chains from contract_represent.
+        self._stipulate(contract, run, parent_event_id=represent_event_id)
 
-        # Step 4: EVALUATE (initial)
-        if not self._evaluate(contract, state, run):
+        # Step 4: ACTIVATE — one-shot admission gate.
+        # Chains from contract_stipulate.
+        decision = self._admit(contract, state, run)
+        self._record_admission(contract, decision, run)
+        if not decision.ok:
+            self._apply_admission_failure(contract, run, decision)
+            self._finalize(contract, run)
             return run
 
-        # Move LATENT → ELIGIBLE → ACTIVE
-        self._transition(contract, ContractState.ELIGIBLE, "conditions met")
-        self._transition(contract, ContractState.ACTIVE, "selected for execution")
+        run.grant = decision.grant
+        contract.grant = decision.grant
+        self._transition(contract, ContractState.ELIGIBLE, "admission gate passed", run)
+        self._transition(contract, ContractState.ACTIVE, "discharge begins", run)
+        run.last_iter_anchor = run.last_state_event_id   # iter 1 chains from ACTIVE state
 
         self._init_executor_messages(contract, run)
 
-        # Main loop — bounded by every constraint
+        # Discharge loop — Steps 5-8 repeat until terminal.
         while contract.state == ContractState.ACTIVE:
-            # Step 4 (per-iter): EVALUATE budget
-            if not self._evaluate(contract, state, run):
+            # Per-iter budget enforcement (separate from admission's capacity check)
+            if not self._check_budget(contract, state, run):
                 break
 
             if run.iterations >= self.max_iterations:
-                self._transition(contract, ContractState.FAILED,
-                                 f"max_iterations {self.max_iterations} reached")
-                run.failure_reason = "max_iterations"
+                # Step 8 CLOSE — criterion unreachable within iteration envelope.
+                # Transition to SUSPENDED (not FAILED): the world could change
+                # and a re-admission attempt could yet succeed.
+                self._transition(
+                    contract, ContractState.SUSPENDED,
+                    f"max_iterations {self.max_iterations} reached without criterion satisfaction",
+                    run,
+                )
+                run.suspend_reason = "criterion_unreachable: iteration envelope exhausted"
+                contract.suspend_reason = run.suspend_reason
+                contract.re_entry_condition = "fresh representations or extended envelope"
                 break
 
-            # Step 5: SELECT — v1 always uses the executor LLM with tools
-            # Step 6: ACTIVATE (increments run.iterations)
-            iter_start_len = len(run.messages)  # P1: mark start of this turn
-            keep_going = self._activate_once(contract, state, run)
+            # Step 5 SELECT (v1: fixed executor) + Step 6 INVOKE
+            iter_start_len = len(run.messages)
+            keep_going = self._perform_once(contract, state, run)
             if not keep_going:
-                # Executor declared DONE or emitted no tool call.
+                # Executor signaled DONE or emitted no tool call.
                 if self._verify_criteria(contract, state, run):
                     self._transition(contract, ContractState.FULFILLED,
-                                     "executor stopped and criteria satisfied")
+                                     "executor stopped and criteria satisfied", run)
                 else:
                     self._transition(contract, ContractState.FAILED,
-                                     "executor stopped before criteria satisfied")
+                                     "executor stopped before criteria satisfied", run)
                     run.failure_reason = "executor_quit_early"
                 break
 
-            # Step 7 (post-activate): verify criteria on interval OR when all steps done.
-            # Avoids running an expensive test-runner probe on every single iteration.
+            # Step 7 VERIFY — criterion on interval OR when all plan steps done.
             all_steps_done = bool(run.plan) and all(s.complete for s in run.plan)
             should_check = (run.iterations % self.criterion_check_interval == 0) or all_steps_done
-            criterion_checked = False
             if should_check:
-                criterion_checked = True
                 if self._verify_criteria(contract, state, run):
-                    self._transition(contract, ContractState.FULFILLED, "all criteria satisfied")
+                    self._transition(contract, ContractState.FULFILLED, "all criteria satisfied", run)
                     break
 
-                replan_threshold = max(1, self.max_criterion_fails // 2)
-                if run.criterion_fail_streak >= replan_threshold:
-                    if run.replan_count == 0:
-                        # F2: first escape — call planner again with context of what was tried
-                        self._do_replan(contract, run, state)
-                    elif not run.free_form:
-                        # F3: second escape — drop plan, run free like ReAct
-                        self._enter_free_form(contract, run)
-                    else:
-                        # All escapes exhausted — give up
-                        self._transition(
-                            contract, ContractState.FAILED,
-                            f"criterion_unreachable after replan+free-form ({run.criterion_fail_streak} fails)",
-                        )
-                        run.failure_reason = "criterion_unreachable"
-                        break
+            # Step 7 (judge) — advisory per-step completion
+            self._update_plan_checklist(contract, run)
 
-            # Step 7 (judge): advisory — skip in free-form mode (no plan steps to evaluate)
-            if not run.free_form:
-                self._update_plan_checklist(contract, run)
-
-            # P1: sliding window — compress the oldest turn into prior_attempts log
+            # P1 sliding window: drop the oldest raw turn → compressed prior_attempts entry
             turn_msgs = run.messages[iter_start_len:]
             self._prune_to_window(contract, run, turn_msgs)
 
-        self.recorder.append(TraceEvent(
-            event_id=f"step-{uuid.uuid4().hex[:6]}",
-            parent_id=contract.id,
-            ts=utcnow_iso(),
-            kind="step_end",
-            payload={
-                "iterations": run.iterations,
-                "final_state": contract.state.value,
-                "cost": _cost_dict(contract.cost),
-            },
-        ))
+        self._finalize(contract, run)
         return run
+
+    # ── Cost charging ────────────────────────────────────────────────────────
+    # Every LLM call goes through _charge_llm; every tool invocation goes through
+    # _charge_tool. These are the SINGLE SOURCE OF TRUTH for cost accumulation.
+    # Direct increments to contract.cost.* outside these helpers create budget
+    # escapes (see PLAN.md 1.5.15 for the audit that led to this).
+
+    def _charge_llm(self, contract: Contract, result: LLMResult) -> None:
+        contract.cost.tokens_in  += result.tokens_in
+        contract.cost.tokens_out += result.tokens_out
+        contract.cost.usd        += result.usd
+        contract.cost.llm_calls  += 1
+        contract.cost.wall_s     += float(result.raw.get("wall_s", 0.0))
+
+    def _charge_tool(self, contract: Contract, result: ToolResult) -> None:
+        contract.cost.tool_calls += 1
+        contract.cost.wall_s     += float(result.wall_s)
 
     # ── Step 3: DECOMPOSE ───────────────────────────────────────────────────
 
-    def _decompose(self, contract: Contract, run: ActivatorRun) -> None:
-        steps = call_planner(
+    def _stipulate(
+        self, contract: Contract, run: ActivatorRun, parent_event_id: Optional[str] = None,
+    ) -> None:
+        # Planner LLM call chains from contract_represent (parent_event_id).
+        # contract_stipulate then chains from the planner llm_usage event.
+        # We don't know the llm_usage event_id pre-call, so use the most-recent-
+        # event approximation: contract_stipulate chains from parent_event_id
+        # (contract_represent) since the planner llm_usage is itself a sibling.
+        steps, planner_result = call_stipulator(
             self.llm,
             contract.obligation,
             representations=contract.representations or None,
+            parent_event_id=parent_event_id,
         )
+        self._charge_llm(contract, planner_result)
         if not steps:
-            # Fall back to a single step that mirrors the obligation.
             steps = [{"id": "s1", "description": contract.obligation.strip().splitlines()[0][:200]}]
         run.plan = [_PlanStep(id=s["id"], description=s["description"]) for s in steps]
-        contract.cost.llm_calls += 1
+        event_id = f"dec-{uuid.uuid4().hex[:6]}"
+        # Parent = the most-recent llm_usage (planner) which produced this plan.
+        # The recorder's last event was the planner llm_usage event.
+        dec_parent = self.recorder.traj.events[-1].event_id if self.recorder.traj.events else parent_event_id
         self.recorder.append(TraceEvent(
-            event_id=f"dec-{uuid.uuid4().hex[:6]}",
-            parent_id=contract.id,
+            event_id=event_id,
+            parent_id=dec_parent,
             ts=utcnow_iso(),
-            kind="contract_decompose",
+            kind="contract_stipulate",
             payload={
                 "contract_id": contract.id,
                 "steps": [{"id": s.id, "description": s.description} for s in run.plan],
             },
         ))
+        run.last_stipulate_event_id = event_id
 
-    # ── Step 4: EVALUATE budget ─────────────────────────────────────────────
+    # ── Step 4: ACTIVATE — admission gate ───────────────────────────────────
 
-    def _evaluate(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
-        """Return True if still eligible to continue; False otherwise (transitions to FAILED/EXPIRED)."""
+    def _admit(self, contract: Contract, state: State, run: ActivatorRun) -> AdmissionDecision:
+        """One-shot admission validation. Three checks → grant.
+
+        (a) Boundary — is the contract well-formed?
+        (b) Environment — does the world match the contract's assumptions?
+        (c) Capacity — is there room to run?
+        (d) Grant — derive granted capability set (v1: full registry).
+        """
+        # (a) Boundary
+        if not (contract.obligation or "").strip():
+            return AdmissionDecision.reject("boundary", "empty obligation")
+        if not contract.criteria:
+            return AdmissionDecision.reject("boundary", "no criteria declared")
+        if not run.plan:
+            return AdmissionDecision.reject("boundary", "empty plan from DECOMPOSE")
+        cons = contract.constraints
+        if cons.max_tokens_total <= 0 or cons.max_tool_calls <= 0 or cons.max_llm_calls <= 0:
+            return AdmissionDecision.reject("boundary", "non-positive constraint bounds")
+        now = time.time()
+        if cons.deadline_ts is not None and now > cons.deadline_ts:
+            return AdmissionDecision.reject("boundary", "deadline already passed")
+
+        # (b) Environment
+        if not contract.conditions_met(state):
+            return AdmissionDecision.reject("environment", "declared conditions not met")
+        # Capability availability: every capability mentioned in `contract.capabilities`
+        # must exist in the registry. (Plan-step-derived capability requirements are
+        # v2 work; v1 only validates the declared set.)
+        for cap_name in contract.capabilities or []:
+            if self.registry.get(cap_name) is None:
+                return AdmissionDecision.reject(
+                    "environment", f"capability '{cap_name}' not in registry",
+                )
+
+        # (c) Capacity
+        violation = cons.check(contract.cost, contract.depth, now)
+        if violation:
+            return AdmissionDecision.reject("capacity", violation)
+
+        # (d) Grant — v1: full registry. v2 will derive a subset from plan steps.
+        grant = set(self.registry.names())
+
+        # (e) Lock the deadline: absolute wall-clock time by which the contract
+        # must close. Per-iteration _check_budget enforces it via
+        # Constraints.check() — the contract owns its envelope, not the harness.
+        if contract.constraints.deadline_ts is None and contract.constraints.max_wall_s > 0:
+            contract.constraints.deadline_ts = time.time() + contract.constraints.max_wall_s
+
+        return AdmissionDecision.admit(grant)
+
+    def _apply_admission_failure(
+        self, contract: Contract, run: ActivatorRun, decision: AdmissionDecision,
+    ) -> None:
+        """Consult contract.policy for the response to an admission failure."""
+        response = contract.policy.response_for(decision.failure_type)  # type: ignore[arg-type]
+        reason = f"admission_{decision.failure_type}: {decision.reason}"
+
+        if response == "FAIL":
+            self._transition(contract, ContractState.FAILED, reason, run)
+            run.failure_reason = reason
+        elif response == "SUSPEND":
+            self._transition(contract, ContractState.SUSPENDED, reason, run)
+            run.suspend_reason = reason
+            contract.suspend_reason = reason
+            contract.re_entry_condition = decision.reason
+        elif response == "ESCALATE":
+            # v1: ESCALATE has no parent contract to receive it; treat as FAIL with tag.
+            self._transition(contract, ContractState.FAILED, f"escalate: {reason}", run)
+            run.failure_reason = f"escalate: {reason}"
+        elif response == "ASK_USER":
+            # v1: no user-input capability yet; treat as SUSPEND tagged as awaiting user.
+            self._transition(contract, ContractState.SUSPENDED, f"ask_user: {reason}", run)
+            run.suspend_reason = f"ask_user: {reason}"
+            contract.suspend_reason = run.suspend_reason
+            contract.re_entry_condition = "user input"
+
+    def _record_admission(
+        self, contract: Contract, decision: AdmissionDecision, run: ActivatorRun,
+    ) -> None:
+        event_id = f"admit-{uuid.uuid4().hex[:6]}"
+        self.recorder.append(TraceEvent(
+            event_id=event_id,
+            parent_id=run.last_stipulate_event_id or None,
+            ts=utcnow_iso(),
+            kind="contract_admit",
+            payload={
+                "contract_id": contract.id,
+                "ok": decision.ok,
+                "failure_type": decision.failure_type,
+                "reason": decision.reason,
+                "grant": sorted(decision.grant) if decision.ok else [],
+            },
+        ))
+        run.last_admit_event_id = event_id
+
+    # ── Per-iteration budget enforcement ────────────────────────────────────
+
+    def _check_budget(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
+        """Return True if still within envelope; transition + return False otherwise."""
         now = time.time()
         violation = contract.constraints.check(contract.cost, contract.depth, now)
         if violation:
             self._transition(contract, ContractState.FAILED, f"budget violation: {violation}")
             run.failure_reason = violation
             return False
-        if not contract.conditions_met(state):
-            # Should not happen for the root contract (no conditions), but safe to check
-            self._transition(contract, ContractState.SUSPENDED, "conditions not met")
-            return False
         return True
 
-    # ── Step 6: ACTIVATE one capability ─────────────────────────────────────
+    # ── Step 6: INVOKE one capability ───────────────────────────────────────
 
     def _init_executor_messages(self, contract: Contract, run: ActivatorRun) -> None:
         run.messages = [
-            {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
+            {"role": "system", "content": PERFORMER_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_user_prompt(contract, run)},
         ]
 
@@ -333,63 +478,41 @@ class Activator:
             f"usd: ${c.usd:.4f}/${b.max_usd:.2f}"
         )
 
-    # ── Action Realization (LIFE-Harness Layer 3) ──────────────────────────
-    _MARKDOWN_FENCE_RE = re.compile(r"^```[\w]*\n?|```$", re.MULTILINE)
-
-    def _realize_action(self, tool_name: str, args: dict, state: State) -> dict:
-        args = dict(args)
-        if tool_name in ("write", "read", "list", "str_replace"):
-            path = args.get("path")
-            if isinstance(path, str):
-                args["path"] = path.replace("\\", "/").lstrip("./")
-        if tool_name == "write":
-            content = args.get("content")
-            if isinstance(content, str) and content.startswith("```"):
-                args["content"] = self._MARKDOWN_FENCE_RE.sub("", content).strip() + "\n"
-        if tool_name == "bash":
-            timeout = args.get("timeout_s")
-            if isinstance(timeout, str):
-                try:
-                    args["timeout_s"] = float(timeout)
-                except ValueError:
-                    del args["timeout_s"]
-        return args
-
-    # ── Failure Attribution (LIFE-Harness taxonomy, priority-ordered) ─────
-    @staticmethod
-    def _attribute_tool_failure(result: ToolResult) -> str:
-        out = result.output.lower()
-        detail = result.detail or {}
-        if detail.get("precondition_failed"):
-            return "environment_contract"
-        if any(s in out for s in ("missing", "unknown tool", "invalid", "json", "type")):
-            return "action_realization"
-        if any(s in out for s in ("not found", "permission", "escapes workdir", "timeout")):
-            return "environment_contract"
-        return "residual_reasoning"
-
-    def _activate_once(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
+    def _perform_once(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
         """One executor turn: ask LLM for next action, run the tool call (if any).
 
         Increments run.iterations. Returns True if the loop should continue
         (a tool was called); False if the executor signaled DONE or emitted no
         tool call.
+
+        v1: the tool schema exposed to the LLM is the full registry. v2 will
+        restrict the schema to the grant computed at admission time.
         """
         run.iterations += 1
-        tools = self.registry.tool_schemas()
+        tools = self.registry.tool_schemas(only=run.grant or None)
+        # Iteration N chains from iteration N-1 (or ACTIVE state for iter 1).
+        # last_iter_anchor: the event that this iteration's executor LLM call
+        # logically follows. Updated after VERIFY so iter N+1 chains from the
+        # last verify event if one ran.
+        iter_parent = (
+            run.last_iter_anchor
+            or run.last_perform_event_id
+            or run.last_admit_event_id
+            or run.last_state_event_id
+            or None
+        )
         result = self.llm.chat(
             messages=run.messages,
             tools=tools,
             tool_choice="auto",
-            role_tag="executor",
+            role_tag="performer",
             temperature=0.2,
+            parent_event_id=iter_parent,
         )
-        contract.cost.tokens_in += result.tokens_in
-        contract.cost.tokens_out += result.tokens_out
-        contract.cost.usd += result.usd
-        contract.cost.llm_calls += 1
+        # The executor llm_usage event was just appended (last event in trace).
+        executor_llm_event_id = self.recorder.traj.events[-1].event_id
+        self._charge_llm(contract, result)
 
-        # Append assistant turn (tool_calls or text)
         if result.tool_calls:
             run.messages.append({
                 "role": "assistant",
@@ -410,18 +533,21 @@ class Activator:
             run.messages.append({"role": "assistant", "content": result.text or ""})
 
         if not result.tool_calls:
-            # No tool call. Treat any "DONE" text as a stop signal; criteria verify next.
             run.final_text = result.text
             return False
 
         # Discipline: only execute the FIRST tool call this turn.
+        # No silent argument normalization — args are passed to the registry as the
+        # LLM emitted them. Malformed args produce tool errors that the executor
+        # sees in the next turn, same as any other failure.
         first = result.tool_calls[0]
-        first["arguments"] = self._realize_action(first["name"], first["arguments"], state)
+        invoke_event_id = f"inv-{uuid.uuid4().hex[:6]}"
+        # capability_perform chains from the executor llm_usage that produced this tool call
         self.recorder.append(TraceEvent(
-            event_id=f"act-{uuid.uuid4().hex[:6]}",
-            parent_id=contract.id,
+            event_id=invoke_event_id,
+            parent_id=executor_llm_event_id,
             ts=utcnow_iso(),
-            kind="capability_activate",
+            kind="capability_perform",
             payload={
                 "contract_id": contract.id,
                 "tool": first["name"],
@@ -430,6 +556,9 @@ class Activator:
                 "iteration": run.iterations,
             },
         ))
+        run.last_perform_event_id = invoke_event_id
+        run.last_iter_anchor = invoke_event_id   # next iter chains from here (may be overridden by VERIFY)
+
         tool_result: ToolResult = self.registry.invoke(
             name=first["name"],
             args=first["arguments"],
@@ -437,32 +566,10 @@ class Activator:
             recorder=self.recorder,
             contract_id=contract.id,
             tool_call_id=first["id"],
+            parent_event_id=invoke_event_id,
         )
-        contract.cost.tool_calls += 1
+        self._charge_tool(contract, tool_result)
 
-        if tool_result.is_error:
-            layer = self._attribute_tool_failure(tool_result)
-            self.recorder.append(TraceEvent(
-                event_id=f"fail-{uuid.uuid4().hex[:6]}",
-                parent_id=contract.id,
-                ts=utcnow_iso(),
-                kind="failure_attribution",
-                payload={
-                    "layer": layer,
-                    "description": tool_result.output[:300],
-                    "tool": first["name"],
-                    "args": first["arguments"],
-                    "iteration": run.iterations,
-                },
-            ))
-
-        # W1: track write pressure — reset on any "write" tool call
-        if first["name"] == "write":
-            run.consecutive_nonwrite = 0
-        else:
-            run.consecutive_nonwrite += 1
-
-        # Feed the tool result back to the LLM thread.
         run.messages.append({
             "role": "tool",
             "tool_call_id": first["id"],
@@ -470,9 +577,8 @@ class Activator:
             else f"[ERROR] {tool_result.output}",
         })
 
-        # If there were extra parallel tool_calls in the assistant message, OpenAI
-        # requires a matching tool message for each. Reply to ignored ones with
-        # a stub so the thread stays valid for the next call.
+        # OpenAI requires a matching tool message for any extra parallel tool_calls
+        # emitted by the assistant; reply with a stub for ignored ones.
         for skipped in result.tool_calls[1:]:
             run.messages.append({
                 "role": "tool",
@@ -482,191 +588,12 @@ class Activator:
 
         return True
 
-    # ── Criterion history summary ───────────────────────────────────────────
-
-    def _build_criterion_context(self, run: ActivatorRun) -> str:
-        """Compact summary of every criterion FAIL so far.
-
-        Passed into replan and free-form prompts so the planner/executor
-        knows *why* the criterion kept failing, not just what tools were called.
-        Format: one line per check — 'iter NN: <evidence>'
-        """
-        if not run.criterion_history:
-            return ""
-        lines = ["CRITERION FEEDBACK (why the goal was not yet satisfied):"]
-        # Deduplicate consecutive identical evidence — long runs repeat the same message
-        last_ev = ""
-        repeat = 0
-        for iter_num, ev in run.criterion_history:
-            if ev == last_ev:
-                repeat += 1
-            else:
-                if repeat > 0:
-                    lines.append(f"  ... (same verdict repeated {repeat}x)")
-                    repeat = 0
-                lines.append(f"  iter {iter_num:02d}: {ev}")
-                last_ev = ev
-        if repeat > 0:
-            lines.append(f"  ... (same verdict repeated {repeat}x)")
-        lines.append(
-            "Your NEXT plan MUST directly address these failure reasons. "
-            "Do not repeat approaches that already failed."
-        )
-        return "\n".join(lines)
-
-    # ── F2: Dynamic replan ──────────────────────────────────────────────────
-
-    def _do_replan(self, contract: Contract, run: ActivatorRun, state: State) -> None:
-        """Call the planner again with a summary of what was tried.
-
-        Replaces run.plan with a fresh plan grounded in prior-attempts context.
-        Resets the criterion_fail_streak so the executor gets a full budget.
-        """
-        from cat.contracts import Representation
-        reps = list(contract.representations or [])
-        crit_ctx = self._build_criterion_context(run)
-        if run.prior_attempts or crit_ctx:
-            tried = "\n".join(f"  {l}" for l in run.prior_attempts[-15:])
-            evidence = ""
-            if crit_ctx:
-                evidence += crit_ctx + "\n\n"
-            if tried:
-                evidence += f"WHAT WAS TRIED (tool call log):\n{tried}"
-            reps = [r for r in reps if r.key != "prior_attempts"]
-            reps.append(Representation(
-                key="prior_attempts",
-                value="previous approach failed — generate a different plan",
-                evidence=evidence.strip(),
-            ))
-
-        # Inject latest oracle failure output so the planner sees exact test errors
-        # after partial changes (not just the initial pre-run failure).
-        last_test_output = state.kv.get("last_criterion_output", "")
-        if last_test_output:
-            reps = [r for r in reps if r.key != "latest_test_failure"]
-            reps.append(Representation(
-                key="latest_test_failure",
-                value="oracle output after most recent changes (still failing)",
-                evidence=(
-                    "LATEST TEST FAILURE (after your changes so far):\n"
-                    "Use this to understand what still needs to be fixed.\n\n"
-                    + last_test_output[-2000:]
-                ),
-            ))
-
-        # Probe git diff to show what changes were made so far.
-        # Gives the planner concrete evidence of partial progress — avoids
-        # replanning from scratch when the fix is close (e.g. wrong function edited).
-        diff_result = self.registry.invoke(
-            name="bash",
-            args={"command": "git diff HEAD --stat 2>/dev/null; git diff HEAD 2>/dev/null | head -80", "timeout_s": 15},
-            state=state,
-            recorder=self.recorder,
-            contract_id=contract.id,
-            tool_call_id=f"replan-diff-{uuid.uuid4().hex[:6]}",
-        )
-        contract.cost.tool_calls += 1
-        diff_text = diff_result.output.strip()
-        if diff_text and diff_text != "(no output)":
-            reps = [r for r in reps if r.key != "current_diff"]
-            reps.append(Representation(
-                key="current_diff",
-                value="files changed so far (git diff HEAD)",
-                evidence=f"Changes made so far (may be incomplete or incorrect):\n{diff_text[:2000]}",
-            ))
-
-        new_steps = call_planner(self.llm, contract.obligation, representations=reps)
-        contract.cost.llm_calls += 1
-        if not new_steps:
-            return  # planner failed — keep current plan
-        run.plan = [_PlanStep(id=s["id"], description=s["description"]) for s in new_steps]
-        run.replan_count += 1
-        run.criterion_fail_streak = 0
-
-        self.recorder.append(TraceEvent(
-            event_id=f"replan-{uuid.uuid4().hex[:6]}",
-            parent_id=contract.id,
-            ts=utcnow_iso(),
-            kind="contract_decompose",
-            payload={
-                "contract_id": contract.id,
-                "replan": run.replan_count,
-                "steps": [{"id": s.id, "description": s.description} for s in run.plan],
-            },
-        ))
-
-        # Rebuild executor messages with fresh plan + criterion feedback
-        run.messages = [
-            {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
-            {"role": "user", "content": self._build_user_prompt(contract, run)},
-        ]
-        context_parts = []
-        if run.prior_attempts:
-            log = "\n".join(f"  {l}" for l in run.prior_attempts[-20:])
-            context_parts.append("PRIOR ATTEMPTS (do not repeat these approaches):\n" + log)
-        if crit_ctx:
-            context_parts.append(crit_ctx)
-        if context_parts:
-            run.messages.append({
-                "role": "user",
-                "content": "\n\n".join(context_parts),
-            })
-
-    def _enter_free_form(self, contract: Contract, run: ActivatorRun) -> None:
-        """Drop the plan entirely — executor runs free like ReAct.
-
-        Replaces the plan with a single open-ended step. No per-step judge.
-        The criterion gate still applies; we just remove the plan structure
-        so the executor is not constrained to a multi-step checklist.
-        """
-        run.free_form = True
-        run.replan_count += 1
-        run.criterion_fail_streak = 0
-        run.plan = [_PlanStep(
-            id="free",
-            description="Satisfy the criterion by any means. No plan constraints.",
-        )]
-
-        self.recorder.append(TraceEvent(
-            event_id=f"freeform-{uuid.uuid4().hex[:6]}",
-            parent_id=contract.id,
-            ts=utcnow_iso(),
-            kind="contract_decompose",
-            payload={
-                "contract_id": contract.id,
-                "replan": run.replan_count,
-                "free_form": True,
-                "steps": [{"id": "free", "description": "free-form: satisfy criterion"}],
-            },
-        ))
-
-        prior_log = "\n".join(f"  {l}" for l in run.prior_attempts[-20:]) if run.prior_attempts else "(none)"
-        crit_ctx = self._build_criterion_context(run)
-        run.messages = [
-            {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"OBLIGATION:\n{contract.obligation}\n\n"
-                "MODE: FREE-FORM — structured plans have not satisfied the criterion. "
-                "Act freely: read, write, run whatever is needed. "
-                "The criterion will tell you when you succeed. No checklist constraints.\n\n"
-                f"PRIOR ATTEMPTS (do not repeat):\n{prior_log}\n\n"
-                + (f"{crit_ctx}\n\n" if crit_ctx else "")
-                + f"BUDGET:\n{self._format_budget(contract)}\n\n"
-                "Take ONE action now."
-            )},
-        ]
-
     # ── Oracle criterion injection ───────────────────────────────────────────
 
     def _maybe_inject_oracle_criterion(self, contract: Contract) -> None:
-        """If REPRESENT found a test oracle and no oracle criterion exists, inject one.
-
-        Oracle criteria are authoritative: _verify_criteria runs only oracle criteria
-        when any are present, skipping LLM-judge criteria entirely. This ensures the
-        contract closes on real test results, not on model opinion.
-        """
+        """If REPRESENT found a test oracle and no oracle criterion exists, inject one."""
         if any(c.is_oracle for c in contract.criteria):
-            return  # oracle already set (e.g. by benchmarks.swe_bench.TbSweAgent)
+            return
 
         strategy_rep = next(
             (r for r in (contract.representations or []) if r.key == "judge_strategy"),
@@ -679,20 +606,20 @@ class Activator:
         if not oracle_cmd:
             return
 
-        contract.criteria.insert(0, self._build_oracle_criterion(oracle_cmd))
+        contract.criteria.insert(0, self._build_oracle_criterion(contract, oracle_cmd))
 
-    def _build_oracle_criterion(self, command: str) -> "Criterion":
-        """Wrap a shell command as an authoritative oracle Criterion.
-
-        Passes when the command exits 0 (is_error=False from the bash handler).
-        Works in both local (subprocess) and tmux (terminal-bench) modes because
-        both bash handlers set is_error based on exit code.
-        """
+    def _build_oracle_criterion(self, contract: Contract, command: str) -> "Criterion":
         from cat.contracts import Criterion, Evidence
         registry = self.registry
         recorder = self.recorder
+        charge_tool = self._charge_tool   # capture; contract is closed-over
 
         def _predicate(state: State) -> tuple[bool, Evidence]:
+            # Parent of oracle's bash tool_call is the last event in the trace.
+            # When called from _verify_criteria mid-loop, that's the last invoke;
+            # when called from TbSweAgent._initial_representations, that's the
+            # latent state event. Either is the correct causal parent.
+            parent = recorder.traj.events[-1].event_id if recorder.traj.events else None
             result = registry.invoke(
                 name="bash",
                 args={"command": command, "timeout_s": 120},
@@ -700,7 +627,11 @@ class Activator:
                 recorder=recorder,
                 contract_id="oracle-check",
                 tool_call_id=f"oracle-{uuid.uuid4().hex[:6]}",
+                parent_event_id=parent,
             )
+            # Oracle bash runs every criterion check — charge it to the contract
+            # so its tool_calls + wall_s do not silently escape the envelope.
+            charge_tool(contract, result)
             passed = not result.is_error
             summary = ("PASS" if passed else "FAIL") + f": oracle ({command[:60]})"
             return passed, Evidence(
@@ -720,9 +651,9 @@ class Activator:
     def _verify_criteria(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
         """Run criteria. Oracle criteria are authoritative; LLM criteria are fallback.
 
-        If any criterion has is_oracle=True, ONLY oracle criteria are evaluated —
-        LLM-judge criteria are skipped entirely. This prevents a lenient LLM from
-        closing a contract when the real tests still fail.
+        When any criterion has is_oracle=True, ONLY oracle criteria run; LLM-judge
+        criteria are skipped — the contract closes on real test results, not on
+        model opinion.
         """
         if not contract.criteria:
             return False
@@ -733,9 +664,17 @@ class Activator:
         all_ok = True
         for crit in crits_to_run:
             ok = crit.check(state)
+            # criterion_check chains from the oracle bash tool_result (last appended
+            # event during crit.check), which itself chains from the invoke.
+            crit_parent = (
+                self.recorder.traj.events[-1].event_id
+                if self.recorder.traj.events
+                else run.last_perform_event_id
+            )
+            event_id = f"crit-{crit.id}-{uuid.uuid4().hex[:4]}"
             self.recorder.append(TraceEvent(
-                event_id=f"crit-{crit.id}-{uuid.uuid4().hex[:4]}",
-                parent_id=contract.id,
+                event_id=event_id,
+                parent_id=crit_parent,
                 ts=utcnow_iso(),
                 kind="criterion_check",
                 payload={
@@ -748,19 +687,9 @@ class Activator:
                     "is_oracle": crit.is_oracle,
                 },
             ))
+            run.last_iter_anchor = event_id   # next iter chains from this verify event
             if not ok:
                 all_ok = False
-
-        # F4: maintain consecutive-failure streak for criterion_unreachable detection
-        if all_ok:
-            run.criterion_fail_streak = 0
-        else:
-            run.criterion_fail_streak += 1
-            # Record the evidence from each failure so replans can learn from it.
-            for crit in crits_to_run:
-                if not crit.satisfied and crit.last_evidence:
-                    evidence = crit.last_evidence.summary[:200]
-                    run.criterion_history.append((run.iterations, evidence))
         return all_ok
 
     def _update_plan_checklist(self, contract: Contract, run: ActivatorRun) -> None:
@@ -771,16 +700,20 @@ class Activator:
         for step in run.plan:
             if step.complete:
                 continue
-            complete, reason = call_judge(self.llm, step.description, summary)
-            contract.cost.llm_calls += 1
+            # Judge LLM call chains from the current invoke (it's evaluating
+            # that invoke's effect on the plan step).
+            complete, reason, judge_result = call_attestor(
+                self.llm, step.description, summary,
+                parent_event_id=run.last_perform_event_id or None,
+            )
+            judge_llm_event_id = self.recorder.traj.events[-1].event_id
+            self._charge_llm(contract, judge_result)
             step.complete = complete
             step.last_reason = reason[:140]
-            # We don't have token harvest on the judge call separately at this
-            # layer (LLM class already recorded llm_usage). Step status remains
-            # advisory; the final close still rests on Criterion.predicate.
+            judge_event_id = f"judge-{step.id}-{uuid.uuid4().hex[:4]}"
             self.recorder.append(TraceEvent(
-                event_id=f"judge-{step.id}-{uuid.uuid4().hex[:4]}",
-                parent_id=contract.id,
+                event_id=judge_event_id,
+                parent_id=judge_llm_event_id,
                 ts=utcnow_iso(),
                 kind="criterion_check",
                 payload={
@@ -793,72 +726,46 @@ class Activator:
                     "iteration": run.iterations,
                 },
             ))
-            # Only ask judge for the first un-checked step per turn — keeps token
-            # cost bounded and matches the "address the first un-checked step"
-            # discipline rule.
+            run.last_iter_anchor = judge_event_id
+            # Only judge first un-checked step per turn (token budget discipline).
             break
 
-        # Re-issue the user prompt so the executor sees the updated checklist
-        # on the next turn. (We append a user message; the executor will
-        # produce the next tool_call in response.)
-        # W1: inject write-pressure warning if executor has been reading without writing
-        write_warning = ""
-        if run.consecutive_nonwrite >= 5:
-            write_warning = (
-                f"\n\n⚠️  WRITE PRESSURE ({run.consecutive_nonwrite} consecutive non-write actions): "
-                "You have spent your last several turns reading code without writing any changes. "
-                "Your VERY NEXT action MUST be a write tool call. "
-                "Do NOT read any more code. Write your best fix now — the criterion will verify correctness."
-            )
+        # Refresh executor's user prompt with the updated checklist for the next turn.
         run.messages.append({
             "role": "user",
             "content": (
                 "CHECKLIST UPDATE:\n"
                 f"{self._format_checklist(run)}\n\n"
                 f"BUDGET:\n{self._format_budget(contract)}\n\n"
-                "Take ONE action toward the first un-checked step, or reply DONE only if all are checked."
-                f"{write_warning}"
+                "Take ONE action toward the first un-checked step, "
+                "or reply DONE only if all are checked."
             ),
         })
 
     def _prune_to_window(
         self, contract: Contract, run: ActivatorRun, turn_msgs: list[dict]
     ) -> None:
-        """P1: Sliding window context management.
+        """P1: sliding window. Drop oldest raw turn → compressed prior_attempts entry.
 
-        After each complete iteration, record the turn's messages. When the
-        window overflows, drop the oldest raw turn and compress it to a one-line
-        entry in run.prior_attempts. Rebuild run.messages from:
-
-            [system]
-            [user: fresh obligation + current checklist + budget]
-            [user: PRIOR ATTEMPTS log]   ← only if non-empty
-            [last window_size raw turns]
-
-        The fresh user prompt replaces the stale initial prompt (which still shows
-        the original checklist). The prior_attempts log gives the executor negative
-        knowledge ("don't try pip install — it failed") without the token cost of
-        the full tool output.
-
-        Executor token cost: O(window * avg_turn_tokens + prior_log) instead of O(N).
+        After each iteration, snapshot the turn's messages. When window overflows,
+        drop the oldest snapshot and append a one-liner to prior_attempts. Rebuild
+        run.messages from [system, fresh user prompt, prior_attempts log, last N turns].
         """
         if self.window_size <= 0 or not turn_msgs:
             return
 
-        run._recent_turns.append(list(turn_msgs))  # snapshot
+        run._recent_turns.append(list(turn_msgs))
 
         if len(run._recent_turns) <= self.window_size:
-            return  # still within window, nothing to prune
+            return
 
-        # Drop oldest turn → compress to prior_attempts
         dropped = run._recent_turns.pop(0)
         summary = _extract_turn_summary(dropped, len(run.prior_attempts) + 1)
         if summary:
             run.prior_attempts.append(summary)
 
-        # Rebuild message thread from structured state
         new_msgs: list[dict] = [
-            {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
+            {"role": "system", "content": PERFORMER_SYSTEM_PROMPT},
             {"role": "user", "content": self._build_user_prompt(contract, run)},
         ]
         if run.prior_attempts:
@@ -881,7 +788,6 @@ class Activator:
                 f"LAST_IS_ERROR: {last.get('is_error')}\n"
                 f"LAST_OUTPUT (truncated):\n{(last.get('output') or '')[:1500]}\n"
             )
-        # Terminal-bench mode: use live pane capture instead of local workdir snapshot.
         terminal_output = run.state.kv.get("terminal_output")
         if terminal_output:
             snapshot = f"TERMINAL PANE (last capture):\n{terminal_output[:3000]}"
@@ -892,14 +798,22 @@ class Activator:
             f"WORKDIR SNAPSHOT:\n{snapshot}\n"
         )
 
-    # ── State + cost machinery ──────────────────────────────────────────────
+    # ── State machinery ─────────────────────────────────────────────────────
 
-    def _transition(self, contract: Contract, to: ContractState, reason: str) -> None:
+    def _transition(
+        self, contract: Contract, to: ContractState, reason: str,
+        run: Optional[ActivatorRun] = None,
+    ) -> None:
+        # Causal-parent semantics: a state transition is caused by the event
+        # that just preceded it (admission decision, criterion check, budget
+        # violation, etc.). Default to "last appended event" which is naturally
+        # the cause by virtue of sequential execution order.
+        last_ev = self.recorder.traj.events[-1].event_id if self.recorder.traj.events else None
         if not contract.can_transition(to):
-            # Forbidden transition — record as terminal failure rather than silent skip.
+            # Rejected transition; chain from the cause but don't update cursor
             self.recorder.append(TraceEvent(
                 event_id=f"state-{uuid.uuid4().hex[:6]}",
-                parent_id=contract.id,
+                parent_id=last_ev,
                 ts=utcnow_iso(),
                 kind="contract_state",
                 payload={
@@ -914,9 +828,10 @@ class Activator:
         prev = contract.state
         contract.state = to
         contract.state_reason = reason
+        event_id = f"state-{uuid.uuid4().hex[:6]}"
         self.recorder.append(TraceEvent(
-            event_id=f"state-{uuid.uuid4().hex[:6]}",
-            parent_id=contract.id,
+            event_id=event_id,
+            parent_id=last_ev,
             ts=utcnow_iso(),
             kind="contract_state",
             payload={
@@ -926,12 +841,14 @@ class Activator:
                 "reason": reason,
             },
         ))
+        if run is not None:
+            run.last_state_event_id = event_id
 
-    def _record_state(self, contract: Contract, state: ContractState) -> None:
-        # Used once at run start to log the initial state.
+    def _record_state(self, contract: Contract, state: ContractState, run: ActivatorRun) -> None:
+        event_id = f"state-init-{contract.id}"
         self.recorder.append(TraceEvent(
-            event_id=f"state-init-{contract.id}",
-            parent_id=None,
+            event_id=event_id,
+            parent_id=None,    # ROOT of the DAG
             ts=utcnow_iso(),
             kind="contract_state",
             payload={
@@ -940,6 +857,21 @@ class Activator:
                 "to": state.value,
                 "reason": "ingested",
                 "obligation": contract.obligation,
+            },
+        ))
+        run.last_state_event_id = event_id
+
+    def _finalize(self, contract: Contract, run: ActivatorRun) -> None:
+        # step_end chains from the terminal state transition (last state event)
+        self.recorder.append(TraceEvent(
+            event_id=f"step-{uuid.uuid4().hex[:6]}",
+            parent_id=run.last_state_event_id or None,
+            ts=utcnow_iso(),
+            kind="step_end",
+            payload={
+                "iterations": run.iterations,
+                "final_state": contract.state.value,
+                "cost": _cost_dict(contract.cost),
             },
         ))
 
