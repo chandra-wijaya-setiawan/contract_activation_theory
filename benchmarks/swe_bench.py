@@ -330,6 +330,16 @@ class TbSweAgent(TbCatAgent):
             return reps  # Already passing — nothing to inject
         # Get test output from state (criterion stores output in last_criterion_output)
         test_output = state.kv.get("last_criterion_output", "")
+        # Extract high-signal facts (1.6.6.12) — names the likely fix target so
+        # the stipulator doesn't have to dig the function name out of 2.5KB of
+        # raw pytest traceback. Closes the django-13315 wrong-target failure
+        # mode where the stipulator picked `ForeignKey.formfield` instead of
+        # `apply_limit_choices_to`.
+        from cat.test_signals import extract_pytest_signals
+        repo_root = "/testbed"  # SWE-bench convention
+        signals = extract_pytest_signals(test_output, repo_root)
+        signals_prefix = signals.format_for_stipulator() if signals.is_useful() else ""
+
         # Keep the most informative tail: pytest failure details are at the end
         failure_output = test_output[-2500:] if len(test_output) > 2500 else test_output
         reps.append(Representation(
@@ -339,6 +349,8 @@ class TbSweAgent(TbCatAgent):
                 "ORACLE RUN BEFORE ANY CHANGES — use this to write targeted plan steps.\n"
                 "The following test output shows EXACTLY what is failing and what is expected.\n"
                 "Your plan steps must address these specific failures.\n\n"
+                + signals_prefix
+                + ("\n" if signals_prefix else "")
                 + failure_output
             ),
         ))

@@ -1159,6 +1159,43 @@ the dominant layer reliably exposes the next layer's bottleneck. CAT's
 instrumentation makes the bottleneck observable; what's missing is the
 loop where the framework's own diagnostic triggers its own next fix.
 
+### Cost-per-PASS analysis (1.6.6.13, 2026-05-29)
+
+v1.7-tools spent $0.462 on swe10 vs v1.6.6-final's $0.313 (+47%) despite
+−55% tool calls. Per-task breakdown traced the increase to:
+
+- **PERFORM layer ONLY.** Stipulator/Attestor per-call costs were flat
+  (×1.03); performer per-call cost grew ×1.58 (5,932 → 9,388 input
+  tokens/call). LLM call counts were stable (203 → 196).
+- **Same turns, bigger turns.** The fewer-but-fatter pattern: agents made
+  fewer tool calls, but each performer LLM call carried ~3,500 more input
+  tokens. Driver: `read` alone accounts for 95% of all tool-output bytes
+  (1.05 MB across 55 calls, avg 19 KB each). The new tools we worried
+  about (`goto_def`, `find_refs`, `outline`) returned tiny outputs (224 B,
+  274 B, 0 B). `outline` had **zero** calls — the LLM never reached for
+  the cheapest option.
+- **LLM keeps doing bare big reads after `goto_def`.** After `goto_def`
+  returns `{path, line}`, the LLM tends to follow with `read(path)` rather
+  than `read(path, offset=line-5, limit=50)`. Nothing in the `read` tool
+  description or its truncation message nudges narrow reading.
+- **django-13315 outlier real but partial.** Burned its full 500K budget
+  in v1.7 (vs giving up at 106K in v1.6.6) because the new tools made
+  progress *seem* tractable. Accounts for $0.08 of the $0.15 increase.
+- **Per-PASS economics: $0.032 → $0.045 (+39%)**, not the naive +66% — the
+  budget-burn task inflates the naive figure. Roughly even once
+  django-13315's planner issue is fixed at v1.7+ (procedural memory or
+  multi-candidate stipulation).
+
+Surgical fix landed as **1.6.6.14** — borrow Pi/Claude-Code truncation
+pattern: explicit "showing X of Y lines" message + description nudge "use
+offset/limit; continue with offset until complete." ~10 lines of code, no
+schema change.
+
+What was NOT fixed and deferred to v2.x: the structural overhead from
+having 14 tools available on every call (~$0.05/run static floor). The
+proper fix is **capability granting at the admission gate** — only expose
+tools the contract genuinely needs. See v2.x note below.
+
 ---
 
 ## v1.7.x / v1.8.x sequencing decision (locked 2026-05-29)
@@ -1452,6 +1489,35 @@ coding.
   procedural memory" section. Predicted observable: token cost per task
   drops on recurring patterns as the agent develops automaticity. Requires
   v1.6 DAG infrastructure first.
+- **Cost-efficiency optimization layer** *(forward note from 1.6.6.13)* —
+  the v1.7-tools cost-per-PASS analysis revealed three structural sources
+  of per-call cost inflation that no single fix at the loop layer cleanly
+  addresses:
+    1. **Static tool-schema overhead** — every performer LLM call carries
+       all 14 tool schemas (~1KB of JSON per call), even when the contract
+       only needs 3 of them. The fix is **capability granting at the
+       admission gate (Step 4)**: only register the tools the contract
+       genuinely requires. Requires understanding contract → required-tool
+       mapping, likely co-developed with 1.7.x procedural memory which
+       can learn this mapping from past DAGs.
+    2. **History accumulation through context** — by turn 10, the LLM
+       re-reads 9 prior tool results every call. CAT today has no
+       in-context compaction beyond gross turn-summary squashing. A real
+       fix needs **tool-result summarization at history-write time**
+       (replace verbose results with their salient fact once the agent
+       has moved on from them) — likely a new attestor-adjacent role.
+    3. **LLM tool-selection bias** — the LLM defaults to `read` (familiar)
+       over `outline` (cheaper, less familiar in pretraining), even when
+       outline would dominate. 1.6.6.14 patches this with a description
+       nudge, but the principled fix is **cost-aware multi-candidate
+       generation at Step 5b** (the Dijkstra ADVISOR could score
+       candidates partly on expected-bytes-out and not just on plan fit).
+  These three together form a coherent "cost-efficiency layer" — schema
+  granting (Step 4), history compaction (post-Step 7), and cost-aware
+  candidate scoring (Step 5b). All three want each other's infrastructure;
+  none ships before v1.7+/v1.8. The placeholder name is intentionally
+  bland: this is not premature optimization, it's a *known* tax we're
+  carrying that needs an architectural answer in v2.x.
 - **Speculative activation** — pre-activate capabilities while ELIGIBLE to
   reduce latency.
 - **Contract markets** — auction protocol when multiple agents bid on a

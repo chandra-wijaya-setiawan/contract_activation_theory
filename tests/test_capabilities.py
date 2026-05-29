@@ -345,3 +345,49 @@ def test_find_refs_locates_all_usages(tmp_path: Path):
     # parse is defined in core.py and used in uses.py — both should appear
     assert any("core.py" in p for p in paths)
     assert any("uses.py" in p for p in paths)
+
+
+# ── 1.6.6.14 read truncation nudge tests ────────────────────────────────────
+
+
+def test_read_supports_offset_and_limit(tmp_path: Path):
+    f = tmp_path / "big.py"
+    f.write_text("\n".join(f"line {i}" for i in range(1, 101)) + "\n")
+    reg = build_docker_registry(_LocalContainer(tmp_path), default_workdir=str(tmp_path))
+    state = State(workdir=tmp_path)
+    r = reg.invoke("read", {"path": str(f), "offset": 10, "limit": 5}, state=state)
+    assert not r.is_error, r.output
+    # Should contain only lines 10-14
+    assert "line 10" in r.output
+    assert "line 14" in r.output
+    assert "line 15" not in r.output
+    assert "line 9" not in r.output
+    # Should include the range notice
+    assert "Showing lines 10-14 of 100" in r.output
+
+
+def test_read_truncation_message_tells_total_and_resume(tmp_path: Path):
+    """When the file exceeds the 2000-line default, the truncation notice
+    must name the total line count AND the offset to resume from."""
+    f = tmp_path / "huge.py"
+    f.write_text("\n".join(f"L{i}" for i in range(1, 2501)) + "\n")
+    reg = build_docker_registry(_LocalContainer(tmp_path), default_workdir=str(tmp_path))
+    state = State(workdir=tmp_path)
+    r = reg.invoke("read", {"path": str(f)}, state=state)
+    assert not r.is_error, r.output
+    # 2000-line cap should kick in
+    assert "of 2500" in r.output, r.output[-200:]
+    assert "offset=2001" in r.output  # tells the LLM where to resume
+    assert "2000 line limit" in r.output
+
+
+def test_read_full_file_no_notice(tmp_path: Path):
+    """Small files that fit entirely should NOT emit a truncation notice."""
+    f = tmp_path / "small.py"
+    f.write_text("hello\nworld\n")
+    reg = build_docker_registry(_LocalContainer(tmp_path), default_workdir=str(tmp_path))
+    state = State(workdir=tmp_path)
+    r = reg.invoke("read", {"path": str(f)}, state=state)
+    assert not r.is_error
+    assert "Truncated" not in r.output
+    assert "Showing lines" not in r.output

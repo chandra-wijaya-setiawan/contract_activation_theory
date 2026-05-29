@@ -659,17 +659,95 @@ def build_docker_registry(container: "object", default_workdir: str = "/testbed"
         )
 
     def _read(args: dict, state: State) -> ToolResult:
+        """Read a file with offset/limit + Pi-style truncation message.
+
+        1.6.6.14 — added offset/limit support and a truncation notice that
+        tells the LLM both how much it got and how to continue (Pi pattern:
+        "showing X of Y lines; use offset to continue"). Addresses the
+        cost-per-PASS finding that bare reads dominate output bytes (95% of
+        tool output volume in v1.7-tools).
+        """
         path = args.get("path")
         if not isinstance(path, str) or not path:
             return ToolResult(tool="read", is_error=True, output="missing 'path'")
+        offset = args.get("offset")  # 1-indexed line
+        limit = args.get("limit")    # max lines to return
+        # Default cap: 2000 lines OR 50KB, whichever hits first (Pi defaults)
+        MAX_LINES = 2000
+        MAX_BYTES = 50 * 1024
+
         exit_code, output = _exec(["cat", path])
         if exit_code != 0:
             return ToolResult(tool="read", is_error=True, output=output[:OUTPUT_CAP_BYTES])
+
+        lines = output.split("\n")
+        # cat appends a trailing newline; drop the empty tail if so
+        if lines and lines[-1] == "":
+            lines.pop()
+        total_lines = len(lines)
+
+        try:
+            start = max(0, (int(offset) - 1)) if offset is not None else 0
+        except (TypeError, ValueError):
+            start = 0
+        try:
+            n_lim = int(limit) if limit is not None else MAX_LINES
+        except (TypeError, ValueError):
+            n_lim = MAX_LINES
+        n_lim = max(0, min(n_lim, MAX_LINES))
+        end_req = min(total_lines, start + n_lim)
+
+        selected = lines[start:end_req]
+        sliced = "\n".join(selected)
+
+        # Byte cap can fire before line cap on dense lines
+        truncated_by_bytes = False
+        if len(sliced.encode("utf-8", errors="replace")) > MAX_BYTES:
+            # Walk back from MAX_BYTES to the previous newline
+            head = sliced.encode("utf-8", errors="replace")[:MAX_BYTES]
+            sliced = head.decode("utf-8", errors="replace")
+            cut = sliced.rfind("\n")
+            if cut > 0:
+                sliced = sliced[:cut]
+            selected = sliced.split("\n")
+            truncated_by_bytes = True
+
+        n_shown = len(selected)
+        end_shown = start + n_shown
+
+        # Build the truncation/range notice — designed to nudge narrow reads.
+        notice = ""
+        if total_lines == 0:
+            notice = ""  # empty file
+        elif start == 0 and end_shown == total_lines and not truncated_by_bytes:
+            notice = ""  # full file fit
+        elif truncated_by_bytes:
+            notice = (
+                f"\n[Truncated: lines {start + 1}-{end_shown} of {total_lines} "
+                f"({MAX_BYTES // 1024}KB byte limit hit). "
+                f"Pass offset={end_shown + 1} to continue, or use limit to read a smaller range.]"
+            )
+        elif n_shown >= MAX_LINES and total_lines > end_shown:
+            notice = (
+                f"\n[Truncated: showing lines {start + 1}-{end_shown} of {total_lines} "
+                f"({MAX_LINES} line limit). Pass offset={end_shown + 1} to continue.]"
+            )
+        elif start > 0 or end_shown < total_lines:
+            notice = (
+                f"\n[Showing lines {start + 1}-{end_shown} of {total_lines}. "
+                f"Use offset/limit to view other ranges.]"
+            )
+
         return ToolResult(
             tool="read",
             is_error=False,
-            output=_truncate(output, READ_CAP_BYTES),
-            detail={"bytes": len(output.encode("utf-8", errors="replace"))},
+            output=sliced + notice,
+            detail={
+                "total_lines": total_lines,
+                "shown_lines": n_shown,
+                "offset": start + 1,
+                "truncated_by_bytes": truncated_by_bytes,
+            },
         )
 
     def _list(args: dict, state: State) -> ToolResult:
@@ -1077,11 +1155,23 @@ def build_docker_registry(container: "object", default_workdir: str = "/testbed"
     ))
     reg.register(Capability(
         name="read",
-        description="Read a file from inside the container (cat). Output capped at 64KB.",
+        description=(
+            "Read a file from inside the container. Default cap: 2000 lines or 50KB "
+            "(whichever hits first). "
+            "Use `offset` (1-indexed line number) and `limit` (max lines) for narrow reads — "
+            "STRONGLY RECOMMENDED after `goto_def` or `find_refs` returns a location: "
+            "e.g. `read(path, offset=line-5, limit=50)` instead of bare `read(path)`. "
+            "When you need the full file, continue with offset until complete. "
+            "The truncation message tells you how many lines exist and where to resume."
+        ),
         json_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "absolute path inside the container"},
+                "path":   {"type": "string", "description": "absolute path inside the container"},
+                "offset": {"type": "integer",
+                           "description": "1-indexed line number to start reading from (default 1)"},
+                "limit":  {"type": "integer",
+                           "description": "max lines to return (default 2000)"},
             },
             "required": ["path"],
         },
