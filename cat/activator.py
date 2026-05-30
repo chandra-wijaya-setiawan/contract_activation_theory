@@ -59,13 +59,8 @@ You will be given:
 - the BUDGET STATUS
 
 Rules:
-1. Each turn, propose your next concrete performance act. You MAY emit TWO \
-alternative tool calls in the same turn when the next step is genuinely \
-uncertain — the framework will score both against prior runs at similar \
-states (via Dijkstra over a learned corpus) and execute the more promising \
-one. The losing alternative is recorded for retrospective analysis. If you \
-are confident, ONE tool call is fine and skips arbitration entirely. Emit \
-brief text "DONE" only when every plan step is checked complete.
+1. Take exactly ONE concrete performance act per turn (one tool call) OR emit \
+a brief text "DONE" only when every plan step is checked complete.
 2. Address the FIRST un-checked step. Do not skip ahead.
 3. Be terse. Do not narrate. Do not re-state the plan. Just act.
 4. If a tool returns an error, diagnose and try a corrected action; do NOT repeat \
