@@ -1579,6 +1579,38 @@ coding.
   procedural memory" section. Predicted observable: token cost per task
   drops on recurring patterns as the agent develops automaticity. Requires
   v1.6 DAG infrastructure first.
+- **Cross-domain working memory via two-tier features** *(forward note from
+  1.7.0 v1 simulation, 2026-05-30)* — v1.7 builds the offline-RL + online-
+  search loop on swe10 (code domain). The framework GENERALIZES to other
+  domains (tau-bench, WebArena, OSWorld) only if the canonicalization
+  separates **domain-agnostic core features** from **domain-specific
+  extensions**. Concretely:
+
+  Domain-agnostic core (every domain populates these):
+    `obligation_hash`, `plan_idx`, `last_outcome`,
+    `durable_change_count`, `iter_since_durable_change`,
+    `verify_attempt_count`, `investigate_attempt_count`, `mutate_attempt_count`,
+    `n_unique_actions`, `action_intent ∈ {investigate, mutate, verify, other}`
+
+  Domain-specific extensions (sparse dict):
+    code-Python: `{workdir_sig, env_facts, last_bash_class}`
+    tau-bench:   `{api_endpoint_class, db_table_touched, ...}`
+    WebArena:    `{dom_section_class, last_form_id, ...}`
+
+  Each Capability registration declares an `intent` classification. The
+  CEGAR predicate tree then learns predicates over the domain-agnostic
+  features primarily — `verify_attempt_count > 3` would fire identically
+  in swe10 AND tau-bench, catching domain-independent failure modes (the
+  pytest-loop pattern, but generalized). The LIBRARIAN does cross-domain
+  *action-level* transfer via embedding; the predicate tree does cross-
+  domain *reasoning-pattern* transfer via shared features.
+
+  The minimum refactor (~50 lines) is queued as **task 1.7.0.x**, to land
+  AFTER v2 CEGAR splits validate the math on swe10. Bigger architecture
+  question — whether the cognitive layers (REPRESENT/STIPULATE/PERFORM/
+  VERIFY) themselves need cross-domain abstraction — deferred to v2.x
+  when a second domain creates pressure.
+
 - **Cost-efficiency optimization layer** *(forward note from 1.6.6.13)* —
   the v1.7-tools cost-per-PASS analysis revealed three structural sources
   of per-call cost inflation that no single fix at the loop layer cleanly
