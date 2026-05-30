@@ -567,6 +567,10 @@ class Activator:
         if any. Returns None when the librarian is unavailable, the state is
         cold, or no path-to-goal candidate exists.
 
+        When a hint IS produced, also emits a `librarian_hint` trace event
+        so we can count emissions and attribute behavior changes (post-A.2
+        refinement (1) — telemetry).
+
         Lightweight: just walks the current trace events to compute the
         runtime raw_features snapshot.
         """
@@ -586,6 +590,40 @@ class Activator:
             return None
         if rec is None:
             return None
+
+        # Telemetry: record that a hint was emitted on this turn.
+        # Chains from the iteration anchor — sibling to the upcoming
+        # performer llm_usage event the hint will influence.
+        try:
+            parent = (
+                run.last_iter_anchor
+                or run.last_perform_event_id
+                or run.last_admit_event_id
+                or run.last_state_event_id
+                or None
+            )
+            self.recorder.append(TraceEvent(
+                event_id=f"hint-{uuid.uuid4().hex[:6]}",
+                parent_id=parent,
+                ts=utcnow_iso(),
+                kind="librarian_hint",
+                payload={
+                    "contract_id": contract.id,
+                    "iteration": run.iterations + 1,  # this hint is for the NEXT iter
+                    "state_class": rec.state_class,
+                    "action_klass": rec.action_klass,
+                    "tool": rec.tool,
+                    "canonical_args": rec.canonical_args,
+                    "expected_cost": rec.expected_cost,
+                    "next_state_d_star": rec.next_state_d_star,
+                    "total_score": rec.total_score,
+                    "confidence_n": rec.confidence_n,
+                    "n_alternatives": rec.n_alternatives,
+                },
+            ))
+        except Exception as exc:  # noqa: BLE001
+            print(f"warning: librarian_hint trace failed: {exc}")
+
         return (
             "[CORPUS HINT] "
             + rec.format_hint()

@@ -823,3 +823,53 @@ def test_election_skipped_when_single_candidate(workdir, recorder, tmp_path):
 
     elections = [e for e in traj.events if e.kind == "election"]
     assert len(elections) == 0
+
+
+def test_librarian_hint_emits_trace_event(workdir, recorder, tmp_path):
+    """When a hint is produced, a librarian_hint trace event must be
+    recorded. Lets us count emissions and attribute behavior changes."""
+    from cat.librarian import Librarian
+    _ingest_pass_trace_with_actions(
+        tmp_path / "c.db", "Create hello.txt with content 'hi'.",
+        [{"tool": "write", "args": {"path": "hello.txt", "content": "hi"}}],
+        trial_id="seed-0",
+    )
+    _ingest_pass_trace_with_actions(
+        tmp_path / "c.db", "Create hello.txt with content 'hi'.",
+        [{"tool": "write", "args": {"path": "hello.txt", "content": "hi"}}],
+        trial_id="seed-1",
+    )
+    lib = Librarian(tmp_path / "c.db")
+    lib.refresh()
+
+    crit = deterministic_criterion(
+        id="hello-exists", description="hello.txt contains 'hi'",
+        predicate=lambda s: (s.workdir / "hello.txt").exists(),
+    )
+    contract = Contract.new(
+        obligation="Create hello.txt with content 'hi'.",
+        criteria=[crit],
+    )
+    state = State(workdir=workdir)
+    llm = ScriptedLLM(
+        planner_steps=["Create hello.txt with content 'hi'."],
+        executor_turns=[
+            _ScriptedTurn(
+                text=None,
+                tool_calls=[{"name": "write", "arguments": {"path": "hello.txt", "content": "hi"}}],
+            ),
+        ],
+    )
+    act = Activator(llm=llm, registry=build_default_registry(),
+                    recorder=recorder, librarian=lib)
+    act.run(contract, state)
+    traj = recorder.finalize()
+
+    hint_events = [e for e in traj.events if e.kind == "librarian_hint"]
+    # We expect at least one hint since the corpus is non-empty and the
+    # initial state matches the seeded obligation.
+    assert len(hint_events) >= 1, "expected at least one librarian_hint event"
+    ev = hint_events[0]
+    assert ev.payload["contract_id"] == contract.id
+    assert ev.payload["tool"] == "write"  # what the corpus recommends
+    assert ev.payload["confidence_n"] >= 1

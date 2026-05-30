@@ -34,6 +34,7 @@ EventKind = Literal[
     "criterion_check",         # verifier ran a criterion
     "capability_perform",      # Step 6 PERFORM: one performance act (was: capability_invoke)
     "election",                # v1.7 A.2 ADVISOR+ELECTION: math arbitrated between candidates
+    "librarian_hint",          # v1.7 A.1 advisory hint was injected into performer context
     # Legacy aliases (kept readable for pre-rename traces):
     "contract_decompose",      # legacy alias for contract_stipulate
     "capability_invoke",       # legacy alias for capability_perform
