@@ -1198,49 +1198,139 @@ tools the contract genuinely needs. See v2.x note below.
 
 ---
 
-## v1.7.x / v1.8.x sequencing decision (locked 2026-05-29)
+## v1.7 — Learning Loop (revised plan, 2026-05-30)
 
-Two pending chains, each internally sequential, independent of each other:
+Supersedes the previous v1.7.x / v1.8.x split. After the design walkthrough +
+literature scan (offline-RL Q estimation + Dijkstra over learned weights),
+the two were never independent initiatives — they are the data layer and the
+algorithm layer of one offline-RL + online-search system. Splitting them
+defers any meaningful validation until both ship; instead we build the
+vertical slice end-to-end and validate as one machine.
+
+### The full loop (architecture)
 
 ```
-1.7 chain (procedural memory):
-   1.7.2 outcome-tag DAG nodes
-     ↓
-   1.7.1 LIBRARIAN retrieves outcome-tagged DAGs at PERFORM
-     ↓
-   1.7.3 DAG-grounded SUSPENDED resume
-
-1.8 chain (Dijkstra multi-candidate):
-   1.8.1 capture N candidates at SELECT
-     ↓
-   1.8.2 ADVISOR scores candidates
-     ↓
-   1.8.3 ELECTION step picks
+trace events with parent_id (existing)
+            ↓
+post-run outcome tagging (pass/fail/dead_end/neutral on DAG subtrees)
+            ↓
+state_class hash + action_class hash (canonicalization)
+            ↓
+SQLite + FTS5 corpus of trajectories — each (s, a) pair gets
+  • running mean tokens-in cost Q̂(s,a)
+  • Beta(α,β) success posterior — Bayesian P̂(success|s,a)
+  • visit count n(s,a)
+            ↓
+LIBRARIAN — at PERFORM-step 5, given current state_class:
+  retrieve top-k (s,a) edges with Q̂, P̂, n
+            ↓
+Step 5a candidate generation — LLM emits N candidate tool calls
+            ↓
+Step 5b ADVISOR scoring (math, not LLM):
+  score(a) = Q̂(s,a)/P̂(success|s,a) − κ·√(2·ln N(s) / n(s,a))
+              ↑                       ↑
+       expected cost-given-survival   UCB1 exploration bonus
+  Unseen (s,a) → fall back to global prior, high exploration bonus
+            ↓
+Step 5c ELECTION — argmin score(a). Losing candidates recorded in DAG
+for retrospective analysis (Voyager-style: nothing deleted).
+            ↓
+PERFORM — execute the elected action.
+            ↓
+... continues to VERIFY / DISCHARGE ...
+            ↓
+Post-run writeback: outcome-label the just-completed DAG, ingest each
+edge into the corpus, update Q̂ / posterior. Corpus grows by one
+trajectory's worth.
 ```
 
-**Decision: 1.7 chain first, then 1.8 chain.**
+### Why integrated, not split
 
-Reasoning:
-- Procedural memory pays off on every task (each new task can retrieve a
-  similar prior DAG); multi-candidate planning pays off mainly on hard tasks
-  with high path entropy.
-- 1.7.2 outcome-tagging is a prerequisite for 1.8.x anyway — you need
-  labeled DAGs to score candidates against, so doing 1.8.x first would
-  immediately stall on the same dependency.
-- The largest remaining failure mode (stipulator picks wrong target on
-  django-13315-class issues) is structurally a *cross-task learning*
-  problem — i.e., the 1.7 chain — more than a *single-task search*
-  problem.
+| Splitting risks | Why it matters |
+|---|---|
+| LIBRARIAN ships alone | Built, but no consumer — only inspection value. No validation signal |
+| ADVISOR ships alone | Falls back to LATS/MCTS without learned weights. The "Dijkstra over learned costs" hypothesis is never tested |
+| Two separate gates | First gate's design freezes the interface between them — and either it survives (lucky) or it doesn't (rework) |
+| End-to-end validation deferred | The state_class canonicalization recipe is load-bearing; you only learn what works by running the whole loop |
 
-Execution order:
-1. (optional) Tighten v1.6 with the 3 quality follow-ups (in-loop redundancy
-   guard / sharpened initial_test_failure / cost-per-PASS investigation)
-2. 1.7.2 outcome-tag DAG nodes
-3. 1.7.1 LIBRARIAN retrieval at PERFORM
-4. 1.7.3 DAG-grounded SUSPENDED resume
-5. 1.8.1 multi-candidate capture
-6. 1.8.2 ADVISOR scoring
-7. 1.8.3 ELECTION
+The honest framing: this is *one* offline-RL + online-search loop. The pieces are dependency-ordered but ship together.
+
+### Subtasks (one vertical slice, then iterate)
+
+**Phase A — minimum viable loop (one PR, one validation):**
+
+1. **Outcome-tagging** — `cat/dag.py`: add `outcome`, `outcome_decided_at`,
+   `outcome_observed_at`, `invalidated` fields on `Node`. `tag_outcomes(dag)`
+   walks bottom-up after a run finishes with ~5 deterministic rules. No LLM.
+2. **Canonicalization** — `cat/state_class.py` (new): `state_class(node)` and
+   `action_class(tool_call)` produce stable hashes. Critical detail; will need
+   tuning. Start with the simplest possible recipe (obligation hash + plan
+   step index + tool name + canonical args path).
+3. **Corpus** — `cat/corpus.py` (new): SQLite + FTS5 schema (trajectory, edge,
+   q_estimate aggregate tables). Writeback hook in the activator's post-run
+   path. No vector store, no embeddings, no Neo4j.
+4. **LIBRARIAN** — `cat/librarian.py` (new): given a state_class, return top-k
+   edges with `(Q̂, σ², Beta(α,β), n)`. Simple SQL.
+5. **Step-5 split in activator** — currently the performer emits one tool_call
+   per turn. Refactor to: emit N=2 candidates (LLM default + one LIBRARIAN-
+   suggested if any), score by formula above, ELECT. N=2 keeps churn small
+   while still exercising the scoring path.
+6. **ADVISOR scoring** — `cat/advisor.py` (new): the formula. Stateless
+   function: given `(state_class, candidates, librarian_response)` → returns
+   scored candidates. Uses Bayesian P̂(success) (MACLA's robust-to-small-N
+   trick) rather than frequentist `n_pass/n_total`.
+7. **ELECTION** — `cat/election.py` (new): argmin scored. Losers go into
+   trace as `capability_perform_rejected` events for the DAG to record.
+
+Validation: re-run swe10 with cold corpus → swe10 again with warm corpus
+(seeded by the cold run + the v1.6.6.14 swe10 we have on disk) → measure
+solve rate AND cost-per-PASS delta. The hypothesis is that the warm-corpus
+run beats the cold-corpus run on at least one of those.
+
+If the validation moves the needle, iterate the canonicalization, exploration
+constant κ, and candidate count N. If it doesn't, the design is wrong —
+likely the state_class hash recipe — and we re-design before shipping more.
+
+**Phase B — separable extensions:**
+
+- **SUSPENDED resume DAG-grounded** (formerly 1.7.3): when contract enters
+  SUSPENDED, walk back to last `neutral` ancestor, prune dead-end subtree,
+  resume from there. Independent of the main loop's value-add but uses the
+  same outcome-tagged DAG.
+- **A* heuristic h(v)** — learned from corpus, admissible-by-construction
+  via 25th-percentile cost-to-goal of past PASS trajectories. Ships when
+  Phase A's flat Dijkstra has a stable interface.
+- **Multi-objective reward** (tokens + dollars + wall, not just tokens).
+  Skip in Phase A; revisit if cost/PASS dominates evaluation.
+
+### Validation discipline
+
+The only meaningful unit of validation is the full loop. Sub-pieces have
+unit tests (outcome-tagging rules, hash stability, corpus schema), but
+solve-rate / cost-per-PASS is measured exactly once: after the vertical
+slice ships.
+
+### Open canonicalization questions
+
+These will be empirically resolved during Phase A; flagging them so we
+can watch:
+
+1. How granular should `state_class` be? Too narrow → every (s,a) has N=1.
+   Too broad → Q estimates collapse useful signal. Start narrow (full
+   obligation hash + tool + path) and widen if collisions are too sparse.
+2. Should the LIBRARIAN re-rank exact-hash matches by FTS5 over obligation
+   text? Probably yes for tie-breaking, but the LLM doesn't need to be
+   involved unless ambiguity is real.
+3. Beta prior strength: weak (Beta(1,1) = uniform) vs informed (Beta(α₀,β₀)
+   from global success rate). Start uniform; tune later.
+
+### Gate criteria before v2.x
+
+- Vertical slice ships, end-to-end working
+- swe10 cold-vs-warm corpus validation shows measurable improvement on
+  at least one of: solve rate, cost-per-PASS, tool-calls-per-task avg
+- Trace + DAG + corpus tables remain queryable for offline analysis (no
+  black-box "memory blob" — every Q estimate must be inspectable)
 
 ---
 
