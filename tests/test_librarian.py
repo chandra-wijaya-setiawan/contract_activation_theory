@@ -187,3 +187,106 @@ def test_librarian_recommend_format_hint_is_human_readable(tmp_path: Path):
         assert "prior runs at this state suggest" in h
         assert "expected cost" in h
         assert "n=" in h
+
+
+# ── v1.7 A.2 ELECTION tests ──────────────────────────────────────────────────
+
+
+def _seed_corpus_with_initial_state(tmp_path: Path, obligation: str = "do the thing"):
+    """Helper: build a corpus with 2 PASS traces of the same obligation so
+    the initial state has 2+ observations and can score candidates."""
+    db = tmp_path / "corpus.db"
+    corpus = Corpus(db)
+    for i in range(2):
+        trial = tmp_path / f"task-{i}" / f"trial-{i}"
+        logs = trial / "agent-logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        jsonl = logs / "trace.jsonl"
+        with jsonl.open("w") as f:
+            for ev in _basic_events(obligation):
+                f.write(json.dumps(ev) + "\n")
+        corpus.ingest_trace(jsonl, reached_goal=True)
+    lib = Librarian(db)
+    lib.refresh()
+    return lib
+
+
+def _initial_state_raw(obligation: str = "do the thing"):
+    from cat.state_class import short_hash
+    return {
+        "obligation_hash": short_hash(obligation),
+        "plan_idx": 0,
+        "last_outcome": None,
+        "last_action_intent": None,
+        "durable_change_count": 0,
+        "iter_since_durable_change": 0,
+        "verify_attempt_count": 0,
+        "investigate_attempt_count": 0,
+        "mutate_attempt_count": 0,
+        "n_unique_actions": 0,
+        "n_unique_errors": 0,
+        "attempted_actions": [],
+        "env_facts": [],
+        "last_tool": None,
+        "last_bash_class": None,
+        "attempted_bash_classes": [],
+    }
+
+
+def test_score_candidates_returns_one_per_input(tmp_path: Path):
+    lib = _seed_corpus_with_initial_state(tmp_path)
+    raw = _initial_state_raw()
+    candidates = [
+        {"tool": "read", "args": {"path": "/testbed/file.py"}},
+        {"tool": "str_replace", "args": {"path": "/testbed/file.py", "old_str": "x", "new_str": "y"}},
+    ]
+    scored = lib.score_candidates(candidates, raw)
+    assert len(scored) == 2
+    assert scored[0].index == 0
+    assert scored[1].index == 1
+    assert scored[0].tool == "read"
+    assert scored[1].tool == "str_replace"
+
+
+def test_score_candidates_assigns_score_for_seen_actions(tmp_path: Path):
+    """The two actions in the seed trace (read, str_replace) should both
+    score non-defer when queried from the initial state."""
+    lib = _seed_corpus_with_initial_state(tmp_path)
+    raw = _initial_state_raw()
+    candidates = [
+        {"tool": "read", "args": {"path": "/testbed/file.py"}},
+        {"tool": "str_replace", "args": {"path": "/testbed/file.py", "old_str": "x", "new_str": "y"}},
+    ]
+    scored = lib.score_candidates(candidates, raw)
+    non_defer = [s for s in scored if not s.defer]
+    assert len(non_defer) >= 1, "at least one seen action should score non-defer"
+    for s in non_defer:
+        assert s.expected_cost is not None
+        assert s.total_score is not None
+
+
+def test_score_candidates_defers_on_unseen_action(tmp_path: Path):
+    """An action never seen in the corpus should defer."""
+    lib = _seed_corpus_with_initial_state(tmp_path)
+    raw = _initial_state_raw()
+    candidates = [
+        {"tool": "bash", "args": {"command": "ls -la /nope"}},  # never seen
+    ]
+    scored = lib.score_candidates(candidates, raw)
+    assert len(scored) == 1
+    assert scored[0].defer is True
+    assert scored[0].total_score is None
+
+
+def test_score_candidates_handles_empty_corpus(tmp_path: Path):
+    """Empty corpus → all candidates defer, no crash."""
+    db = tmp_path / "empty.db"
+    Corpus(db)  # create schema only
+    lib = Librarian(db)
+    lib.refresh()
+    scored = lib.score_candidates(
+        [{"tool": "read", "args": {"path": "/x"}}],
+        _initial_state_raw(),
+    )
+    assert len(scored) == 1
+    assert scored[0].defer is True

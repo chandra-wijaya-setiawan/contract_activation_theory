@@ -622,3 +622,204 @@ def test_max_iterations_transitions_to_SUSPENDED(workdir, recorder):
     assert contract.state == ContractState.SUSPENDED
     assert "criterion_unreachable" in (run.suspend_reason or "")
     assert contract.re_entry_condition is not None
+
+
+# ── v1.7 A.2 ELECTION tests ──────────────────────────────────────────────────
+
+
+def _ingest_pass_trace_with_actions(corpus_db_path, obligation, action_sequence, trial_id="t0"):
+    """Helper for ELECTION tests: build a JSONL trace where the performer
+    used `action_sequence` (each item = {tool, args}) and the contract
+    reached fulfilled. Ingest into the corpus.
+
+    `trial_id` must be unique across calls — Corpus dedupes on trace_id."""
+    import tempfile
+    from cat.corpus import Corpus
+
+    events = [
+        {"event_id": "s0", "parent_id": None, "ts": "t0", "kind": "contract_state",
+         "payload": {"to": "latent", "obligation": obligation}},
+        {"event_id": "rep", "parent_id": "s0", "ts": "t1", "kind": "contract_represent",
+         "payload": {"representations": []}},
+        {"event_id": "stip", "parent_id": "rep", "ts": "t2", "kind": "contract_stipulate",
+         "payload": {"steps": [{"id": "s1", "description": "x"}]}},
+        {"event_id": "adm", "parent_id": "stip", "ts": "t3", "kind": "contract_admit",
+         "payload": {"ok": True}},
+        {"event_id": "st1", "parent_id": "adm", "ts": "t4", "kind": "contract_state",
+         "payload": {"to": "active"}},
+    ]
+    last_id = "st1"
+    for i, action in enumerate(action_sequence):
+        p_id = f"p{i}"; tc_id = f"tc{i}"; tr_id = f"tr{i}"; lu_id = f"lu{i}"
+        events.append({"event_id": p_id, "parent_id": last_id, "ts": f"t{10+i*4}",
+                       "kind": "capability_perform", "payload": {"tool": action["tool"]}})
+        events.append({"event_id": tc_id, "parent_id": p_id, "ts": f"t{11+i*4}",
+                       "kind": "tool_call",
+                       "payload": {"tool_call_id": tc_id, "tool": action["tool"],
+                                   "args": action.get("args", {})}})
+        events.append({"event_id": tr_id, "parent_id": tc_id, "ts": f"t{12+i*4}",
+                       "kind": "tool_result",
+                       "payload": {"tool_call_id": tc_id, "is_error": False, "output": "ok"}})
+        events.append({"event_id": lu_id, "parent_id": tr_id, "ts": f"t{13+i*4}",
+                       "kind": "llm_usage",
+                       "payload": {"role": "performer", "in": 50 + i * 10, "out": 5}})
+        last_id = lu_id
+    events.append({"event_id": "ccfinal", "parent_id": last_id, "ts": "tF",
+                   "kind": "criterion_check", "payload": {"step_id": "s1", "ok": True}})
+    events.append({"event_id": "stF", "parent_id": "ccfinal", "ts": "tFinal",
+                   "kind": "contract_state", "payload": {"to": "fulfilled"}})
+
+    # Write JSONL into a temp trial-like dir. trial_id ensures unique trace_id.
+    trial = Path(tempfile.mkdtemp()) / "task" / f"trial-{trial_id}"
+    logs = trial / "agent-logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    jsonl = logs / "t.jsonl"
+    with jsonl.open("w") as f:
+        for ev in events:
+            f.write(json.dumps(ev) + "\n")
+    corpus = Corpus(corpus_db_path)
+    corpus.ingest_trace(jsonl, reached_goal=True)
+
+
+def test_election_picks_corpus_recommended_action(workdir, recorder, tmp_path):
+    """When the LLM emits 2 candidates and the corpus has evidence one is
+    cheaper, ELECTION picks the cheaper one. Also asserts that the rejected
+    candidate is dropped from the assistant message (otherwise OpenAI's
+    tool_call ↔ tool_result correspondence breaks)."""
+    from cat.librarian import Librarian
+
+    obligation = "Create hello.txt with content 'hi'."
+    # Seed the corpus with traces where `write` is the dominant successful action.
+    corpus_db = tmp_path / "corpus.db"
+    for i in range(3):
+        _ingest_pass_trace_with_actions(
+            corpus_db, obligation,
+            [{"tool": "write", "args": {"path": "hello.txt", "content": "hi"}}],
+            trial_id=f"seed-{i}",
+        )
+    lib = Librarian(corpus_db)
+    lib.refresh()
+
+    crit = deterministic_criterion(
+        id="hello-exists", description="hello.txt contains 'hi'",
+        predicate=lambda s: (s.workdir / "hello.txt").exists()
+        and (s.workdir / "hello.txt").read_text() == "hi",
+    )
+    contract = Contract.new(obligation=obligation, criteria=[crit])
+    state = State(workdir=workdir)
+    llm = ScriptedLLM(
+        planner_steps=["Create hello.txt with content 'hi'."],
+        executor_turns=[
+            _ScriptedTurn(
+                text=None,
+                tool_calls=[
+                    # Candidate 0: bash (NOT in corpus) — should DEFER
+                    {"name": "bash", "arguments": {"command": "echo hi > hello.txt"}},
+                    # Candidate 1: write (IN corpus) — should win
+                    {"name": "write", "arguments": {"path": "hello.txt", "content": "hi"}},
+                ],
+            ),
+        ],
+    )
+    act = Activator(llm=llm, registry=build_default_registry(),
+                    recorder=recorder, librarian=lib)
+    run = act.run(contract, state)
+    traj = recorder.finalize()
+
+    assert contract.state == ContractState.FULFILLED, contract.state_reason
+    assert (workdir / "hello.txt").read_text() == "hi"
+
+    # The election event must have been recorded
+    elections = [e for e in traj.events if e.kind == "election"]
+    assert len(elections) == 1, "expected exactly one election event"
+    ev = elections[0]
+    # Math should pick candidate 1 (write) since bash defers and write scores
+    assert ev.payload["winner_index"] == 1
+    assert ev.payload["decision"] == "math"
+    assert ev.payload["winner_tool"] == "write"
+    assert len(ev.payload["candidates"]) == 2
+
+
+def test_election_defers_when_all_candidates_unseen(workdir, recorder, tmp_path):
+    """All candidates are unseen in the corpus → ELECTION defers to candidate
+    0 (LLM's preferred). Need a NON-empty corpus (otherwise librarian is
+    not ready and election is skipped entirely)."""
+    from cat.librarian import Librarian
+
+    # Seed corpus with a DIFFERENT obligation so the live state hashes to
+    # something the corpus has never seen.
+    corpus_db = tmp_path / "corpus.db"
+    _ingest_pass_trace_with_actions(
+        corpus_db, "some unrelated obligation",
+        [{"tool": "read", "args": {"path": "/x"}}],
+        trial_id="seed-0",
+    )
+    lib = Librarian(corpus_db)
+    lib.refresh()
+
+    crit = deterministic_criterion(
+        id="hello-exists", description="hello.txt contains 'hi'",
+        predicate=lambda s: (s.workdir / "hello.txt").exists(),
+    )
+    contract = Contract.new(obligation="totally different obligation", criteria=[crit])
+    state = State(workdir=workdir)
+    llm = ScriptedLLM(
+        planner_steps=["x"],
+        executor_turns=[
+            _ScriptedTurn(
+                text=None,
+                tool_calls=[
+                    {"name": "write", "arguments": {"path": "hello.txt", "content": "hi"}},
+                    {"name": "bash", "arguments": {"command": "echo hi > hello.txt"}},
+                ],
+            ),
+        ],
+    )
+    act = Activator(llm=llm, registry=build_default_registry(),
+                    recorder=recorder, librarian=lib)
+    act.run(contract, state)
+    traj = recorder.finalize()
+
+    elections = [e for e in traj.events if e.kind == "election"]
+    assert len(elections) == 1
+    ev = elections[0]
+    assert ev.payload["winner_index"] == 0
+    assert ev.payload["decision"] == "defer"
+
+
+def test_election_skipped_when_single_candidate(workdir, recorder, tmp_path):
+    """LLM emits exactly 1 tool call — no election event, no librarian call.
+
+    Use a non-empty corpus to prove the skip is driven by candidate-count,
+    not by librarian-not-ready."""
+    from cat.librarian import Librarian
+    _ingest_pass_trace_with_actions(
+        tmp_path / "c.db", "x",
+        [{"tool": "read", "args": {"path": "/x"}}],
+        trial_id="seed-0",
+    )
+    lib = Librarian(tmp_path / "c.db")
+    lib.refresh()
+
+    crit = deterministic_criterion(
+        id="hello-exists", description="hello.txt contains 'hi'",
+        predicate=lambda s: (s.workdir / "hello.txt").exists(),
+    )
+    contract = Contract.new(obligation="x", criteria=[crit])
+    state = State(workdir=workdir)
+    llm = ScriptedLLM(
+        planner_steps=["x"],
+        executor_turns=[
+            _ScriptedTurn(
+                text=None,
+                tool_calls=[{"name": "write", "arguments": {"path": "hello.txt", "content": "hi"}}],
+            ),
+        ],
+    )
+    act = Activator(llm=llm, registry=build_default_registry(),
+                    recorder=recorder, librarian=lib)
+    act.run(contract, state)
+    traj = recorder.finalize()
+
+    elections = [e for e in traj.events if e.kind == "election"]
+    assert len(elections) == 0

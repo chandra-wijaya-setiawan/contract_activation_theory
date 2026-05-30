@@ -29,6 +29,27 @@ GOAL_NODE = -1
 
 
 @dataclass
+class ScoredCandidate:
+    """One candidate action ranked by the LIBRARIAN for ELECTION.
+
+    `defer=True` means the corpus has no information for this state/action
+    pair — the score should be treated as a no-confidence vote. ELECTION
+    falls through to the LLM's preferred candidate (the first one emitted)
+    when all candidates defer.
+    """
+    index: int                          # which LLM-emitted candidate this is
+    tool: str
+    canonical_args: dict
+    action_klass: str
+    state_class: int                    # current state (for trace event)
+    expected_cost: Optional[float] = None       # Q̂(s, a) — mean observed cost
+    next_state_d_star: Optional[float] = None   # d*(s') — distance from successor
+    total_score: Optional[float] = None         # expected_cost + d*(next)
+    confidence_n: int = 0                       # times this (s, a) was observed
+    defer: bool = True                          # True when corpus has no signal
+
+
+@dataclass
 class Recommendation:
     """A LIBRARIAN suggestion for the next action."""
     action_klass: str           # short hash; for trace correlation
@@ -97,6 +118,70 @@ class Librarian:
         self._graph = _build_graph(self._samples, self._tree)
         # Compute d* via backward Dijkstra
         self._d_star = _backward_dijkstra(self._graph)
+
+    def score_candidates(
+        self,
+        candidates: list[dict],
+        raw_features: dict,
+    ) -> list[ScoredCandidate]:
+        """Score each LLM-emitted candidate action by corpus-derived shortest
+        path. Each candidate is a dict {'tool': str, 'args': dict} (the
+        original args from the LLM's tool_call, not canonicalized).
+
+        Returns one ScoredCandidate per input candidate, in the same order.
+
+        For each candidate:
+          - canonicalize args via state_class.canonical_action_args
+          - look up (state_class, action_class) edges in the graph
+          - if found: total_score = mean expected_cost + d*(next_state)
+          - if not found OR successor disconnected from GOAL: defer=True
+
+        ELECTION picks the lowest total_score among non-defer candidates;
+        if all defer, ELECTION returns the first (LLM's preferred).
+        """
+        from cat.state_class import canonical_action_args
+        out: list[ScoredCandidate] = []
+        if self._tree is None or self._graph is None:
+            sc = -1
+        else:
+            sc = self._tree.state_class(raw_features)
+        out_edges = self._graph.get("out_edges", {}).get(sc, []) if self._graph else []
+        # Build a lookup: action_klass → (mean_w, next_sc, n)
+        edges_by_action: dict[str, tuple] = {}
+        for akls, next_sc, w_mean, n in out_edges:
+            if akls == "__goal__":
+                continue
+            # If the same action_klass appears with multiple next_sc, prefer
+            # the one with lowest d*(next) — that's what Dijkstra would pick.
+            if akls not in edges_by_action:
+                edges_by_action[akls] = (w_mean, next_sc, n)
+            else:
+                # Already have one; keep whichever leads to cheaper next state
+                _w, prev_next, _n = edges_by_action[akls]
+                if self._d_star.get(next_sc, math.inf) < self._d_star.get(prev_next, math.inf):
+                    edges_by_action[akls] = (w_mean, next_sc, n)
+
+        for i, cand in enumerate(candidates):
+            tool = cand.get("tool", "") or cand.get("name", "")
+            raw_args = cand.get("args", {}) or cand.get("arguments", {}) or {}
+            ca = canonical_action_args(tool, raw_args)
+            from cat.state_class import action_class
+            akls = action_class(tool, raw_args)
+            sc_obj = ScoredCandidate(
+                index=i, tool=tool, canonical_args=ca,
+                action_klass=akls, state_class=sc,
+            )
+            if akls in edges_by_action:
+                w_mean, next_sc, n = edges_by_action[akls]
+                d_next = self._d_star.get(next_sc, math.inf)
+                if d_next != math.inf:
+                    sc_obj.expected_cost = w_mean
+                    sc_obj.next_state_d_star = d_next
+                    sc_obj.total_score = w_mean + d_next
+                    sc_obj.confidence_n = n
+                    sc_obj.defer = False
+            out.append(sc_obj)
+        return out
 
     def recommend(self, raw_features: dict) -> Optional[Recommendation]:
         """Return the best action for this state, or None if cold/disconnected.

@@ -59,8 +59,13 @@ You will be given:
 - the BUDGET STATUS
 
 Rules:
-1. Take exactly ONE concrete performance act per turn (one tool call) OR emit \
-a brief text "DONE" only when every plan step is checked complete.
+1. Each turn, propose your next concrete performance act. You MAY emit TWO \
+alternative tool calls in the same turn when the next step is genuinely \
+uncertain — the framework will score both against prior runs at similar \
+states (via Dijkstra over a learned corpus) and execute the more promising \
+one. The losing alternative is recorded for retrospective analysis. If you \
+are confident, ONE tool call is fine and skips arbitration entirely. Emit \
+brief text "DONE" only when every plan step is checked complete.
 2. Address the FIRST un-checked step. Do not skip ahead.
 3. Be terse. Do not narrate. Do not re-state the plan. Just act.
 4. If a tool returns an error, diagnose and try a corrected action; do NOT repeat \
@@ -484,6 +489,79 @@ class Activator:
             f"usd: ${c.usd:.4f}/${b.max_usd:.2f}"
         )
 
+    def _run_election(
+        self,
+        contract: Contract,
+        run: ActivatorRun,
+        candidates: list[dict],
+        parent_event_id: str,
+    ) -> int:
+        """Score `candidates` via the librarian; emit an `election` trace
+        event; return the winning index.
+
+        Winner = lowest total_score among non-defer candidates; if all
+        defer, returns 0 (LLM's preferred). Never raises — election is
+        best-effort optimization, not a correctness path.
+        """
+        try:
+            from cat.state_class import extract_raw_features_from_events
+            events_dicts = [
+                {"kind": e.kind, "payload": e.payload or {}}
+                for e in self.recorder.traj.events
+            ]
+            obligation_text = (contract.obligation or "").strip()
+            raw = extract_raw_features_from_events(events_dicts, obligation_text)
+            # Normalize candidates to {tool, args} dicts for librarian
+            cand_inputs = [
+                {"tool": c.get("name", ""), "args": c.get("arguments", {}) or {}}
+                for c in candidates
+            ]
+            scored = self.librarian.score_candidates(cand_inputs, raw)
+        except Exception as exc:  # noqa: BLE001 — never crash for an optimization
+            print(f"warning: election scoring failed: {exc}")
+            return 0
+
+        # Pick winner: lowest total_score among non-defer; else 0
+        eligible = [s for s in scored if not s.defer and s.total_score is not None]
+        if eligible:
+            winner = min(eligible, key=lambda s: s.total_score)
+            elected_index = winner.index
+            decision_reason = "math"
+        else:
+            elected_index = 0
+            decision_reason = "defer"
+
+        # Record election event
+        election_id = f"elect-{uuid.uuid4().hex[:6]}"
+        self.recorder.append(TraceEvent(
+            event_id=election_id,
+            parent_id=parent_event_id,
+            ts=utcnow_iso(),
+            kind="election",
+            payload={
+                "contract_id": contract.id,
+                "iteration": run.iterations,
+                "winner_index": elected_index,
+                "winner_tool": candidates[elected_index].get("name", ""),
+                "decision": decision_reason,
+                "candidates": [
+                    {
+                        "index": s.index,
+                        "tool": s.tool,
+                        "action_klass": s.action_klass,
+                        "state_class": s.state_class,
+                        "expected_cost": s.expected_cost,
+                        "next_state_d_star": s.next_state_d_star,
+                        "total_score": s.total_score,
+                        "confidence_n": s.confidence_n,
+                        "defer": s.defer,
+                    }
+                    for s in scored
+                ],
+            },
+        ))
+        return elected_index
+
     def _librarian_hint(self, contract: Contract, run: ActivatorRun) -> Optional[str]:
         """Build a CORPUS HINT message from the LIBRARIAN's recommendation,
         if any. Returns None when the librarian is unavailable, the state is
@@ -562,6 +640,31 @@ class Activator:
         executor_llm_event_id = self.recorder.traj.events[-1].event_id
         self._charge_llm(contract, result)
 
+        # 1.7 Phase A.2 — ELECTION: when the LLM emits ≥2 candidate tool
+        # calls in one turn and we have a librarian, the math arbitrates.
+        # Scoring is `expected_cost + d*(next_state)`. Lowest wins. If all
+        # candidates DEFER (no corpus signal), fall through to the first
+        # candidate (LLM's preferred — preserves cold-state behavior).
+        # The losing candidate is recorded in an `election` trace event for
+        # retrospective analysis and trimmed from the message history so
+        # the OpenAI tool_call ↔ tool_result correspondence stays valid.
+        elected_index = 0
+        if (
+            len(result.tool_calls) >= 2
+            and self.librarian is not None
+            and self.librarian.is_ready()
+        ):
+            elected_index = self._run_election(
+                contract, run, result.tool_calls, executor_llm_event_id,
+            )
+        # Keep only the winning tool_call in result.tool_calls for downstream
+        # processing. Other candidates are recorded in the election event.
+        if len(result.tool_calls) >= 2 and elected_index != 0:
+            winner = result.tool_calls[elected_index]
+            result.tool_calls = [winner]
+        elif len(result.tool_calls) >= 2:
+            result.tool_calls = [result.tool_calls[0]]
+
         if result.tool_calls:
             run.messages.append({
                 "role": "assistant",
@@ -585,10 +688,8 @@ class Activator:
             run.final_text = result.text
             return False
 
-        # Discipline: only execute the FIRST tool call this turn.
-        # No silent argument normalization — args are passed to the registry as the
-        # LLM emitted them. Malformed args produce tool errors that the executor
-        # sees in the next turn, same as any other failure.
+        # Discipline: only execute the FIRST tool call (post-ELECTION, this is
+        # the winning candidate; pre-ELECTION it was the LLM's first emission).
         first = result.tool_calls[0]
         invoke_event_id = f"inv-{uuid.uuid4().hex[:6]}"
         # capability_perform chains from the executor llm_usage that produced this tool call

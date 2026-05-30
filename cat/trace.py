@@ -33,6 +33,7 @@ EventKind = Literal[
     "contract_admit",          # Step 4 ACTIVATE: admission gate decision
     "criterion_check",         # verifier ran a criterion
     "capability_perform",      # Step 6 PERFORM: one performance act (was: capability_invoke)
+    "election",                # v1.7 A.2 ADVISOR+ELECTION: math arbitrated between candidates
     # Legacy aliases (kept readable for pre-rename traces):
     "contract_decompose",      # legacy alias for contract_stipulate
     "capability_invoke",       # legacy alias for capability_perform
