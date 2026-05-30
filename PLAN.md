@@ -31,8 +31,8 @@ in **docs/PRD/**.
 - **v1.7 B — SUSPENDED resume (DAG-grounded).** Walk DAG to last neutral ancestor on suspend; prune dead-end subtree; resume.
 - **v1.7 C — A\* heuristic h(v) from corpus.** Upgrade Dijkstra to A* with admissible-by-construction h(v) = 25th-percentile cost-to-goal.
 - **v1.7.0.x — Two-tier feature refactor formalization.** `action_intent` declared at Capability registration, not hardcoded. Code-Python features moved to `domain_features` dict. Sets up tau-bench arrival.
-- **v1.4 — tau-bench cross-domain validation.** First non-code domain. → [PRD](docs/PRD/v1.4_tau_bench.md)
-- **v1.8 — Coding domain hardening (gate before v2.0).** Head-to-head vs Hermes/Pi/Claude-Code + AgentBench subset + pass^k. → [PRD](docs/PRD/v1.8_hardening.md)
+- **v1.4 — SkillsBench cross-domain validation.** 94 tasks across 11 professional domains, deterministic per-task verifier, Docker-per-task (same shape as SWE-bench). Folds in part of v1.8 head-to-head (Claude Code / OpenHands / Codex are already on leaderboard). → [PRD](docs/PRD/v1.4_skillsbench.md)
+- **v1.8 — Framework-comparison hardening (gate before v2.0).** Pi + Hermes head-to-head (the leaderboard doesn't cover these); pass^k consistency analysis. → [PRD](docs/PRD/v1.8_hardening.md)
 - **v1.9 — GAIA (near-verifiable open-ended).** Bridge between deterministic and subjective criteria. Multi-step research questions with exact-match answers.
 - **v2.0 — Domain-agnostic expansion.** WebArena + OSWorld + Spider 2.0. → [PRD](docs/PRD/v2.0_cross_domain.md)
 
