@@ -303,9 +303,34 @@ def _finalize_sample(buf: dict, trace_id: str, reached_goal: bool) -> Sample:
 # ── PredicateTree (v1: only base keys, ONE conceptual leaf per base-tuple) ──
 
 
+def predicate_holds(raw: dict, feature: str, threshold) -> bool:
+    """Evaluate a learned predicate on raw features.
+
+    Type-dispatch on the value's runtime type:
+      - numeric value + numeric threshold  → `v > threshold`
+      - list value                          → `threshold in v` (membership)
+      - everything else (str/None)          → `v == threshold`
+    """
+    v = raw.get(feature)
+    if isinstance(v, (int, float)) and isinstance(threshold, (int, float)) and not isinstance(v, bool):
+        return v > threshold
+    if isinstance(v, list):
+        return threshold in v
+    return v == threshold
+
+
+def describe_predicate(feature: str, threshold, sample_value) -> str:
+    """Human-readable predicate string."""
+    if isinstance(sample_value, (int, float)) and isinstance(threshold, (int, float)) and not isinstance(sample_value, bool):
+        return f"{feature} > {threshold}"
+    if isinstance(sample_value, list):
+        return f"{threshold!r} in {feature}"
+    return f"{feature} == {threshold!r}"
+
+
 class PredicateTree:
     """Starts maximally coarse — every sample with the same base-key tuple is
-    one leaf. Refinement (v2+) will add learned predicates as splits.
+    one leaf. v2 adds CEGAR-driven splits via .split().
 
     base_keys are the dimensions the tree treats as ALWAYS-ON: every other
     raw feature must be earned into the tree via a counterexample-driven
@@ -314,23 +339,69 @@ class PredicateTree:
 
     def __init__(self, base_keys=("obligation_hash", "plan_idx")):
         self.base_keys = base_keys
-        # Stable assignment: (base_tuple) → leaf_id (int)
+        self._base_to_root: dict[tuple, int] = {}     # base_tuple -> root node id
         self._next_id = 0
-        self._key_to_id: dict[tuple, int] = {}
-        # In v1 we ONLY have base-key leaves. v2 adds learned predicates per leaf.
+        # For internal (non-leaf) nodes:
+        self.splits: dict[int, tuple] = {}             # node_id -> (feature, threshold, description)
+        self.children: dict[int, tuple[int, int]] = {} # node_id -> (left_leaf_id, right_leaf_id)
+        # Track which node ids are CURRENTLY leaves (for iteration)
+        self._is_leaf: dict[int, bool] = {}
+
+    def _alloc_id(self) -> int:
+        i = self._next_id
+        self._next_id += 1
+        self._is_leaf[i] = True
+        return i
 
     def _base_tuple(self, raw: dict) -> tuple:
         return tuple(raw.get(k) for k in self.base_keys)
 
     def state_class(self, raw: dict) -> int:
-        key = self._base_tuple(raw)
-        if key not in self._key_to_id:
-            self._key_to_id[key] = self._next_id
-            self._next_id += 1
-        return self._key_to_id[key]
+        bt = self._base_tuple(raw)
+        if bt not in self._base_to_root:
+            self._base_to_root[bt] = self._alloc_id()
+        node_id = self._base_to_root[bt]
+        while node_id in self.splits:
+            feature, threshold, _desc = self.splits[node_id]
+            left_id, right_id = self.children[node_id]
+            node_id = left_id if predicate_holds(raw, feature, threshold) else right_id
+        return node_id
+
+    def split(self, leaf_id: int, feature: str, threshold, sample_value=None) -> tuple[int, int]:
+        if leaf_id in self.splits:
+            raise ValueError(f"node {leaf_id} already split")
+        if not self._is_leaf.get(leaf_id, False):
+            raise ValueError(f"node {leaf_id} is not a leaf")
+        left = self._alloc_id()
+        right = self._alloc_id()
+        desc = describe_predicate(feature, threshold, sample_value if sample_value is not None else threshold)
+        self.splits[leaf_id] = (feature, threshold, desc)
+        self.children[leaf_id] = (left, right)
+        self._is_leaf[leaf_id] = False
+        return left, right
 
     def n_leaves(self) -> int:
-        return len(self._key_to_id)
+        return sum(1 for v in self._is_leaf.values() if v)
+
+    def depth_of(self, node_id: int) -> int:
+        """Depth from root for a node id. Linear walk; cheap for our tree sizes."""
+        for root_id in self._base_to_root.values():
+            d = self._depth_walk(root_id, node_id, 0)
+            if d is not None:
+                return d
+        return -1
+
+    def _depth_walk(self, current: int, target: int, depth: int) -> Optional[int]:
+        if current == target:
+            return depth
+        if current not in self.splits:
+            return None
+        l, r = self.children[current]
+        for child in (l, r):
+            d = self._depth_walk(child, target, depth + 1)
+            if d is not None:
+                return d
+        return None
 
 
 # ── Graph + backward Dijkstra ───────────────────────────────────────────────
@@ -378,6 +449,169 @@ def build_graph(samples: list[Sample], tree: PredicateTree) -> dict:
         "edge_buckets": dict(edge_buckets),
         "pass_terminal_states": pass_terminal_states,
     }
+
+
+# ── CEGAR: counterexample detection + decision-tree-stump split ────────────
+
+
+def find_counterexample(
+    samples: list[Sample],
+    tol_cv: float = 0.30,
+    min_samples: int = 4,
+) -> Optional[dict]:
+    """Trigger B (value_split): leaf with highest CV of realized_cost_to_goal
+    above threshold. Considers only PASS-path samples (realized cost is
+    well-defined). Trigger A (belief_split, self-loop) is added in v2.1.
+    """
+    by_leaf: dict[int, list[Sample]] = defaultdict(list)
+    for s in samples:
+        if s.on_goal_path and s.realized_cost_to_goal != math.inf:
+            by_leaf[s.state_class].append(s)
+    worst = None
+    worst_cv = tol_cv
+    for leaf, ss in by_leaf.items():
+        if len(ss) < min_samples:
+            continue
+        costs = [s.realized_cost_to_goal for s in ss]
+        mean = statistics.mean(costs)
+        if mean == 0:
+            continue
+        stdev = statistics.stdev(costs) if len(costs) > 1 else 0.0
+        cv = stdev / mean
+        if cv > worst_cv:
+            worst_cv = cv
+            worst = {"leaf": leaf, "samples": ss, "kind": "value_split", "cv": cv}
+    return worst
+
+
+def _variance_loss(values: list[float]) -> float:
+    """Population variance; 0 if fewer than 2 samples."""
+    if len(values) < 2:
+        return 0.0
+    m = sum(values) / len(values)
+    return sum((v - m) ** 2 for v in values) / len(values)
+
+
+def choose_predicate(
+    samples: list[Sample],
+    kind: str,
+    base_keys: tuple = ("obligation_hash", "plan_idx"),
+) -> Optional[dict]:
+    """Hand-rolled max_depth=1 decision stump over raw_features.
+
+    Iterates every (feature, candidate_threshold) pair; picks the one with
+    minimum weighted variance of the target. Target depends on kind:
+      - value_split: regression on realized_cost_to_goal
+      - belief_split: classification on durable_change (0/1)
+
+    Excludes base_keys from candidates (always-on; can't be a refinement
+    target). Returns {feature, threshold, description, loss, sample_value}
+    or None if no informative split exists.
+    """
+    if kind == "value_split":
+        y = [s.realized_cost_to_goal for s in samples]
+    else:
+        y = [1.0 if s.durable_change else 0.0 for s in samples]
+
+    # Collect candidate (feature, threshold) pairs
+    candidates: dict[str, set] = defaultdict(set)
+    for s in samples:
+        for fkey, fval in s.raw_features.items():
+            if fkey in base_keys:
+                continue
+            if isinstance(fval, (int, float)) and not isinstance(fval, bool):
+                candidates[fkey].add(fval)
+            elif isinstance(fval, str) or fval is None:
+                candidates[fkey].add(fval)
+            elif isinstance(fval, list):
+                for item in fval:
+                    candidates[fkey].add(item)
+            elif isinstance(fval, bool):
+                candidates[fkey].add(fval)
+
+    baseline_loss = _variance_loss(y)
+    best = None
+    best_loss = baseline_loss  # any valid split must beat the baseline
+
+    for feature, thresholds in candidates.items():
+        for threshold in thresholds:
+            left_y, right_y = [], []
+            sample_value_for_desc = None
+            for s, y_i in zip(samples, y):
+                v = s.raw_features.get(feature)
+                if sample_value_for_desc is None and v is not None:
+                    sample_value_for_desc = v
+                if predicate_holds(s.raw_features, feature, threshold):
+                    left_y.append(y_i)
+                else:
+                    right_y.append(y_i)
+            if not left_y or not right_y:
+                continue
+            n = len(y)
+            loss = (len(left_y) / n) * _variance_loss(left_y) + (len(right_y) / n) * _variance_loss(right_y)
+            if loss < best_loss:
+                best_loss = loss
+                best = {
+                    "feature":         feature,
+                    "threshold":       threshold,
+                    "loss":            loss,
+                    "baseline_loss":   baseline_loss,
+                    "reduction":       baseline_loss - loss,
+                    "n_left":          len(left_y),
+                    "n_right":         len(right_y),
+                    "sample_value":    sample_value_for_desc,
+                    "description":     describe_predicate(feature, threshold,
+                                                          sample_value_for_desc if sample_value_for_desc is not None else threshold),
+                }
+    return best
+
+
+def learn_abstraction(
+    samples: list[Sample],
+    max_iterations: int = 12,
+    max_depth: int = 6,
+    tol_cv: float = 0.30,
+    min_samples: int = 4,
+) -> tuple[PredicateTree, list[str]]:
+    """The CEGAR loop. Returns (final_tree, history_log)."""
+    tree = PredicateTree()
+    history: list[str] = []
+
+    for i in range(max_iterations):
+        # Re-apply tree to every sample
+        for s in samples:
+            s.state_class = tree.state_class(s.raw_features)
+            s.next_state_class = tree.state_class(s.next_raw_features)
+        # Find worst counterexample
+        cex = find_counterexample(samples, tol_cv=tol_cv, min_samples=min_samples)
+        if cex is None:
+            history.append(f"iter {i}: no counterexample above CV={tol_cv} (n_leaves={tree.n_leaves()})")
+            break
+        # Depth guard
+        if tree.depth_of(cex["leaf"]) >= max_depth:
+            history.append(f"iter {i}: leaf {cex['leaf']} at max_depth={max_depth}; skipping (consider raising max_depth)")
+            break
+        # Choose predicate
+        pred = choose_predicate(cex["samples"], cex["kind"], base_keys=tree.base_keys)
+        if pred is None:
+            history.append(f"iter {i}: leaf {cex['leaf']} CV={cex['cv']:.2f} but no informative predicate found")
+            break
+        # Apply split
+        left, right = tree.split(cex["leaf"], pred["feature"], pred["threshold"], pred["sample_value"])
+        history.append(
+            f"iter {i}: split leaf {cex['leaf']} (CV={cex['cv']:.2f}, n={len(cex['samples'])})  "
+            f"on  {pred['description']}  "
+            f"→ leaves {left}/{right}  "
+            f"(variance: {pred['baseline_loss']:.0f} → {pred['loss']:.0f},  Δ={pred['reduction']:.0f})"
+        )
+    else:
+        history.append(f"iter {max_iterations}: max_iterations reached")
+
+    # Final state-class assignment
+    for s in samples:
+        s.state_class = tree.state_class(s.raw_features)
+        s.next_state_class = tree.state_class(s.next_raw_features)
+    return tree, history
 
 
 def backward_dijkstra(graph: dict, target: int = GOAL_NODE) -> dict[int, float]:
@@ -493,11 +727,29 @@ def ingest_run_dir(run_dir: Path) -> list[Sample]:
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 
+def report_tree_structure(tree: PredicateTree) -> str:
+    """Show the learned predicate tree."""
+    lines = ["# Learned predicate tree"]
+    lines.append(f"  {tree.n_leaves()} leaves, {len(tree.splits)} split nodes")
+    if not tree.splits:
+        lines.append("  (no splits — only base-key leaves)")
+        return "\n".join(lines)
+    for split_node, (feature, threshold, desc) in sorted(tree.splits.items()):
+        left, right = tree.children[split_node]
+        lines.append(f"  node {split_node}: split on '{desc}' → leaves {left} (true) / {right} (false)")
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir", nargs="+", help="path(s) to tb-runs leaves; multiple = merged corpus")
     ap.add_argument("--json", action="store_true", help="emit samples + graph as JSON")
     ap.add_argument("--actions", action="store_true", help="show candidate actions per leaf")
+    ap.add_argument("--cegar", action="store_true", help="run CEGAR refinement loop (v2)")
+    ap.add_argument("--tol-cv", type=float, default=0.30, help="counterexample threshold (CV)")
+    ap.add_argument("--max-iter", type=int, default=12, help="max CEGAR iterations")
+    ap.add_argument("--max-depth", type=int, default=6, help="max predicate tree depth")
+    ap.add_argument("--min-samples", type=int, default=4, help="min samples per leaf to consider splitting")
     args = ap.parse_args()
 
     samples: list[Sample] = []
@@ -506,6 +758,27 @@ def main():
     if not samples:
         print("no samples ingested", file=sys.stderr)
         sys.exit(1)
+
+    if args.cegar:
+        tree, history = learn_abstraction(
+            samples,
+            max_iterations=args.max_iter,
+            max_depth=args.max_depth,
+            tol_cv=args.tol_cv,
+            min_samples=args.min_samples,
+        )
+        graph = build_graph(samples, tree)
+        print("# CEGAR refinement log")
+        for line in history:
+            print(f"  {line}")
+        print()
+        print(report_tree_structure(tree))
+        print()
+        print(report_variance_per_leaf(samples, tree))
+        if args.actions:
+            print()
+            print(report_actions_per_leaf(samples, tree, graph))
+        return
 
     tree = PredicateTree()
     graph = build_graph(samples, tree)

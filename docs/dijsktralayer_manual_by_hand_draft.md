@@ -694,6 +694,175 @@ AWAY from another pytest call.
 
 ---
 
+## 11. POC iteration v2 — CEGAR splits (2026-05-30)
+
+v2 implements the counterexample-driven split mechanism. Hand-rolled
+`max_depth=1` decision stump (no sklearn dependency, ~80 lines of stdlib).
+Full v2 output in `docs/v2_simulation_output.txt`.
+
+### Configuration
+
+- `tol_cv = 0.30` (counterexample threshold on coefficient of variation)
+- `max_iterations = 30`
+- `max_depth = 8`
+- `min_samples = 4` (Trigger B; need ≥4 samples to fit a meaningful stump)
+- Trigger: value_split only in v2 (belief_split for self-loops queued for v2.1)
+
+### Run on merged swe10 corpus (19 traces, 392 samples)
+
+**CEGAR loop log (first 12 splits, in order):**
+
+```
+iter  0: split leaf  6 (CV=0.81)  on  workdir_version > 0           Δvar=76M
+iter  1: split leaf 10 (CV=1.28)  on  last_outcome == 'error'        Δvar=5.6M
+iter  2: split leaf  8 (CV=0.78)  on  'pytest-act' in attempted     Δvar=1.7B
+iter  3: split leaf 14 (CV=0.80)  on  n_attempted_actions > 12       Δvar=700M
+iter  4: split leaf  7 (CV=0.76)  on  last_tool == 'read'            Δvar=25M
+iter  5: split leaf  0 (CV=0.74)  on  'bash-other' in attempted     Δvar=6.3B
+iter  6: split leaf  5 (CV=0.71)  on  n_attempted_actions > 1        Δvar=41M
+iter  7: split leaf 22 (CV=1.07)  on  last_tool == 'rg'              Δvar=18M
+iter  8: split leaf 25 (CV=1.26)  on  last_bash_class == 'grep'      Δvar=15M
+iter  9: split leaf 20 (CV=0.67)  on  n_attempted_actions > 18       Δvar=360M
+iter 10: split leaf 28 (CV=0.67)  on  last_bash_class == 'python-c-script' Δvar=127M
+iter 11: split leaf 31 (CV=0.67)  on  n_attempted_actions > 19       Δvar=96M
+...  (run terminates at iter 30 / max_depth=8)
+final: 38 leaves, 19 split nodes
+```
+
+### What the data picked (and what it tells us)
+
+**The predicates the corpus chose at the top of the tree are exactly the
+ones we predicted in v1's writeup:**
+
+1. **`workdir_version > 0`** — "have you made your edit yet?" The single
+   most variance-reducing split on the highest-CV leaf. Validates the
+   intuition that "before-edit" and "after-edit" are fundamentally
+   different states.
+
+2. **`last_outcome == 'error'`** — error-state vs success-state. The
+   second-most-load-bearing split.
+
+3. **`'pytest action_class' in attempted_actions`** — *have you tried
+   pytest yet?* This is the corpus directly encoding the failure mode
+   from 1.6.6.13's cost analysis. After CEGAR refinement, the state
+   "I've already tried pytest" is a separate leaf from "I haven't tried
+   pytest" — meaning the ADVISOR can recommend AWAY from another pytest
+   call when n_pytest_tried > 0.
+
+4. **`n_attempted_actions > 12/18/19`** — drift indicators at multiple
+   depths. Catches the f59669ec self-loop pattern: "you've been iterating
+   for a while, probably stuck."
+
+**These are the domain-agnostic predicates** the v1.7.0.x refactor will
+formalize. `workdir_version`, `n_attempted_actions`, and `last_outcome`
+all generalize to other domains; the bash_class predicates are code-only.
+
+### d*(s) is now meaningful
+
+In v1, every reachable leaf had `d* = 0` (degenerate single-node-per-task).
+After CEGAR refinement, d* values are real distances:
+
+```
+leaf  11:  d* = 4,433     (cheapest reachable — small sklearn task post-edit)
+leaf  21:  d* = 5,928     (django mid-trajectory)
+leaf  23:  d* = 14,023    (sympy investigation)
+leaf  35:  d* = 27,154    (sympy deep iteration)
+leaf  45:  d* = (52 samples, mean_real=285K, CV=0.27)  (most expensive PASS-cluster)
+```
+
+**The graph is now actually learnable for Dijkstra recommendations.**
+
+### Example: what the corpus would recommend from leaf 11
+
+```
+leaf 11:  d* = 4,433
+   action [69d7ba97]  read sklearn/show_versions.py   n=2  durable=0/2  d*(next)=4433
+   action [dfa4a970]  str_replace show_versions.py    n=1  durable=1/1  d*(next)=0
+   action [0e5c7f9d]  read show_versions.py            n=1  durable=0/1  d*(next)=4433
+```
+
+Dijkstra: `score(read) = 3,993 + 4,433 = 8,426 tokens`
+          `score(str_replace) = 4,433 + 0 = 4,433 tokens` ← **recommended**
+
+The corpus has learned: from sklearn-post-investigation state, go
+straight to `str_replace`. Don't bare-read more.
+
+### Example: what the corpus would recommend from leaf 23 (rg disambiguation)
+
+```
+leaf 23:  d* = 14,023
+   action [4399f39a]  rg "return s\.replace\(...)"    d*(next)=14023
+   action [905452c4]  rg "return s.replace\(...)"      d*(next)=9749   ← cheaper next state
+   action [0824524d]  rg "return s.replace\(...)"      d*(next)=14023
+```
+
+Dijkstra: pick the rg variant that leads to the cheaper next-state leaf.
+This is the corpus learning "this regex variant was the one that actually
+disambiguated."
+
+### What v2 has proven
+
+- **The CEGAR mechanism works as designed.** Variance reduction per split
+  is substantial (Δvar = 75M, 1.7B, 6.3B on the biggest splits).
+- **The predicates are interpretable.** Each split has a human-readable
+  form (`workdir_version > 0`, `'pytest' in attempted_actions`,
+  `last_outcome == 'error'`).
+- **d* is no longer trivially zero.** After refinement, leaves have
+  meaningful distance-to-GOAL values, ranging 0 to ~285K tokens.
+- **Cross-trace aggregation contributes.** Many leaves have n_traces=2
+  (one from each run), so the Q estimates and d* computations
+  incorporate evidence from multiple agent attempts at the same state.
+- **The action recommendations differ from what the agent actually did.**
+  In leaves like 11 and 23, Dijkstra recommends actions that minimize
+  cost-to-goal, not the actions the LLM happened to emit first.
+
+### What v2 doesn't yet do (v3 work)
+
+- **No belief_split trigger** for self-loops. The f59669ec-pattern (36
+  identical actions from the same state, observation constant) isn't
+  detected by value_split alone — it needs the Trigger A check on
+  self-loop fraction.
+- **No DEFER logic.** The advisor would currently always return an action
+  even from a leaf with n=1 (low confidence). Need a confidence floor.
+- **No LIBRARIAN.** Embedding similarity for cross-task transfer not
+  built; obligation_hash exact-match is the only cross-task mechanism.
+- **Token-weight stationarity** not enforced. All edge weights are
+  pooled across both runs (v1.6.6 + v1.7-tools) which used the same
+  `deepseek-v4-flash`. If we mix models, the weights would compose
+  poorly.
+
+### Provisional answer to the v1.7 Phase A gating question
+
+The simulation supports the design empirically:
+- State_class collision rate at coarse base (1/task) → at refined leaves,
+  multiple traces hit the same finely-typed state (e.g., leaf 21 has
+  42 samples across 2 traces; leaf 45 has 52 samples).
+- Variance after refinement is below threshold for most leaves with
+  enough samples (CV < 0.30 for 14 of 38 leaves).
+- d* values differ meaningfully across leaves, so Dijkstra has signal.
+- Predicates picked match the human-predicted failure modes (pytest
+  loop, drift indicators, post-edit state).
+
+**Go decision: implement Phase A with CEGAR-shaped abstraction,
+preceded by 1.7.0.x two-tier feature refactor.** Math validated;
+build path clear.
+
+### Next iteration choices
+
+| v | What | Why |
+|---|---|---|
+| v3 | Add belief_split trigger (self-loop ratio) | Catches POMDP-style stuck-states like f59669ec |
+| v4 | Add DEFER logic + confidence floor | Avoid recommending from n=1 leaves |
+| 1.7.0.x | Two-tier feature refactor | Make CEGAR predicates domain-agnostic before Phase A |
+| Phase A | Wire CEGAR + advisor into activator runtime | Real impact on live runs |
+
+The refactor (1.7.0.x) is more valuable than v3/v4 right now because
+without it, the predicates the live agent learns will be locked to
+code-Python features. v3/v4 polish the corpus side; the refactor opens
+the cross-domain door before we close it.
+
+---
+
 ## Sources
 
 - Trace file: `data/runs/swebench/2026-05-28/16-28-49-swe10-v1.7-tools/django__django-12039/django__django-12039.1-of-1.swe10-v1.7-tools/agent-logs/cat-tb-8d35f3fb.jsonl`
