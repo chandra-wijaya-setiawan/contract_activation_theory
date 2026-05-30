@@ -55,6 +55,14 @@ done
 if [[ -z "$RUN_ID" ]]; then
   echo "ERROR: --run-id required" >&2; exit 2
 fi
+# Docker compose project names must be lowercase + [a-z0-9_-] — terminal-bench
+# builds the project name from --run-id, so we must enforce it here or the
+# whole run silently fails at `docker compose build` with cryptic errors.
+if [[ ! "$RUN_ID" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+  echo "ERROR: --run-id '$RUN_ID' must be lowercase alphanumerics, hyphens, or underscores, starting with a letter or digit" >&2
+  echo "       (this is a docker compose project-name requirement; mixed case or special chars break the harness build step)" >&2
+  exit 2
+fi
 if [[ ${#TASK_IDS[@]} -eq 0 ]]; then
   echo "ERROR: at least one --task-id required" >&2; exit 2
 fi
