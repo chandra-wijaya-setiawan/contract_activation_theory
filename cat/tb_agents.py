@@ -13,6 +13,7 @@ Required env: OPENROUTER_API_KEY
 """
 from __future__ import annotations
 import json
+import os
 import tempfile
 import time
 import uuid
@@ -267,6 +268,21 @@ class TbCatAgent(BaseAgent):
             if pre_reps:
                 contract.representations = pre_reps
 
+            # 1.7 Phase A.1 — optional LIBRARIAN attached when CAT_CORPUS_DB
+            # env var points to a SQLite corpus. Cold-start safe: if path
+            # doesn't exist OR corpus is empty, recommend() returns None and
+            # the activator falls through to standard behavior.
+            librarian = None
+            corpus_db = os.environ.get("CAT_CORPUS_DB", "").strip()
+            if corpus_db:
+                try:
+                    from cat.librarian import Librarian
+                    librarian = Librarian(corpus_db)
+                    librarian.refresh()
+                except Exception as exc:  # noqa: BLE001 — never fail task on librarian
+                    print(f"warning: librarian init failed ({exc}); continuing without advisor")
+                    librarian = None
+
             activator = Activator(
                 llm=llm,
                 registry=registry,
@@ -274,6 +290,7 @@ class TbCatAgent(BaseAgent):
                 max_iterations=self._max_iterations,
                 criterion_check_interval=self._criterion_check_interval,
                 window_size=self._window_size,
+                librarian=librarian,
             )
             activator.run(contract, state)
 

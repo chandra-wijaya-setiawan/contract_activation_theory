@@ -176,6 +176,7 @@ class Activator:
         max_iterations: int = 40,
         criterion_check_interval: int = 1,
         window_size: int = 4,
+        librarian: Optional["Librarian"] = None,
     ):
         self.llm = llm
         self.registry = registry
@@ -183,6 +184,11 @@ class Activator:
         self.max_iterations = max_iterations
         self.criterion_check_interval = criterion_check_interval
         self.window_size = window_size
+        # 1.7 Phase A.1 — optional advisory librarian. If set, the activator
+        # injects a "[CORPUS HINT]" system message into the performer context
+        # before each Step-5 SELECT LLM call. The LLM still picks; the hint
+        # carries prior runs' shortest-path-to-GOAL recommendation.
+        self.librarian = librarian
 
     # ── Public entry ────────────────────────────────────────────────────────
 
@@ -478,6 +484,36 @@ class Activator:
             f"usd: ${c.usd:.4f}/${b.max_usd:.2f}"
         )
 
+    def _librarian_hint(self, contract: Contract, run: ActivatorRun) -> Optional[str]:
+        """Build a CORPUS HINT message from the LIBRARIAN's recommendation,
+        if any. Returns None when the librarian is unavailable, the state is
+        cold, or no path-to-goal candidate exists.
+
+        Lightweight: just walks the current trace events to compute the
+        runtime raw_features snapshot.
+        """
+        if self.librarian is None or not self.librarian.is_ready():
+            return None
+        try:
+            from cat.state_class import extract_raw_features_from_events
+            events_dicts = [
+                {"kind": e.kind, "payload": e.payload or {}}
+                for e in self.recorder.traj.events
+            ]
+            obligation_text = (contract.obligation or "").strip()
+            raw = extract_raw_features_from_events(events_dicts, obligation_text)
+            rec = self.librarian.recommend(raw)
+        except Exception as exc:  # noqa: BLE001 — never crash the run for a hint
+            print(f"warning: librarian hint failed: {exc}")
+            return None
+        if rec is None:
+            return None
+        return (
+            "[CORPUS HINT] "
+            + rec.format_hint()
+            + " — this is advisory only; use your judgment if the situation differs."
+        )
+
     def _perform_once(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
         """One executor turn: ask LLM for next action, run the tool call (if any).
 
@@ -501,8 +537,21 @@ class Activator:
             or run.last_state_event_id
             or None
         )
+
+        # 1.7 Phase A.1 — inject LIBRARIAN advisory hint if available.
+        # The hint goes in as a transient SYSTEM message that the LLM sees on
+        # THIS turn only; it doesn't get permanently added to run.messages so
+        # later turns won't carry stale advice. The hint is purely advisory;
+        # the LLM still picks the tool call.
+        messages_with_hint = run.messages
+        hint_text = self._librarian_hint(contract, run) if self.librarian is not None else None
+        if hint_text:
+            messages_with_hint = run.messages + [
+                {"role": "system", "content": hint_text}
+            ]
+
         result = self.llm.chat(
-            messages=run.messages,
+            messages=messages_with_hint,
             tools=tools,
             tool_choice="auto",
             role_tag="performer",

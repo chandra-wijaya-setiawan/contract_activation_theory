@@ -231,6 +231,13 @@ if [[ -f "$RUN_DIR/results.json" ]]; then
   echo ""
   echo "── Generating KPI report (this may take a moment for LLM attribution)"
   cd "$REPO_ROOT" && python3 -m cat.run_report "$RUN_DIR" "${REPORT_FLAGS[@]}" || true
+
+  # 1.7 Phase A.1 — corpus writeback. Ingest this run's traces so the
+  # LIBRARIAN has more samples next time. Cold-start safe.
+  CORPUS_DB="${CAT_CORPUS_DB:-$REPO_ROOT/data/corpus/cat_corpus.db}"
+  echo ""
+  echo "── Writing samples to corpus: $CORPUS_DB"
+  cd "$REPO_ROOT" && python3 scripts/seed_corpus.py "$CORPUS_DB" "$RUN_DIR" || true
 fi
 
 # Regenerate top-level INDEX
