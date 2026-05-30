@@ -20,19 +20,17 @@ in **docs/PRD/**.
 | v1.6.6.7–14 | ✅ 2026-05-29 | 14-tool surface, −55% tool calls, read truncation nudge → [PRD](docs/PRD/v1.6.6.7-14_tool_surface_expansion.md) |
 | v1.7.0 | ✅ 2026-05-30 | Offline CEGAR + Dijkstra simulator validated → [PRD](docs/PRD/v1.7.0_offline_simulation.md) |
 | v1.7 A.1 | ✅ 2026-05-30 | Live corpus + LIBRARIAN advisory; smoke 2/3 PASS @ −18 to −25% tokens → [PRD](docs/PRD/v1.7_A1_corpus_librarian.md) |
-| **v1.7 A.2** | **🎯 NEXT** | **ADVISOR + ELECTION (math arbitrates between N=2 candidates)** → [PRD](docs/PRD/v1.7_A2_advisor_election.md) |
+| **v1.7 A.2** | **🎯 NEXT** | **ADVISOR + ELECTION** (math arbitrates between N=2 candidates) → [PRD](docs/PRD/v1.7_A2_election_and_followons.md) |
 
 ## Next
 
-- **v1.7 A.2 — ADVISOR + ELECTION.** Math arbitrates between LLM-generated candidates instead of just advising. ~150 LOC, ~1 hour. → [PRD](docs/PRD/v1.7_A2_advisor_election.md)
+- **v1.7 A.2 — ELECTION + follow-ons.** Math arbitrates between LLM-generated candidates instead of just advising. Single PRD bundles A.2 (primary), A* heuristic + SUSPENDED resume (ship only if data demands). ~150 LOC primary. → [PRD](docs/PRD/v1.7_A2_election_and_followons.md)
 
 ## Roadmap
 
-- **v1.7 B — SUSPENDED resume (DAG-grounded).** Walk DAG to last neutral ancestor on suspend; prune dead-end subtree; resume.
-- **v1.7 C — A\* heuristic h(v) from corpus.** Upgrade Dijkstra to A* with admissible-by-construction h(v) = 25th-percentile cost-to-goal.
-- **v1.7.0.x — Two-tier feature refactor formalization.** `action_intent` declared at Capability registration, not hardcoded. Code-Python features moved to `domain_features` dict. Sets up tau-bench arrival.
-- **v1.4 — SkillsBench cross-domain validation.** 94 tasks across 11 professional domains, deterministic per-task verifier, Docker-per-task (same shape as SWE-bench). Folds in part of v1.8 head-to-head (Claude Code / OpenHands / Codex are already on leaderboard). → [PRD](docs/PRD/v1.4_skillsbench.md)
-- **v1.8 — Framework-comparison hardening (gate before v2.0).** Pi + Hermes head-to-head (the leaderboard doesn't cover these); pass^k consistency analysis. → [PRD](docs/PRD/v1.8_hardening.md)
+- **v1.7.0.x — Two-tier feature refactor formalization.** `action_intent` declared at Capability registration, not hardcoded. Code-Python features moved to `domain_features` dict. Sets up cross-domain arrival.
+- **v1.7.1 — SkillsBench cross-domain validation.** 94 tasks across 11 professional domains, deterministic per-task verifier, Docker-per-task (same shape as SWE-bench). Folds in head-to-head vs Claude Code / OpenHands / Codex (already on leaderboard). → [PRD](docs/PRD/v1.7.1_skillsbench.md)
+- **v1.7.2 — Framework-comparison hardening (gate before v2.0).** Pi + Hermes head-to-head (the leaderboard doesn't cover these); pass^k consistency analysis. → [PRD](docs/PRD/v1.7.2_framework_comparison.md)
 - **v1.9 — GAIA (near-verifiable open-ended).** Bridge between deterministic and subjective criteria. Multi-step research questions with exact-match answers.
 - **v2.0 — Domain-agnostic expansion.** WebArena + OSWorld + Spider 2.0. → [PRD](docs/PRD/v2.0_cross_domain.md)
 
