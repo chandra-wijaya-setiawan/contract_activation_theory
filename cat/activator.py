@@ -504,7 +504,11 @@ class Activator:
                 {"kind": e.kind, "payload": e.payload or {}}
                 for e in self.recorder.traj.events
             ]
-            obligation_text = (contract.obligation or "").strip()
+            # CRITICAL: do NOT strip — the corpus stores obligation text as-is
+            # from the contract_state event payload, and stripping here would
+            # produce a different hash than what's in the corpus, breaking
+            # every state_class lookup. (Bug found 2026-05-30.)
+            obligation_text = contract.obligation or ""
             raw = extract_raw_features_from_events(events_dicts, obligation_text)
             # Normalize candidates to {tool, args} dicts for librarian
             cand_inputs = [
@@ -577,7 +581,11 @@ class Activator:
                 {"kind": e.kind, "payload": e.payload or {}}
                 for e in self.recorder.traj.events
             ]
-            obligation_text = (contract.obligation or "").strip()
+            # CRITICAL: do NOT strip — the corpus stores obligation text as-is
+            # from the contract_state event payload, and stripping here would
+            # produce a different hash than what's in the corpus, breaking
+            # every state_class lookup. (Bug found 2026-05-30.)
+            obligation_text = contract.obligation or ""
             raw = extract_raw_features_from_events(events_dicts, obligation_text)
             rec = self.librarian.recommend(raw)
         except Exception as exc:  # noqa: BLE001 — never crash the run for a hint
