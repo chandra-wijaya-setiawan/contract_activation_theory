@@ -77,17 +77,81 @@ def bash_command_class(cmd: str) -> str:
     return "bash-other"
 
 
-# State-changing tool classes — used to mark durable_change on each sample
-STATE_CHANGING_TOOLS = {"str_replace", "multi_edit", "apply_patch", "write"}
-STATE_CHANGING_BASH = {"pip-install", "pip-other", "pip-via-python", "mkdir", "fs-mutate"}
+# ── Action intent classification (domain-agnostic, declared at register-time) ──
+#
+# Three primary intents map cleanly to the abstract reasoning shape:
+#   investigate → gather information without changing state
+#   mutate      → change durable state (edit files, install packages)
+#   verify      → check whether a hypothesis / fix holds
+# Anything else falls back to "other" (rare).
+#
+# When CAT eventually adds tau-bench, this dispatch becomes per-domain — each
+# Capability declares its intent at registration. For now we hard-code the
+# mapping for the swe10 tool surface.
+
+_INVESTIGATE_TOOLS = {"read", "list", "rg", "fd", "outline",
+                      "goto_def", "find_refs", "git_diff", "git_status"}
+_MUTATE_TOOLS      = {"str_replace", "multi_edit", "apply_patch", "write"}
+
+# For bash, intent depends on what's being run.
+_VERIFY_BASH       = {"pytest", "django-runtests"}
+_MUTATE_BASH       = {"pip-install", "pip-other", "pip-via-python", "mkdir", "fs-mutate"}
+# everything else (ls, cat, find, grep, head-tail-wc, echo, bash-other, sed,
+# python-c-script, python-script, git-other, git-log) → "investigate"
 
 
-def is_state_changing(tool: str, args: dict, is_error: bool) -> bool:
-    if is_error: return False
-    if tool in STATE_CHANGING_TOOLS: return True
+def action_intent_of(tool: str, args: dict) -> str:
+    """Classify a tool call by its abstract reasoning role."""
+    if tool in _INVESTIGATE_TOOLS:
+        return "investigate"
+    if tool in _MUTATE_TOOLS:
+        return "mutate"
     if tool == "bash":
-        return bash_command_class(args.get("command", "")) in STATE_CHANGING_BASH
-    return False
+        bc = bash_command_class(args.get("command", ""))
+        if bc in _VERIFY_BASH: return "verify"
+        if bc in _MUTATE_BASH: return "mutate"
+        return "investigate"
+    return "other"
+
+
+# State-changing = an action that successfully changed durable state.
+# Re-expressed in terms of intent: every "mutate" with no error.
+def is_state_changing(tool: str, args: dict, is_error: bool) -> bool:
+    if is_error:
+        return False
+    return action_intent_of(tool, args) == "mutate"
+
+
+# ── Feature classification ──────────────────────────────────────────────────
+#
+# CORE_FEATURES are domain-agnostic — they exist in every domain CAT runs in
+# (code, API calls, browser, etc.). These should be the predicates the
+# CEGAR tree prefers to split on, because they generalize.
+#
+# DOMAIN_FEATURES are code-Python-specific. The tree may still split on them
+# when they're more predictive, but the reporter flags such splits so we
+# know which predicates carry domain assumptions.
+
+CORE_FEATURES = {
+    "obligation_hash",          # always-on base key (every domain)
+    "plan_idx",                  # always-on base key (every domain)
+    "last_outcome",              # ok / error — every domain has outcomes
+    "last_action_intent",        # last call's intent class
+    "durable_change_count",      # how many mutations so far (replaces workdir_version)
+    "iter_since_durable_change", # drift indicator (the f59669ec marker)
+    "verify_attempt_count",      # how many verify-intent calls
+    "investigate_attempt_count", # how many investigate-intent calls
+    "mutate_attempt_count",      # how many mutate-intent calls
+    "n_unique_actions",          # diversity of approaches tried
+    "n_unique_errors",           # diversity of errors seen
+}
+
+# All other keys in raw_features (e.g. last_bash_class, env_facts,
+# attempted_bash_classes) are domain-specific.
+
+
+def is_core_feature(feature_name: str) -> bool:
+    return feature_name in CORE_FEATURES
 
 
 def canonical_action_args(tool: str, args: dict) -> dict:
@@ -178,32 +242,51 @@ def ingest_trace(jsonl_path: Path, reached_goal: bool) -> list[Sample]:
 
     samples: list[Sample] = []
 
-    # Progressive state vars (raw features that evolve during the trajectory)
-    workdir_version = 0
-    plan_step_idx = 0
-    env_facts: set = set()
+    # ── Progressive state vars (1.7.0.x two-tier refactor) ─────────────────
+    # CORE (domain-agnostic) counters
+    plan_step_idx               = 0
     last_outcome: Optional[str] = None
-    last_tool: Optional[str] = None
+    last_action_intent: Optional[str] = None
+    durable_change_count        = 0     # was workdir_version
+    iter_since_durable_change   = 0     # drift indicator
+    verify_attempt_count        = 0
+    investigate_attempt_count   = 0
+    mutate_attempt_count        = 0
+    attempted_actions: set      = set()
+    seen_errors: set            = set()
+    # DOMAIN-SPECIFIC (code-Python) counters
+    env_facts: set              = set()
+    last_tool: Optional[str]    = None
     last_bash_class: Optional[str] = None
-    attempted_actions: set = set()
     attempted_bash_classes: set = set()
 
     # Buffer for the current iter
     current = None
 
     def snapshot_raw():
+        # Two-tier shape: core keys (always populated) + domain-specific keys
+        # (sparse, code-Python today). The CEGAR tree sees them all as a flat
+        # dict; the reporter distinguishes them via is_core_feature.
         return {
-            "obligation_hash":       obligation_hash,
-            "plan_idx":              plan_step_idx,
-            "workdir_version":       workdir_version,
-            "env_facts":             sorted(env_facts),
-            "last_outcome":          last_outcome,
-            "last_tool":             last_tool,
-            "last_bash_class":       last_bash_class,
-            "n_attempted_actions":   len(attempted_actions),
-            "n_attempted_bash":      len(attempted_bash_classes),
-            "attempted_actions":     sorted(attempted_actions),
-            "attempted_bash_classes": sorted(attempted_bash_classes),
+            # ── CORE (domain-agnostic) ──
+            "obligation_hash":            obligation_hash,
+            "plan_idx":                   plan_step_idx,
+            "last_outcome":               last_outcome,
+            "last_action_intent":         last_action_intent,
+            "durable_change_count":       durable_change_count,
+            "iter_since_durable_change":  iter_since_durable_change,
+            "verify_attempt_count":       verify_attempt_count,
+            "investigate_attempt_count":  investigate_attempt_count,
+            "mutate_attempt_count":       mutate_attempt_count,
+            "n_unique_actions":           len(attempted_actions),
+            "n_unique_errors":            len(seen_errors),
+            # Set-membership (core) — useful for "have you tried X yet?" predicates
+            "attempted_actions":          sorted(attempted_actions),
+            # ── DOMAIN-SPECIFIC (code-Python) ──
+            "env_facts":                  sorted(env_facts),
+            "last_tool":                  last_tool,
+            "last_bash_class":            last_bash_class,
+            "attempted_bash_classes":     sorted(attempted_bash_classes),
         }
 
     for ev in events:
@@ -242,18 +325,34 @@ def ingest_trace(jsonl_path: Path, reached_goal: bool) -> list[Sample]:
             if current["tool"]:
                 t = current["tool"]
                 a = current["args"] or {}
+                intent = action_intent_of(t, a)
+                current["intent"] = intent
+                # Core (agnostic) counters
                 attempted_actions.add(action_class(t, a))
+                if intent == "verify":      verify_attempt_count += 1
+                elif intent == "investigate": investigate_attempt_count += 1
+                elif intent == "mutate":      mutate_attempt_count += 1
+                # Domain-specific counters
                 if t == "bash":
                     bcls = bash_command_class(a.get("command", ""))
                     attempted_bash_classes.add(bcls)
                     last_bash_class = bcls
                 last_tool = t
+                last_action_intent = intent
                 if is_state_changing(t, a, err):
                     current["durable"] = True
-                    workdir_version += 1
+                    durable_change_count += 1
+                    iter_since_durable_change = 0   # reset on durable change
                     cmd = (a.get("command") or "").lower()
                     if "pip install pytest" in cmd:
                         env_facts.add("pytest_installed")
+                else:
+                    iter_since_durable_change += 1
+                if err:
+                    # Track error variety (domain-agnostic; the actual error text
+                    # is too noisy, so we key by tool+intent — "what KIND of
+                    # thing erred")
+                    seen_errors.add((t, intent))
                 last_outcome = "error" if err else "ok"
 
         elif k == "criterion_check" and current is not None:
@@ -728,15 +827,19 @@ def ingest_run_dir(run_dir: Path) -> list[Sample]:
 
 
 def report_tree_structure(tree: PredicateTree) -> str:
-    """Show the learned predicate tree."""
+    """Show the learned predicate tree, flagging core vs domain-specific splits."""
     lines = ["# Learned predicate tree"]
-    lines.append(f"  {tree.n_leaves()} leaves, {len(tree.splits)} split nodes")
+    n_core = sum(1 for f, _, _ in tree.splits.values() if is_core_feature(f))
+    n_domain = len(tree.splits) - n_core
+    lines.append(f"  {tree.n_leaves()} leaves, {len(tree.splits)} splits "
+                 f"({n_core} core / {n_domain} domain-specific)")
     if not tree.splits:
         lines.append("  (no splits — only base-key leaves)")
         return "\n".join(lines)
     for split_node, (feature, threshold, desc) in sorted(tree.splits.items()):
         left, right = tree.children[split_node]
-        lines.append(f"  node {split_node}: split on '{desc}' → leaves {left} (true) / {right} (false)")
+        tag = "CORE  " if is_core_feature(feature) else "DOMAIN"
+        lines.append(f"  [{tag}] node {split_node}: split on '{desc}' → leaves {left}/{right}")
     return "\n".join(lines)
 
 

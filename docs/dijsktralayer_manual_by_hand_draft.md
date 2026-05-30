@@ -863,6 +863,131 @@ the cross-domain door before we close it.
 
 ---
 
+## 12. POC iteration v2.1 — two-tier feature refactor (2026-05-30)
+
+Refactor of the feature pipeline to separate **domain-agnostic core
+features** from **domain-specific extensions**. Foundation for cross-domain
+working memory (v2.x roadmap). Full v2.1 output in
+`docs/v2_1_simulation_output.txt`.
+
+### What changed
+
+1. **Added `action_intent_of(tool, args)`** — classifies every tool call as
+   `investigate` | `mutate` | `verify` | `other`. Domain-agnostic; lives at
+   capability-registration time.
+
+2. **New core (agnostic) counters in `raw_features`:**
+   - `durable_change_count` (replaces `workdir_version`)
+   - `iter_since_durable_change` — drift indicator
+   - `verify_attempt_count`, `investigate_attempt_count`, `mutate_attempt_count`
+   - `last_action_intent` — last call's classification
+   - `n_unique_errors` — error variety
+
+3. **`CORE_FEATURES` set** declares which keys are agnostic. Tree treats
+   all features identically when choosing splits; reporter flags whether
+   each chosen predicate is `[CORE]` or `[DOMAIN]`.
+
+4. **Domain-specific features retained but tagged:**
+   - `last_tool`, `last_bash_class`, `env_facts`, `attempted_bash_classes`
+   - These remain available; the tree picks them only when they out-perform
+     core features in variance reduction.
+
+### Headline result: 73% of learned splits are now domain-agnostic
+
+```
+Pre-refactor (v2):  30 splits, ~5 of top 10 were domain-bleed
+Post-refactor:      30 splits, 22 CORE / 8 DOMAIN (73% generalizable)
+```
+
+The data *prefers* the cleaner abstractions when they exist. The tree only
+falls back to domain-specific features (e.g., `last_bash_class == 'grep'`)
+when no core feature is more predictive at that point.
+
+### Top 10 splits, in order picked
+
+```
+iter  0: [CORE  ] durable_change_count > 0           ← replaces workdir_version
+iter  1: [CORE  ] last_outcome == 'ok'
+iter  2: [CORE  ] verify_attempt_count > 2           ← replaces "pytest action attempted"
+iter  3: [DOMAIN] last_tool == 'read'
+iter  4: [DOMAIN] 'bash-other action' in attempted_actions
+iter  5: [CORE  ] investigate_attempt_count > 1
+iter  6: [DOMAIN] last_tool == 'rg'
+iter  7: [DOMAIN] last_bash_class == 'grep'
+iter  8: [CORE  ] iter_since_durable_change > 14     ← the f59669ec drift pattern
+iter  9: [CORE  ] iter_since_durable_change > 16
+```
+
+### Critical generalizations the refactor unlocks
+
+| Pre-refactor predicate | Post-refactor predicate | What this means cross-domain |
+|---|---|---|
+| `workdir_version > 0` | `durable_change_count > 0` | tau-bench: "have you updated the DB?" / WebArena: "have you clicked submit?" |
+| `'pytest action_class' in attempted_actions` | `verify_attempt_count > 2` | tau-bench: "have you confirmed the user 2× already?" |
+| `n_attempted_actions > 18` | `iter_since_durable_change > 25` | "you've been drifting since the last real change" — fires identically across domains |
+| (no equivalent) | `last_action_intent == 'mutate'` | "you just made a change" — primes next-action reasoning anywhere |
+
+The most striking validation: **`iter_since_durable_change > N` is picked at
+multiple thresholds (8, 11, 14, 16, 25, 27, 33, 34)** — the corpus has
+encoded a multi-level "you're drifting" signal directly from the data.
+This is the f59669ec self-loop pattern from §11, but expressed as a
+predicate that would fire in any domain where state changes are sparse
+relative to attempts.
+
+### The remaining domain-specific splits (8 total) are not wasted
+
+They appear later in the tree (depths 2-4) and capture genuinely code-
+specific structure:
+- `last_tool == 'read'` vs `last_tool == 'rg'` — distinct investigation
+  modes within code domain
+- `'<action_hash>' in attempted_actions` — recurring specific actions
+  (like the dominant `bash(pytest)` action_class)
+- `last_bash_class == 'grep'` — within-bash refinement
+
+These are useful predicates the tree should learn — but they're isolated
+in `domain_features` so a future tau-bench port wouldn't carry them
+mistakenly.
+
+### What's been proven by v2.1
+
+1. **Two-tier feature design works.** The CEGAR loop picks core
+   features 73% of the time because they're more general (more samples
+   share core values) AND comparably predictive.
+
+2. **`iter_since_durable_change` is the most important domain-agnostic
+   signal discovered.** Picked at 8 different thresholds across the
+   tree. Maps the agent's "drift after edit" pattern.
+
+3. **`action_intent` classification works.** `verify_attempt_count > 2`
+   replaces the pytest-specific predicate; same predictive power,
+   generalizes to API verification, DOM checks, etc.
+
+4. **No regression in solve quality.** Variance reduction per split
+   matches v2 (the math is identical; only feature naming and structure
+   changed).
+
+### What v2.1 doesn't change
+
+- The math (Dijkstra, value-bisimulation, CEGAR loop)
+- The graph structure
+- d* values (same numerical results — same trajectories, same costs)
+- The recommendation behavior (would pick same actions for same states)
+
+### Next iteration choices (after v2.1)
+
+| v | What | Why |
+|---|---|---|
+| v3 | Belief_split trigger (self-loop ratio) | Catch POMDP-stuck patterns like f59669ec at runtime |
+| v4 | DEFER logic + Beta(α,β) confidence floor | Don't recommend from n=1 leaves |
+| v5 | LIBRARIAN: sentence-transformers obligation embedding | Cross-task transfer when obligation_hash differs |
+| Phase A | Wire CEGAR + advisor into activator runtime | Real impact on live runs |
+
+The 1.7.0.x two-tier refactor is the last preparatory step. **Phase A is
+the next major build** — taking the offline POC and threading it through
+the live agent loop.
+
+---
+
 ## Sources
 
 - Trace file: `data/runs/swebench/2026-05-28/16-28-49-swe10-v1.7-tools/django__django-12039/django__django-12039.1-of-1.swe10-v1.7-tools/agent-logs/cat-tb-8d35f3fb.jsonl`
