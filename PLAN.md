@@ -1,1652 +1,463 @@
-# Project Plan: CAT v1.0 – v2.0
+# Project Plan: CAT
 
-Status as of 2026-05-26 (updated). See DESIGN.md for theory and architecture.
+Contract Activation Theory — a contract-disciplined agent that runs on SWE-bench
+(and eventually other benchmarks). See **DESIGN.md** for theory and architecture.
 
-## Completed
-
-### v1.0 — Synthetic proof of mechanism (DONE, 2026-05-14)
-
-- Core runtime: Contract, Criterion, Activator, Capability, State, Recorder.
-- CatAgent (contract-disciplined) + ReactAgent (vanilla ReAct) sharing same
-  LLM + tool stack.
-- 2 synthetic tasks (hello-file 1-step, multi-step-refactor 5-step), 12 trials.
-- Result: CAT 6x fewer tool calls, 10x fewer tokens on 5-step task.
-- Criterion: deterministic Python predicate (file existence + content match).
-
-### v1.1 — terminal-bench, real Docker tasks (DONE, 2026-05-20)
-
-- Tasks: `hello-world`, `fix-pandas-version`, `csv-to-parquet` (Docker
-  containers via `ssh://cpubox`).
-- Result: **ReAct 88.9% vs CAT 55.6%.** CAT costs 4x more ($0.012 vs
-  $0.003/trial).
-- Root causes:
-  1. LLM judge called 3x per tool call (pre-activation + post-activation +
-     checklist) → 4 LLM calls per tool call vs ReAct's 1.
-  2. LLM judge fires on partial progress → premature contract closure.
-- Criterion: LLM judge on terminal pane output — wrong choice.
-- Lesson: deterministic criterion is mandatory for fair cost comparison.
-
-### v1.2 — Expand synthetic coverage + LIFE-Harness layers (DONE, 2026-05-26)
-
-- 3 new synthetic tasks: bug-fix (~8 steps), multi-file-rename (~10 steps),
-  test-generation (~12 steps).
-- Composable oracle predicates: file_exists, file_contains, file_not_contains,
-  bash_succeeds, ast_has_function, all_of, any_of, oracle_from_predicates.
-- LIFE-Harness layers absorbed (arxiv 2605.22166):
-  - Action Realizer (activator.py): normalize args before invoke.
-  - Environment Spec (capabilities.py): preconditions on tools.
-  - Circuit Breaker (activator.py): trajectory regulation with replan.
-  - Failure Attribution (trace.py): layer-attributed failure events.
-- Result: CAT 3.5x cheaper on hardest task (test-generation), lower variance.
-  All tasks 100% solve rate for both agents.
-
-### v1.3 — terminal-bench deterministic criterion rerun (DONE, 2026-05-26)
-
-Goal: Rerun v1.1's real Docker tasks with the deterministic test-runner
-criterion.
-
-**Changes:**
-- `activator.py`: removed pre-activation `_verify_criteria` call → judge
-  called once per tool call, not twice.
-- `tb_agents.py`: `_make_test_runner_criterion(session, test_cmd)` — runs
-  `<test_cmd>; echo EXIT:$?`, parses exit code. Zero false-positive rate.
-
-**Results:**
-- cat-p4 (3 tasks, 3 attempts): **CAT 100%** — regression fully recovered.
-- cat-p6 vs react-p6 (5 tasks, 2 attempts): **CAT 90% = ReAct 90%** — parity.
-- cat-v13b vs react-v13 (3 tasks, 3 attempts, fresh): **CAT 88.9% = ReAct 88.9%** — exact parity. Pass@2 = 100%.
-- Root cause confirmed: deterministic criterion fixes premature closure.
-
-**Lesson:** LLM judge is only safe called once at task end, not per tool call.
+This document is the source of truth for *what's been done* and *what comes next*.
+Detailed per-iteration decisions live in git commit messages and in
+`docs/<version>_PRD_*.md`; the version sections below summarize without
+duplicating that history.
 
 ---
 
-### v1.4 — SWE-bench verified (DONE, 2026-05-26)
+## Status board
 
-Goal: Validate CAT on real GitHub issues with deterministic pytest criterion.
-
-**Oracle:** `benchmarks/swe_bench.py:TbSweAgent` — applies SWE-bench's own
-`test_patch` + runs `FAIL_TO_PASS` tests via exit code. Proxy oracles for
-tasks whose tests require live network (httpbin etc.).
-
-**Results — swe30 full head-to-head (30 tasks, 1 attempt each):**
-
-| Metric | CAT | ReAct |
-|---|---|---|
-| Solve rate | **9/30 = 30%** | **15/30 = 50%** |
-| Input tokens total | 1,602K | 5,025K |
-| Token cost ratio | 1× | **3.1× more expensive** |
-| Tokens per solved task | 178K | 335K |
-
-**Note:** swe30-cat used pre-v1.2 code (2026-05-16). ReAct is current code.
-CAT v1.2 improvements (F2 replan on deadlock, P2 criterion interval) should
-close some of the solve-rate gap in a rerun.
-
-**Win/loss breakdown:**
-- CAT only (3 tasks): django-12708, pytest-10081, pytest-6202
-- ReAct only (9 tasks): django-11239, django-12039, django-13315, django-14787,
-  matplotlib-24149, matplotlib-24970, requests-1142, sphinx-10323, sympy-15349
-- Both solve (6): django-10880, django-14434, django-16333, xarray-4966,
-  scikit-learn-14141, sympy-15875
-- Neither (12)
-
-**Root cause of CAT failures (ReAct-only wins):**
-- Partial fixes: CAT plan step judged "complete" before all test vars applied
-  (django-11239 example: fixed 2/4 SSL env vars). F2 replan should fix these.
-- Exploratory tasks: ReAct's free-form exploration finds the right code path;
-  CAT's pre-planned steps miss it (especially in large Django/sympy codebases).
-- Token savings per solved task: CAT 178K vs ReAct 335K (CAT still 1.9× cheaper
-  per solution even at lower solve rate).
-
-**Earlier swe10 head-to-head (10 tasks, 1 attempt):**
-- CAT (TbSweAgent): 3/10 = 30% — 199K input tokens total
-- ReAct: 3/10 = 30% — 1,006K input tokens total
-- CAT uses 5× fewer input tokens at equal solve rate
-
-**Critical bugs fixed (2026-05-26):**
-1. `TbSweAgent._resolve_test_cmd()`: only 4/30 tasks had deterministic oracle;
-   26/30 used LLM judge → root cause of 30% solve rate.
-   Fix: dynamic oracle from config.json for any task in the dataset cache.
-2. REPRESENT step: missing `file_types` and `notes` probes → planner blind to
-   archive types and task-specific hints (root cause of crack-7z, extract-safely).
-3. Planner had no context of what the test failure looked like before planning.
-   Fix: `TbSweAgent._initial_representations()` runs oracle once pre-REPRESENT,
-   injects failure output so planner generates targeted steps (e.g. exact env vars
-   missing, not just "fix SSL handling").
-
-**Additional fixes (post v1.4, 2026-05-26):**
-4. Improved planner prompt: require specific function names/file paths and oracle
-   verification step as the plan's last step.
-5. F2 replan now probes `git diff HEAD` — shows partial changes to the new planner
-   so it can correct or build on prior edits rather than replanning from scratch.
-
-**Re-run results (2026-05-26, DONE):**
-
-| Run | Code | Solve rate | Notes |
+| Version | Domain | State | Headline |
 |---|---|---|---|
-| swe10-react | vanilla ReAct | **3/10 = 30%** | baseline |
-| swe10-cat-v12 | old code, old oracle bug | **1/10 = 10%** | confirms oracle was critical |
-| swe10-cat-v13 | oracle fix + init failure (empty output bug) | **3/10 = 30%** | matches react, solves different tasks |
-| **swe10-cat-v14** | **ALL fixes** | **5/10 = 50%** | **+67% over react!** |
-
-**v14 win/loss breakdown (vs swe10-react):**
-- v14-only wins: scikit-learn-14141, sphinx-10323 (react failed both)
-- Both solve: pytest-6202, matplotlib-26342, sympy-15875
-- Neither: requests-2931, astropy-8872, django-12039, sympy-12489, xarray-4966 (parse_error)
-
-**Token efficiency:**
-- React: 140,381 tokens/solved task
-- CAT v14: 100,089 tokens/solved task (28% cheaper per solution)
-
-**Conclusion:** All 5 improvements combined pushed CAT from 30% (react parity) to 50%
-(+20pp over react). The oracle fix alone wasn't enough (v13 = 30% = react). The test
-output capture fix for the planner was the tipping point (scikit-learn: 29K tokens
-PASS in v14 vs 206K tokens FAIL in v13).
+| v1.0 | synthetic | ✅ DONE 2026-05-14 | mechanism proven: 6× fewer tool calls, 10× fewer tokens on 5-step |
+| v1.1 | terminal-bench (LLM judge) | ✅ DONE 2026-05-20 | judge-per-tool-call was wrong; led to v1.3 fix |
+| v1.2 | synthetic coverage + LIFE absorption | ✅ DONE 2026-05-26 | 100% solve on all tasks; LIFE layers absorbed |
+| v1.3 | terminal-bench (deterministic) | ✅ DONE 2026-05-26 | parity with ReAct after judge-once-per-task fix |
+| v1.4 | SWE-bench verified | ✅ DONE 2026-05-27 | swe30 v14 = 13/30 = 43.3% @ 3.8× cheaper than ReAct |
+| v1.5 | LIFE strip + admission gate | ✅ DONE 2026-05-27 | theory ↔ code aligned; 4 LIFE absorptions removed |
+| v1.6 | DAG-first observability + terminology | ✅ DONE 2026-05-28 | parent_id discipline, RunDAG, HTML reports, terminology rename |
+| v1.6.5 | diagnostic taxonomy + HTML report | ✅ DONE 2026-05-28 | LLM-attribution with limitation_kind / improvement_vector |
+| v1.6.6 | tool reliability | ✅ DONE 2026-05-28 | swe10 60% → 90% (docker exec + oracle alignment) |
+| v1.6.6.7–14 | tool surface expansion + tightening | ✅ DONE 2026-05-29 | 14 capabilities, −55% tool calls, read truncation nudge |
+| v1.7.0 | offline simulation (CEGAR + Dijkstra) | ✅ DONE 2026-05-30 | math validated: 22/30 splits domain-agnostic, d* meaningful |
+| v1.7 Phase A.1 | corpus + LIBRARIAN (advisory) | ✅ DONE 2026-05-30 | SQLite corpus, runtime hint injection, smoke 2/3 PASS @ −18 to −25% tokens |
+| **v1.7 Phase A.2** | **ADVISOR + ELECTION (arbitration)** | **🎯 NEXT** | **math arbitrates between N=2 LLM candidates** |
+| v1.7 Phase B | SUSPENDED resume (DAG-grounded) | queued | after A.2 |
+| v1.7 Phase C | A* heuristic h(v) from corpus | queued | after A.2 |
+| v1.4 tau-bench | cross-domain validation | future | post-v1.7 |
+| v1.8 hardening | head-to-head vs Hermes/Claude Code | future | gate before v2.0 |
+| v2.x | learning system, cross-domain, cost-eff layer | future | open design questions section below |
 
 ---
 
-### swe30-cat-v14 — definitive 30-task rerun with all fixes (DONE, 2026-05-27)
+## Next: v1.7 Phase A.2 — ADVISOR + ELECTION
 
-**Results — swe30-cat-v14 vs react baseline (30 tasks, 1 attempt each):**
+**Goal:** make the math actually control behavior. Today (A.1) the LIBRARIAN
+returns a Dijkstra recommendation as a text hint; the LLM may or may not heed
+it. A.2 introduces multi-candidate generation + math-arbitrated selection.
+
+**Concrete change:**
+
+1. **Performer prompt update** — ask LLM to emit **N=2** candidate tool calls
+   per turn (or split into two turns: emit one, get hint, emit alternative).
+2. **`Librarian.score_candidates(candidates, raw_features) → ScoredList`** —
+   for each candidate action, compute `score = expected_cost + d*(next_state | s, a)`.
+   Unknown (s, a) pairs fall back to a global prior with a `defer=True` flag.
+3. **ELECTION step in `Activator._perform_once`** — execute the lowest-scored
+   candidate. If all candidates DEFER (no corpus signal), execute the first
+   one (LLM's preferred choice — preserves backward-compat behavior on cold
+   states).
+4. **`election` trace event** — records winner + losers + scores so we can
+   audit "would have picked X, elected Y" cases.
+5. **Test** — synthetic case where the corpus has a clearly cheaper path;
+   verify ELECTION picks it over the LLM's default.
+
+**Validation:** rerun the 3-task smoke with A.2 enabled. Compare:
+- Same 2/3 PASS rate (no regression)
+- Tool counts and per-task tokens vs A.1 advisory
+- Trace `election` events: how often does math override the LLM, and on
+  what kinds of actions?
+
+**Estimated work:** ~150 lines across `activator.py` + `librarian.py` + a
+small `PERFORMER_SYSTEM_PROMPT` change. ~1 hour focused.
+
+**Out of scope (next next):** Beta(α,β) confidence floor, UCB exploration
+bonus, belief_split trigger for self-loops, LIBRARIAN with sentence-
+transformers for cross-task obligation similarity.
+
+---
+
+## Done — version-by-version history
+
+The detail below is reference: what was decided, what shipped, what numbers
+came out. Use git commits + `docs/<version>_PRD_*.md` files for finer detail.
+
+### v1.0 — Synthetic proof of mechanism (DONE 2026-05-14)
+
+- Core runtime: Contract, Criterion, Activator, Capability, State, Recorder
+- CatAgent (contract-disciplined) + ReactAgent (vanilla) sharing same LLM + tool stack
+- 2 synthetic tasks (hello-file 1-step, multi-step-refactor 5-step), 12 trials
+- **Result:** CAT 6× fewer tool calls, 10× fewer tokens on 5-step task
+- Criterion: deterministic Python predicate (file existence + content match)
+
+### v1.1 — terminal-bench, real Docker tasks (DONE 2026-05-20)
+
+- Tasks: hello-world, fix-pandas-version, csv-to-parquet (Docker via ssh://cpubox)
+- **Result:** ReAct 88.9% vs CAT 55.6%. CAT costs 4× more ($0.012 vs $0.003)
+- Root causes:
+  1. LLM judge called 3× per tool call → 4 LLM calls per tool call (vs ReAct's 1)
+  2. LLM judge fires on partial progress → premature closure
+- **Lesson:** deterministic criterion is mandatory; LLM judge is per-task-end only
+
+### v1.2 — Synthetic coverage + LIFE-Harness layers (DONE 2026-05-26)
+
+- 3 new synthetic tasks (bug-fix ~8-step, multi-file-rename ~10-step, test-generation ~12-step)
+- Composable oracle predicates: file_exists, file_contains, bash_succeeds, ast_has_function, all_of, any_of
+- LIFE-Harness layers absorbed (arxiv 2605.22166): Action Realizer, Environment Spec, Circuit Breaker, Failure Attribution
+- **Result:** CAT 3.5× cheaper on hardest task; 100% solve rate for both agents
+- **Later observation (driving v1.5):** the LIFE absorptions were 4 out of 5 load-bearing CAT mechanisms — theory ↔ code mismatch
+
+### v1.3 — terminal-bench deterministic criterion rerun (DONE 2026-05-26)
+
+- Removed pre-activation `_verify_criteria` (judge called once per tool call, not twice)
+- Added `_make_test_runner_criterion(session, test_cmd)` — runs `<test_cmd>; echo EXIT:$?`, parses exit code
+- **Result:** CAT 88.9% = ReAct 88.9% — exact parity. Pass@2 = 100%
+- **Lesson:** LLM judge is safe ONLY at task end, never per tool call
+
+### v1.4 — SWE-bench verified (DONE 2026-05-27)
+
+Goal: validate CAT on real GitHub issues with deterministic pytest criterion.
+
+**Critical fixes shipped (2026-05-26):**
+1. `TbSweAgent._resolve_test_cmd()`: was using LLM judge for 26/30 tasks (oracle missing) → dynamic oracle from config.json
+2. REPRESENT step: missing file_types and notes probes (planner blind to archive types)
+3. Planner now sees pre-plan oracle failure output via `_initial_representations()` — generates targeted steps
+
+**Results — swe30 v14 vs baselines (30 tasks, 1 attempt):**
 
 | Metric | CAT v14 | CAT v0 | ReAct |
 |---|---|---|---|
 | Solve rate | **13/30 = 43.3%** | 9/30 = 30% | 15/30 = 50% |
 | Tokens per solved task | **92K** | 178K | 354K |
-| Token efficiency vs React | **3.8× cheaper** | 2.0× cheaper | baseline |
-
-**Win/loss breakdown (CAT v14 vs React):**
-- CAT v14 only (4 tasks react fails): matplotlib-26342, scikit-learn-26194, pytest-10081, pytest-6202
-- Shared wins (9 tasks): django-10880, django-14787, django-16333, matplotlib-24149, matplotlib-24970, requests-1142, xarray-4966, scikit-learn-14141, sphinx-10323
-- React only (6 tasks): django-11239, django-12039, django-13315, django-14434, sympy-15349, sympy-15875
-- ERR? (parse error): sympy-17318
-
-**New wins vs CAT v0 (7 tasks):** django-14787, matplotlib-24149, matplotlib-24970, matplotlib-26342, requests-1142, scikit-learn-26194, sphinx-10323
-
-**Regressions vs CAT v0 (3 tasks):**
-- django-14434 (v0=PASS): tool timeouts in Docker container — infrastructure issue
-- django-12708 (v0=PASS): deterministic oracle, agent stuck in different approach
-- sympy-15875 (v0=PASS): LLM judge task, new planner generated harder plan
-
-**Conclusion:** v14 fixes push solve rate from 30% → 43.3% (+44% relative), with 3.8× token efficiency advantage over React. CAT uniquely solves 4 tasks that React cannot. Gap to React narrowed from 20pp (v0) to 6.7pp (v14). Main weakness: LLM judge tasks where planner over-specifies and gets stuck.
-
-### v1.4b — terminal-bench-core full benchmark (2026-05-15, needs rerun)
-
-80-task diverse benchmark (terminal-bench-core v0.1.1), 2 attempts each.
-Run with **pre-v1.2 code** — results will improve with current codebase.
-
-**Results (old code):**
-- cat-official (TbCatAgent, window_size=4): **34/160 = 21%**
-- react-official (TbReactAgent): **54/160 = 34%**
-- Gap: ReAct +13pp. 5 tasks where ReAct 2/2 but CAT 0/2.
-
-**cat-targeted-v2 (DONE, 2026-05-26):** Re-running those 5 tasks with v1.2 code.
-
-**Results:**
-- configure-git-webserver: 0/2 FAIL (timed out — multi-service setup still too hard)
-- crack-7z-hash.hard: 0/2 FAIL (timed out — password-cracking needs REPRESENT improvement)
-- extract-safely: 0/2 FAIL (agent doesn't write /app/solution.txt)
-- fix-pandas-version: 1/2 PASS → Pass@2=100% ✓ (v1.2 fixed this one)
-- git-workflow-hack: 0/2 FAIL (timed out)
-- **Overall: 1/5 improved by v1.2 code**
-
-**Root cause analysis:**
-- fix-pandas-version: F2/F3 replan improvements let agent find the right fix path.
-- crack-7z-hash.hard: REPRESENT step too generic — doesn't probe archive type or detect
-  password protection before planning. New probes (file_types, notes) added in v1.3a
-  representer.py should improve future runs.
-- extract-safely: agent doesn't know output must go to /app/solution.txt — needs
-  better task-specific REPRESENT or more literal instruction parsing.
-- configure-git-webserver, git-workflow-hack: long multi-step tasks; timeout is
-  the binding constraint (360s for complex Docker setup tasks).
-
-## v1.5 — Delete LIFE, realign to admission-gate theory (NEXT, HARD GATE before v1.6+)
-
-Goal: Strip all LIFE-Harness machinery, rename Step 6 ACTIVATE → INVOKE, build
-the real activation layer as a one-shot admission gate (daemon model), restate
-the theory's premise honestly, and verify the refactored system runs
-end-to-end against a previously-failed SWE-bench task.
-
-**Why now:** v1.2 absorbed LIFE as a patch on the contract theory. On
-inspection, four of the load-bearing mechanisms in DESIGN.md are LIFE imports
-(Action Realizer, Environment Spec preconditions, Circuit Breaker
-F2/F3/F4, Failure Attribution taxonomy), and the layer the theory is *named*
-after (activation) is rhetorical — Step 6 is structurally identical to
-ReAct's act phase. Before any new benchmark work, the theory and the code
-must match.
-
-### Subtasks
-
-#### 1.5.1 — Revise DESIGN.md to admission-gate theory  ✅
-- Replace "execution is the exception" slogan with the falsifiable claim:
-  **contract discipline trades exploration for bounded resource use.**
-- Rename Step 6 ACTIVATE → INVOKE.
-- Introduce Step 4 ACTIVATE as the one-shot admission gate (boundary,
-  environment, capacity checks → capability grant).
-- Document admission-failure responses: FAIL, SUSPEND-with-watcher,
-  ESCALATE, ASK_USER — declared as `ContractPolicy` per contract.
-- Drop LIFE-Harness Layer section (Step 6), drop Failure Attribution
-  Taxonomy section, drop F2/F3/F4 escape-hatch section.
-- Add testable-claims section at the end.
-
-#### 1.5.2 — Add numbered v1.5 subtasks to PLAN.md  ✅
-- Replace the v1.5 stub with this numbered list. Inline decision notes
-  documented after each task as `Decision: X because Y`.
-
-#### 1.5.3 — Remove Action Realizer
-- Delete `activator._realize_action` and its call site in `_invoke_once`.
-- Remove `_MARKDOWN_FENCE_RE`.
-- If the LLM mis-formats args (e.g. leading `./`), it gets a tool error in
-  the next turn — same as any other failure.
-
-#### 1.5.4 — Remove tool preconditions (Environment Spec)
-- Delete `preconditions: list[Precondition]` field on `Capability`.
-- Delete `_pre_read_file_exists` and `_pre_bash_non_empty`.
-- Delete precondition loop in `CapabilityRegistry.invoke`.
-- Tools just run and report errors.
-
-#### 1.5.5 — Remove Circuit Breaker (F2/F3/F4)
-- Delete `criterion_fail_streak`, `replan_count`, `free_form`,
-  `consecutive_nonwrite`, `criterion_history`, `_recent_turns` fields.
-- Delete `_do_replan`, `_enter_free_form`, `_build_criterion_context`.
-- Replace with one rule: when the executor stops making progress (no
-  criterion satisfaction within the envelope), contract → SUSPENDED with
-  `suspend_reason="criterion_unreachable"`. Re-admission is event-driven.
-- Delete `max_criterion_fails` parameter; keep `criterion_check_interval`.
-
-#### 1.5.6 — Remove Failure Attribution taxonomy
-- Delete `_attribute_tool_failure` in activator.py.
-- Delete `FailureLayer` literal and `failure_attribution` event kind in
-  trace.py.
-- Delete precondition-failed → environment_contract record in
-  capabilities.py.
-
-#### 1.5.7 — Add escalation policy + admission outcome to Contract
-- Add `ContractPolicy` dataclass: `on_boundary_fail`, `on_environment_fail`,
-  `on_capacity_fail` enums (FAIL / SUSPEND / ESCALATE / ASK_USER).
-- Add `policy`, `grant: set[str]`, `suspend_reason`, `re_entry_condition`
-  fields on `Contract`.
-- Default policy: boundary→FAIL, environment→SUSPEND, capacity→FAIL.
-
-#### 1.5.8 — Split EVALUATE into admission gate + per-iter budget
-- New method `_admit(contract, state, run) -> Decision` that runs
-  boundary + environment + capacity checks and computes the grant.
-- Decision = pass | fail(reason, type). On fail, consult `contract.policy`
-  for response.
-- Keep budget enforcement as `_check_budget` called every iteration.
-- ACTIVATE step runs `_admit` exactly once after DECOMPOSE; the per-iter
-  loop only sees `_check_budget`.
-
-#### 1.5.9 — Rename ACTIVATE → INVOKE
-- Rename `_activate_once` → `_invoke_once`.
-- Rename `capability_activate` event kind → `capability_invoke`.
-- Update docstrings throughout activator.py.
-- ACTIVATE is now the admission gate (Step 4); INVOKE is per-iteration
-  discharge (Step 6).
-
-#### 1.5.10 — Update unit tests for new design
-- Delete tests dependent on F2/F3: `test_replan_receives_criterion_context`,
-  `test_free_form_prompt_includes_criterion_context`,
-  `test_build_criterion_context_deduplicates`,
-  `test_build_criterion_context_empty_when_no_history`,
-  `test_criterion_history_populated_on_fail`.
-- Add tests: admission gate boundary fail → FAILED, environment fail →
-  SUSPENDED with reason, capacity fail → FAILED.
-
-#### 1.5.11 — Run unit test suite, fix regressions
-- `pytest tests/ -q` must pass on the stripped + refactored code.
-
-#### 1.5.12 — Run a v14-failure SWE-bench task end-to-end
-- Pick a task v14 failed (e.g. `django__django-12039` or `sympy__sympy-15349`).
-- Goal: end-to-end execution without crashes; whatever the solve result
-  is, it is the honest CAT-only-without-LIFE baseline.
-
-**Expected impact on swe30 numbers (re-run scheduled post-1.5.12):**
-- Solve rate likely drops (F2 replan was the recovery path for partial fixes).
-- The drop is the diagnostic — it tells us what native mechanism must grow
-  next to replace what LIFE was doing (likely the SUSPENDED-with-watcher
-  loop in v1.6).
-
-**What stays (CAT-native, do NOT remove):**
-- REPRESENT and its probe set (Step 2).
-- Pre-committed plan via DECOMPOSE (Step 3).
-- Admission gate (Step 4 — new, replaces Step 6's stolen name).
-- Oracle as closure gate (Step 7).
-- Contract lifecycle states (LATENT / ELIGIBLE / ACTIVE / SUSPENDED / FULFILLED / FAILED / EXPIRED).
-- Budget as hard Constraint enforced per iteration.
-
-**Gate criteria before v1.6:**
-- `git grep -i "life\|action_realization\|environment_contract\|residual_reasoning\|circuit breaker\|free_form\|criterion_fail_streak" cat/ DESIGN.md` returns nothing (or only legitimate non-LIFE matches).
-- Unit tests pass.
-- One SWE-bench task runs end-to-end with the refactored code.
-- Every remaining mechanism in DESIGN.md derivable from the contract axiom.
-
-### Decision log
-
-(Decisions made during 1.5 implementation. Format: `1.5.N — <decision>. Reason: <why>.`)
-
-- **1.5.1** — DESIGN.md restructured around three concepts: the daemon analogy
-  (contract = dormant by default), the admission gate as Step 4 ACTIVATE
-  (the layer the theory is named after), and the discharge phase (Step 5-8)
-  bounded by an explicit envelope. Reason: the previous DESIGN.md used the
-  word "activation" rhetorically — Step 6 stole the name without inheriting
-  the semantics. Pulling the gate out as a separate step makes dormancy
-  measurable and gives the SUSPENDED state a real meaning (it is what the
-  gate produces on environment fail, not a never-entered placeholder).
-
-- **1.5.5** — Removed `criterion_fail_streak`, `replan_count`, `free_form`,
-  `consecutive_nonwrite`, `criterion_history`, `_do_replan`,
-  `_enter_free_form`, `_build_criterion_context`. The single replacement is
-  `max_iterations` exhaustion → `ContractState.SUSPENDED` with reason
-  `criterion_unreachable: iteration envelope exhausted` and
-  `re_entry_condition: fresh representations or extended envelope`.
-  Reason: the entire F2/F3/F4 escape ladder was LIFE's circuit breaker.
-  Replacing it with a single contract-native transition (SUSPENDED, not
-  FAILED) preserves the recovery semantics (re-admission is possible if the
-  world changes) without the streak-counter machinery.
-
-- **1.5.6** — Kept the `_extract_turn_summary` helper and `prior_attempts`
-  log even though they were originally introduced alongside F2 replan.
-  Reason: the sliding-window compression (P1) is CAT-native — it bounds
-  executor context to `window_size * avg_turn_tokens`. The fact that F2 also
-  consumed `prior_attempts` does not make the compression itself a LIFE
-  import. P1 stays.
-
-- **1.5.7** — Default `ContractPolicy` is `boundary→FAIL,
-  environment→SUSPEND, capacity→FAIL`. Reason: boundary failures are
-  definition bugs that only re-submission helps; environment failures may
-  resolve when the world changes (so SUSPEND is correct); capacity
-  failures usually mean the envelope is wrong, and silently suspending
-  hides the cost overrun. ASK_USER is wired but routes to SUSPEND in v1
-  (no user-input capability yet).
-
-- **1.5.8** — Allowed `LATENT → SUSPENDED` transition (not previously in
-  the state machine). Reason: when the admission gate rejects with
-  `policy=SUSPEND` on environment fail, the contract has not yet been
-  ELIGIBLE — it goes straight from LATENT to SUSPENDED. The old transition
-  table only allowed `ELIGIBLE → SUSPENDED`, which assumed admission had
-  always passed. After the daemon-model refactor, admission can suspend.
-
-- **1.5.9** — Renamed event kind `capability_activate` →
-  `capability_invoke`. Added new event kind `contract_admit` (payload:
-  ok / failure_type / reason / grant). Reason: Step 4 is now the
-  activation gate; Step 6 is the invocation. The trace must distinguish
-  the two — one fires once, the other fires every iteration.
-
-- **1.5.9** — Added optional `only` parameter to
-  `CapabilityRegistry.tool_schemas(only=grant)`. Currently passed by
-  `_invoke_once` as the contract's grant set. v1 grant = full registry
-  (so the tool schema is unchanged). The plumbing is in place so v1.6 /
-  v2.0 can derive per-plan-step grants and gate the tool schema
-  accordingly — that is when dormancy will become measurable.
-
-- **1.5.10** — Replaced F2/F3/F4 unit tests with three admission-gate tests
-  (`test_admission_*`) and one envelope-exhaustion test
-  (`test_max_iterations_transitions_to_SUSPENDED`). Reason: the F-tests
-  asserted behavior that no longer exists; the admission-gate tests assert
-  the new contract-native semantics (boundary → FAILED, environment →
-  SUSPENDED by default, environment → FAILED with policy override).
-
-- **1.5.11** — All 49 unit tests pass on the refactored code (no LIFE).
-  This is the unit-level proof that the strip-and-refactor preserves
-  the CAT-native mechanisms (REPRESENT, DECOMPOSE, oracle gate,
-  contract lifecycle, budget enforcement, P1 sliding window).
-
-#### 1.5.15 — Contract owns its envelope (budget escape fix)
-
-**Why:** The swe30-v1.5-postlife run revealed that the contract is NOT in
-control of its own envelope. Multiple cost dimensions silently escape
-contract accounting, and the harness's `max_agent_timeout_sec=3000s` is the
-only thing that actually stops a stuck run. From the contract's point of
-view, the world just collapses (tool calls start returning
-`NotFound: 404`). This directly violates DESIGN.md's claim that "Budget is
-the envelope granted at admission" and that "Failure = explicit contract
-state with reason."
-
-**Audit of budget escapes:**
-
-| Cost field | Tracked at | Leaked at |
-|---|---|---|
-| `tokens_in/out` | `_invoke_once` executor ✓ | `_decompose` planner ✗, `_update_plan_checklist` judge ✗ |
-| `usd` | `_invoke_once` executor ✓ | `_decompose` planner ✗, `_update_plan_checklist` judge ✗ |
-| `tool_calls` | `_invoke_once` ✓, `representer` ✓ | `_verify_criteria` oracle bash ✗ |
-| `llm_calls` | all sites ✓ | (none) |
-| `wall_s` | (none) | **everywhere** — never accumulated |
-
-Consequences:
-- Real token usage on swe-bench tasks is roughly **2-3× the contract's
-  reported total** (planner ≈ 2K tokens, judge ≈ 200-300 tokens × N iterations
-  is significant on long runs).
-- USD reported by the contract is similarly under-counted.
-- `wall_s` is dead code: `Constraints.check()` checks it, but `cost.wall_s` is
-  never incremented, so the check never fires.
-- Hard tasks hit the harness `agent_timeout` instead of self-closing via
-  `Constraints.check()` returning a reason like "deadline passed". The
-  contract has no chance to transition to FAILED gracefully.
-
-**Engineering work:**
-
-1. **Add cost-charging helpers** (`cat/activator.py`)
-
-   ```python
-   def _charge_llm(self, contract: Contract, result: LLMResult) -> None:
-       contract.cost.tokens_in  += result.tokens_in
-       contract.cost.tokens_out += result.tokens_out
-       contract.cost.usd        += result.usd
-       contract.cost.llm_calls  += 1
-       contract.cost.wall_s     += float(result.raw.get("wall_s", 0.0))
-
-   def _charge_tool(self, contract: Contract, result: ToolResult) -> None:
-       contract.cost.tool_calls += 1
-       contract.cost.wall_s     += float(result.wall_s)
-   ```
-
-   These are the single source of truth for cost accounting.
-
-2. **Refactor every callsite to use the helpers**
-   - `_invoke_once`: replace the 4 explicit cost lines with `_charge_llm(...)`
-     after `llm.chat(...)`, and `_charge_tool(...)` after `registry.invoke(...)`.
-   - `_decompose`: replace `cost.llm_calls += 1` with `_charge_llm(...)`.
-     **Need to update `call_planner` to return the LLMResult, not just steps**
-     (currently throws away the result after parsing). Easiest: have it return
-     `(steps, LLMResult)` and update the one caller.
-   - `_update_plan_checklist`: same change for `call_judge` → return
-     `(complete, reason, LLMResult)`.
-   - `_build_oracle_criterion`: closure captures `contract`; predicate calls
-     `self._charge_tool(contract, result)` after `registry.invoke(...)`.
-   - `representer.represent()`: after each `registry.invoke(...)`, in addition
-     to `tool_calls += 1`, also do `cost.wall_s += result.wall_s`. (Cheapest fix
-     is to import Cost charging from activator — or just inline the wall_s
-     accumulator in representer.)
-
-3. **Lock deadline_ts at admission** (`cat/activator.py:_admit`)
-
-   ```python
-   # At admission, compute the absolute deadline from max_wall_s.
-   # The contract closes itself via _check_budget when now > deadline_ts.
-   if contract.constraints.deadline_ts is None:
-       contract.constraints.deadline_ts = time.time() + contract.constraints.max_wall_s
-   ```
-
-   The existing `Constraints.check()` already enforces `now_ts > deadline_ts`.
-   Per-iter `_check_budget` calls `Constraints.check()` every loop, so the
-   contract self-closes with reason `deadline passed (... > ...)`.
-
-   Rationale for deadline_ts vs cost.wall_s as the enforcement mechanism:
-   - Already-implemented check (no new control-flow logic).
-   - Robust against time-skip bugs (system clock is authoritative).
-   - Matches the daemon-grant semantics: admission grants a deadline; the
-     daemon discharges within it.
-   - `cost.wall_s` stays as the observability metric (sum of LLM + tool wall);
-     `deadline_ts` is the enforcement.
-
-4. **Adjust TbSweAgent envelope** (`cat/tb_agents.py`)
-   - Current `max_wall_s = 900.0` (15 min) — too aggressive; many real fixes
-     legitimately need >15 min.
-   - Harness cap: `max_agent_timeout_sec = 3000s` (50 min).
-   - **New value: `max_wall_s = 2700.0`** (45 min) — gives contract 45 min,
-     leaves 5-min buffer for the harness's post-test phase.
-   - The contract self-closes at 45 min → no more `agent_timeout` in v1.5.
-
-5. **Sub-budgets per role (optional)** — not done in 1.5.15, deferred to 1.6:
-   - The judge consumes a meaningful fraction of total tokens. A future
-     refinement is per-role sub-budgets (`max_judge_tokens`, `max_executor_tokens`)
-     so a chatty judge can't starve the executor. For now, single
-     `max_tokens_total` envelope, but accurately counted across all roles.
-
-6. **Tests** (`tests/test_activator.py`)
-   - `test_admission_locks_deadline`: assert `contract.constraints.deadline_ts`
-     is set after admission.
-   - `test_deadline_fires_per_iter`: set `max_wall_s=0.1`, slow tool sleeps 0.2s,
-     contract transitions to FAILED with reason containing "deadline passed"
-     within 1-2 iterations.
-   - `test_planner_tokens_charged_to_contract`: scripted planner returns
-     LLMResult(tokens_in=100, tokens_out=50), assert `contract.cost.tokens_in
-     >= 100` after run.
-   - `test_judge_tokens_charged_to_contract`: same for judge.
-   - `test_oracle_bash_charged_to_contract`: oracle criterion runs bash;
-     assert `contract.cost.tool_calls` increments.
-
-7. **Update PLAN.md decision log** with the implementation notes.
-
-**Expected impact on swe-bench runs:**
-- Tasks that previously hit the 50-min harness `agent_timeout` will instead
-  self-close at 45 min with `state_reason="budget violation: deadline passed"`.
-  The contract is once again the unit of discipline.
-- Reported token totals will jump (no longer missing planner + judge tokens).
-  Headline 3.8× efficiency vs ReAct may shrink; that is honest.
-- USD reported per task increases (was undercount). Still well below the $5
-  envelope per task.
-- Solve rate likely unchanged (the cap firing earlier doesn't change which
-  tasks succeed; it just changes how they fail).
-- `failure_mode` in results.json shifts from `agent_timeout` to `unset` with
-  the harness no longer reaping.
-
-**Gate before re-running swe-bench:**
-- All unit tests pass.
-- The five new tests pass.
-- `cost.wall_s > 0` observed in at least one real trace event.
-
-**Implementation result (2026-05-27):**
-- `_charge_llm` and `_charge_tool` helpers added; every callsite refactored to
-  use them.
-- `call_planner` and `call_judge` signatures changed to return `LLMResult`
-  alongside their parsed output, so cost can be charged at the caller.
-- `_admit` now locks `deadline_ts = now + max_wall_s` on admission (when not
-  pre-set).
-- `_build_oracle_criterion` now takes `contract` and the closure calls
-  `_charge_tool` after every oracle bash run.
-- `representer.py` updated to charge `wall_s` per probe.
-- `TbSweAgent.max_wall_s` raised from 900s to 2700s (45 min) with 5-min
-  buffer under the harness's 50-min cap.
-- **54/54 unit tests pass** (49 prior + 5 new for 1.5.15).
-
-#### 1.5.16 — Smaller pilot rerun for fast feedback
-
-After 1.5.15 lands, rerun **swe10 (10 tasks) at concurrency 10** rather than
-swe30 at concurrency 3. Rationale:
-
-- 10 tasks × 1 wave (concurrency 10) ≈ wall = ~max single-task time = ~50 min.
-  About 3-4× faster than the 30-task variant.
-- Tighter feedback loop on the 1.5.15 fix.
-- Lower resource pressure per container vs swe30 — each container gets more
-  of the 32-CPU / 126 GB host.
-- Task selection: pick 10 tasks that span the v14 result space (some v14-PASS,
-  some v14-FAIL, including one previously-`agent_timeout` task to verify the
-  new deadline mechanism fires correctly).
-
-**Note**: concurrency 10 caused docker-compose contention on the first try
-(4/10 tasks failed image-build with `unknown_agent_error`). On retry, use
-concurrency 3 for the failed subset, or stagger task starts.
-
-#### 1.5.18 — HTML KPI report + LLM-driven layer attribution (QUEUED)
-
-Goal: end every batch run with an auto-emitted **HTML report** the user can
-review directly, with **LLM-driven layer attribution** rather than only
-deterministic heuristics. Removes Claude from the read-the-trace loop during
-development.
-
-**Why now (after pilot):** the swe10-v1.5-envelope pilot results will be the
-first data set with the new admission-gate + deadline architecture. That is
-the right moment to formalize how runs are reported, so all subsequent
-experiments (1.5.17 iteration-cap test, 1.6 tau-bench, etc.) emit a uniform
-report by default.
-
-**Why LLM-driven attribution (vs deterministic-only):** at the development
-stage, plan-step-vs-execution coupling is hard to detect with substring rules.
-An LLM judge given the plan + the failure evidence can reliably distinguish
-"plan named the wrong file" from "plan was right, executor edited wrong lines"
-from "criterion was never satisfiable." Deterministic rules become a safety
-net + a cheaper-tier fallback for very long runs.
-
-**Engineering work:**
-
-1. **`cat/run_report.py`** (new, ~200 LOC)
-   - Walks any `data/tb-runs/<run_id>/` directory.
-   - For each task: builds `RunMetrics` from JSONL, then calls
-     `attribute_task(metrics, events)` from `cat/attribution.py`.
-   - Aggregates: pass rate, failure-mode breakdown, per-role cost (planner /
-     executor / judge), iteration p50/p75/p90, wall-time distribution.
-   - Emits **`_kpi_report.html`** + **`_kpi_report.json`** next to
-     `results.json`. (HTML is what the user reviews; JSON is for downstream
-     comparison scripts.)
-   - HTML uses a single self-contained template (no external CSS/JS deps so
-     it can be opened in any browser locally).
-
-2. **`cat/attribution.py`** (new, ~150 LOC)
-   - **LLM-driven primary path**: given the trace events + plan + final state
-     + last criterion evidence, prompt a judge LLM to return a structured
-     JSON: `{represent: verdict, decompose: verdict, invoke: verdict,
-     verify: verdict, primary_credit_or_blame: layer, one_line_rationale}`.
-     Verdict = `OK | DEGRADED | FAILED`.
-   - **Heuristic fallback**: cheap deterministic rules (already drafted —
-     see prior analysis: `executor_quit_early` → INVOKE blame,
-     `admission_environment` → REPRESENT blame, etc.). Used when LLM call
-     fails or `--no-llm` is passed.
-   - Cache attribution by trace-content hash so reruns of the report are
-     free.
-
-3. **HTML report shape (sketch):**
-   ```
-   ┌─────────────────────────────────────────────┐
-   │ Run: swe10-v1.5-envelope        agent cat-swe│
-   │ Pass: 5/10 (50%)  Wall: 0h 47m  Tokens: 1.2M │
-   ├─────────────────────────────────────────────┤
-   │ Failure breakdown    Iteration p50/p75/max  │
-   │   deadline_passed: 2    PASS: 14 / 17 / 24  │
-   │   executor_quit:   1    FAIL: 25 / 51 / 51  │
-   │   admission_env:   0                        │
-   │   infra (docker):  4                        │
-   ├─────────────────────────────────────────────┤
-   │ Per-role token cost                          │
-   │   planner:  3% │ executor: 82% │ judge: 15% │
-   ├─────────────────────────────────────────────┤
-   │ Per-task table (sortable, expandable rows)  │
-   │ ┌─────────────────────────┬──────┬──────┐    │
-   │ │ task             │ ✓/✗ │ iter │ blame│    │
-   │ ├──────────────────┼──────┼──────┤    │
-   │ │ sklearn-14141    │ ✓   │  6   │  -   │    │
-   │ │ django-11239     │ ✗   │ 51   │ INVOKE│   │
-   │ │   ↳ rationale: plan named wrong PG env vars … │
-   │ └─────────────────────────┴──────┴──────┘    │
-   └─────────────────────────────────────────────┘
-   ```
-
-4. **Auto-emit at end of run.** Two trigger points:
-   - **Per-task hook** in `cat/tb_agents.py:perform_task` after
-     `recorder.finalize()`: writes `task_kpi.json` next to the trace.
-     (Cheap; no LLM needed at this point — just `RunMetrics.from_jsonl`.)
-   - **Per-run hook** triggered by the harness: hook into terminal-bench's
-     "all tasks done" lifecycle if it exposes one; otherwise add a small
-     watcher script that polls for `results.json` to be final and then runs
-     `python -m cat.run_report <run_dir>`. The watcher launches with the
-     `tb runs create ...` bash one-liner.
-
-5. **No HTML framework dependency.** Render as one inline HTML+CSS+small JS
-   template. Avoid bringing in Jinja just for this. Sortable table can use
-   a 30-line vanilla JS snippet.
-
-**Out of scope for 1.5.18:**
-- Cross-run comparison HTML (left for 1.5.19 or a separate `cat/compare_report.py`).
-- Interactive trace replay UI (already partially covered by `trace_view.py`).
-
-**Acceptance criteria:**
-- After `tb runs create … --run-id X`, `data/tb-runs/.../<X>/_kpi_report.html`
-  exists and renders.
-- Attribution column populated for every FAIL row with a one-line rationale.
-- User can answer "what broke on this run?" without reading the JSONL.
-
-**Implementation result (2026-05-27):**
-- `cat/attribution.py` — LLM-driven primary path + heuristic fallback +
-  trace-hash cache. Returns `Attribution{layers, primary, rationale, method}`.
-- `cat/run_report.py` — walks tb runs directory, aggregates per-task
-  `RunMetrics` + attribution, emits `_kpi_report.html` (~57KB self-contained)
-  and `_kpi_report.json`.
-- `cat/tb_agents.py` — `_emit_task_kpi` hook writes per-task
-  `<run>.task_kpi.json` next to the trace at `recorder.finalize()`. Uses
-  heuristic-only on the agent's critical path; LLM attribution is run-level
-  via `python -m cat.run_report`.
-- 54/54 unit tests still pass.
-- Validated end-to-end against `data/tb-runs/swe30/swe30-cat-v15/`:
-  30/30 tasks attributed; LLM rationales are specific and actionable on FAILs
-  ("Every tool call timed out → executor never made progress" for
-  django-13315; "executor repeatedly tried to read a non-existent file path"
-  for sympy-15875). A couple of PASS rationales were noisy/contradictory —
-  acceptable for a development-phase tool.
-- Cost: ~$0.015 to attribute 30 tasks at DeepSeek Flash rates.
-
-- **1.5.12** — End-to-end SWE-bench run on `django__django-11239` (a v14
-  failure case noted in PLAN.md as "partial-fix: fixed 2/4 SSL env vars"):
-  v1.5 also FAILED (failure_mode=agent_timeout at 3000s, iter=51). Same
-  outcome as v14 and v15 on this task. Trace confirmed the new
-  architecture firing: `contract_admit ok=True grant_n=5` recorded once
-  (one-shot admission), 51 `capability_invoke` events, LATENT → ELIGIBLE
-  → ACTIVE transitions. The agent never reached max_iterations (would
-  have transitioned to SUSPENDED per the new design) because the
-  harness 50-minute envelope expired first — read-tool TIMEOUTs ate
-  wall time, not algorithmic regression. **Diagnostic**: this is a
-  high-path-entropy task that all CAT variants (v14, v15, v1.5) fail
-  and ReAct passes — confirming the theory's testable prediction that
-  pre-commitment trades exploration for efficiency. The v1.5 strip
-  did not introduce a new failure mode here.
-
-- **1.5.13** — Added a no-regression test on a v14-PASS task to confirm
-  the refactor preserves working behavior. Ran
-  `scikit-learn__scikit-learn-14141` (the joblib show_versions task used
-  as the worked example in DESIGN.md) end-to-end on v1.5:
-  **is_resolved=True, parser=tests passed, 27,478 in / 2,725 out tokens,
-  2.5 min wall.** This is the affirmative proof the LIFE-stripped
-  admission-gate architecture solves clean tasks at parity with the
-  previous code. Gate criteria for v1.5 → v1.6 satisfied: no LIFE refs
-  in `cat/`, unit tests green, one v14-PASS task still passes, one
-  v14-FAIL task still fails (no regression on either).
-
----
-
-## v1.6 — DAG-first observability + terminology alignment (NEXT after v1.5)
-
-> See **`docs/1.6.2.9_PRD_renaming_and_dijkstra.md`** for the canonical
-> terminology rename + Dijkstra-layer-mapping decision record.
->
-> Cross-run learning (was 1.6.6) → moved to v1.7.
-> Multi-candidate / Dijkstra-explicit work → v1.8.
-
-Goal: promote the trace from a flat event stream to a typed reasoning DAG, and
-make the HTML report DAG-visualized. This subsumes 1.5.19 (final unified
-report) and 1.5.20 (structured run layout) — they become subtasks of v1.6
-because the DAG impacts both the report shape and the on-disk layout.
-
-**Why DAGs (and why not Dijkstra):**
-
-A CAT run is already a latent DAG — every `TraceEvent` carries a `parent_id`
-field. We just don't enforce it: half the events chain to the contract root
-(flat fan-out, not a real DAG), half chain to their immediate cause (proper
-edge). Tighten that and the trace IS a DAG, no schema change.
-
-But Dijkstra's static-graph + shortest-path assumptions don't transfer to CAT:
-the graph is constructed turn-by-turn by the planner + executor; there is no
-"shortest" path (only "first to satisfy criterion"); LLM stochasticity makes
-costs non-deterministic. The right model is **A\* with imitation learning over
-past DAGs**: past PASS DAGs are demonstrations; past FAIL DAGs are
-anti-demonstrations; the planner is conditioned on retrieved past DAGs that
-match the current task's REPRESENT fingerprint. The DAG corpus is the
-contract layer's *memory* — the part of the daemon model that "remembers what
-worked" without the LLM having to.
-
-### Subtasks
-
-#### 1.6.0 / 1.6.2.9 — Terminology rename + PRD (LANDS BEFORE 1.6.3 RESUMES)
-
-Per `docs/1.6.2.9_PRD_renaming_and_dijkstra.md`:
-- `planner` → `stipulator`, `executor` → `performer`, `judge` → `attestor` (role_tags)
-- `_decompose` → `_stipulate`, `_invoke_once` → `_perform_once` (methods)
-- `contract_decompose` → `contract_stipulate`, `capability_invoke` → `capability_perform` (event kinds)
-- Step names: DECOMPOSE → STIPULATE, INVOKE → PERFORM, CLOSE → DISCHARGE
-- Theory-only roles (SURVEYOR / REGISTRAR / RECORDER / ENFORCER / LIBRARIAN / ADVISOR) live in DESIGN.md, not in code
-- Backward-compat: old event kinds remain readable by `cat/dag.py` and `cat/trace_view.py` via an alias map
-- Acceptance: 62/62 tests pass, sklearn-14141 gate test PASS with new event kinds
-
-#### 1.6.1 — `parent_id` discipline audit
-
-Audit every `Recorder.append(TraceEvent(...))` call site:
-- `contract_state`: parent_id = previous contract_state (the state we came from)
-- `contract_represent`: parent_id = the latent state event
-- `contract_decompose`: parent_id = the contract_represent
-- `contract_admit`: parent_id = the contract_decompose
-- `capability_invoke`: parent_id = the previous invocation OR the contract_admit (for iter 1) OR the previous criterion_check (after VERIFY)
-- `tool_call` / `tool_result`: parent_id = the capability_invoke that triggered them
-- `criterion_check` (oracle): parent_id = the capability_invoke whose result triggered the check
-- `criterion_check` (judge): parent_id = the capability_invoke whose state it judged
-
-Today most of these point to `contract.id` (the root) which loses the
-information. After this audit, every non-root event has a *direct causal
-parent* in the same trace.
-
-Add a unit test:
-```python
-def test_trace_is_valid_dag(events):
-    ids = {e.event_id for e in events}
-    for e in events:
-        if e.parent_id is not None:
-            assert e.parent_id in ids
-```
-
-**Acceptance:** all existing unit tests pass with the tightened parents; new
-DAG validity test passes; no event has `parent_id=contract.id` except the
-root state.
-
-**Gate test (single SWE task before proceeding to 1.6.2):**
-Run `scikit-learn__scikit-learn-14141` (canonical fast PASS, ~2 min wall):
-- Task PASS verdict matches prior runs (no regression)
-- Walk the trace and assert: every non-root event has `parent_id` pointing
-  to another event in the same JSONL; no orphan parents; the DAG is
-  acyclic and connected from the latent state root
-- Report any anomalies. Pause for user review if anything looks off.
-
-#### 1.6.2 — `cat/dag.py` — RunDAG class + dag.json
-
-```python
-@dataclass
-class RunDAG:
-    nodes: dict[event_id, Node]       # typed: Representation | PlanStep | Invocation | Verify | StateTransition
-    edges: list[Edge]                  # typed: emitted_by | addresses | produced | verified_by | succeeded_by
-
-    def longest_chain(self) -> list[Node]
-    def branch_points(self) -> list[Node]
-    def path_to(self, leaf_event_id: str) -> list[Node]
-    def to_dict(self) -> dict           # for dag.json
-    @classmethod
-    def from_jsonl(cls, path: Path) -> "RunDAG"
-```
-
-Persist as `dag.json` next to the trace at `recorder.finalize()`.
-
-**Gate test (single SWE task before proceeding to 1.6.3):**
-Run `scikit-learn__scikit-learn-14141`:
-- Task PASS verdict unchanged
-- `dag.json` exists next to the trace and is parseable
-- `RunDAG.from_jsonl(...)` round-trips: rebuild DAG from JSONL, compare to
-  on-disk dag.json — node and edge sets match
-- Sanity: `longest_chain()` returns a non-trivial path (≥ REPRESENT →
-  DECOMPOSE → ADMIT → at least one Invocation → FULFILLED)
-- Pause for user review if structure looks off.
-
-#### 1.6.3 — DAG visualization in HTML report
-
-Redesign 1.5.18's per-task table: each task row expands into an inline SVG DAG
-showing the actual reasoning path.
-
-```
-expanded row layout:
-┌─────────────────────────────────────────────────────────────────────┐
-│ Task: django__django-11239                FAIL · 51 iters · 35 min  │
-├─────────────────────────────────────────────────────────────────────┤
-│ ┌────────┐                                                          │
-│ │ LATENT │                                                          │
-│ └───┬────┘                                                          │
-│ ┌───▼──────────┐                                                    │
-│ │ REPRESENT    │ 10 reps                                            │
-│ └───┬──────────┘                                                    │
-│ ┌───▼──────────┐                                                    │
-│ │ DECOMPOSE    │ 3 plan steps                                       │
-│ └───┬──────────┘                                                    │
-│ ┌───▼──────────┐                                                    │
-│ │ ADMIT (✓)    │ grant=5 caps                                       │
-│ └───┬──────────┘                                                    │
-│ ┌───▼──┐ ┌────┐ ┌────┐                                              │
-│ │inv 1 │→│ ✓  │→│ vf │  s1 marked complete                          │
-│ └───┬──┘ └────┘ └────┘                                              │
-│ ┌───▼──┐ ┌────┐ ┌────┐                                              │
-│ │inv 2 │→│ ✗  │→│ vf │  tool error                                  │
-│ └───┬──┘ └────┘ └────┘                                              │
-│  ... ↓                                                              │
-│ ┌──────────┐                                                        │
-│ │ FAILED   │ deadline passed                                        │
-│ └──────────┘                                                        │
-│                                                                     │
-│ Layer attribution:  represent OK · decompose OK · invoke FAILED · verify NA │
-│ Primary blame: invoke — "executor exhausted iter budget without converging" │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-Implementation:
-- Inline SVG written directly by `run_report.py` (no D3 / libs).
-- Node positions: simple layered layout (BFS depth = y, sibling index = x).
-- Nodes colored by layer (REPRESENT blue, DECOMPOSE green, INVOKE yellow,
-  VERIFY red/green by outcome, terminal STATES black-bordered).
-- Hover on a node → shows its full event payload as a tooltip.
-- Highlight the path that led to the terminal state (different stroke width).
-
-This replaces the per-task plain table from 1.5.18. The aggregate KPI cards
-at the top stay.
-
-**Gate test (single SWE task before proceeding to 1.6.4):**
-Run `scikit-learn__scikit-learn-14141`:
-- HTML report generated; opens cleanly in browser via the http server
-- Task row expands to show inline SVG DAG
-- Node colors and labels render correctly (REPRESENT blue, DECOMPOSE green,
-  INVOKE yellow, terminal state black-bordered)
-- Hover/tooltip shows event payload
-- Path-to-terminal-state highlight is visible
-- Pause for user review of the visual.
-
-#### 1.6.4 — Structured run output layout (folds 1.5.20)
-
-Implements the README's `data/runs/<bench>/<date>/<time>-<runid>/` layout
-including `dag.json` as an additional artifact:
-
-```
-data/runs/<bench>/<date>/<time>-<runid>/
-  manifest.json
-  results.json
-  run_metadata.json
-  run.log
-  _kpi_report.html
-  _kpi_report.json
-  _attribution_cache/
-  <task-id>/
-    <trial-name>/
-      agent-logs/<run>.jsonl
-      agent-logs/<run>.dag.json    ← NEW in v1.6
-      agent-logs/<run>.task_kpi.json
-      panes/
-      sessions/
-data/runs/INDEX.html
-```
-
-Includes:
-- `scripts/run_bench.sh` launcher wrapping `tb runs create`
-- `scripts/migrate_runs.py` symlinker for legacy `data/tb-runs/...`
-- `cat/run_report.py --index` to regenerate the cross-run INDEX
-
-**Gate test (single SWE task before proceeding to 1.6.5):**
-Run `scikit-learn__scikit-learn-14141` via the new `scripts/run_bench.sh`:
-- Output lands at `data/runs/swebench/<today>/<HH-MM-SS>-skltest/`
-- `manifest.json` written with bench, agent, git_sha, started_at, ended_at,
-  pass_rate
-- HTML report auto-generated at end of run
-- `data/runs/INDEX.html` lists the new run with a working link
-- Run the migration script: legacy runs appear as symlinks under
-  `data/runs/swebench/_legacy/...`
-- Pause for user review if any of these are off.
-
-#### 1.6.5 — Final v1.5 results in new layout (folds 1.5.19)
-
-Migrate the three swe10 v1.5 runs (envelope, retry, retry2) into the new
-layout via symlinks. Generate a unified DAG-visualized HTML report combining
-all three, with per-task FINAL verdict (PASS > real-FAIL > infra-error
-priority).
-
-This is the deliverable originally tabled as 1.5.19. It now lands as part
-of v1.6 so the report is built on top of the DAG infrastructure rather than
-the flat 1.5.18 table.
-
-**Acceptance (this IS the gate for v1.6):**
-- All three swe10 v1.5 runs (envelope, retry, retry2) are accessible under
-  `data/runs/swebench/2026-05-27/...` via symlinks
-- A unified DAG-visualized HTML report combines them with per-task final
-  verdict
-- INDEX lists all runs (legacy + new) with pass rates
-- User reviews the unified report — sign-off closes v1.6 phase 1.
-
-#### 1.6.6 — Cross-run DAG corpus + retrieval (MOVED TO v1.7 per PRD 1.6.2.9)
-
-The pay-off of having DAGs:
-
-- `data/dag_corpus/` indexes every past `dag.json`.
-- At plan time (Step 3 DECOMPOSE): embed obligation + `REPRESENT` fingerprint;
-  retrieve top-K most-similar past DAGs; feed plans + outcomes as few-shot
-  context to the planner.
-- **DAG-grounded SUSPENDED resume**: when a contract suspends with
-  `criterion_unreachable`, find the branch point in this run's DAG where the
-  agent committed to the failing approach. Re-admit with a new Representation
-  named `prior_dead_end` containing the rejected sub-DAG.
-- This restores the v1.6 "failure propagation → parent replans once" behavior
-  promised in v1.4 Open Questions, but **DAG-grounded** rather than
-  streak-counter-driven (which was LIFE).
-
-This is the part of the daemon model that closes the loop — the contract
-layer's memory of what worked.
-
-### Status of deferred 1.5.x items
-
-- **1.5.19** (final v1.5 unified report) → folded into **1.6.5**
-- **1.5.20** (structured run layout + launcher + INDEX) → folded into **1.6.4**
-
-The 1.5.18 HTML report (already shipped) remains usable for runs that exist
-today. The 1.6.3 redesign supersedes it once DAGs are available.
-
----
-
-## v1.6.6 — Tool reliability + sharpness (NEXT, infrastructure track)
-
-Goal: stop inheriting terminal-bench's tmux execution model for SWE-bench
-runs. Use the right execution primitives per domain (see DESIGN.md
-"Benchmark-adapter pattern"). Removes the dominant cause of v1.5 FAILs
-(`tool_environment` 4/4 per the diagnostic auditor) without changing any
-cognitive layer.
-
-**Why before v1.7+:** the procedural-memory and Dijkstra experiments need a
-stable substrate. Today's tmux flakiness confounds any cognitive change —
-"did retrieval help?" is unanswerable if 40% of trials die at the bash
-layer.
-
-### Subtasks
-
-#### 1.6.6.1 — `docker exec` backend (replace tmux for non-interactive tasks)
-
-- New `build_docker_registry(container_name)` in `cat/capabilities.py`,
-  parallel to `build_tmux_registry`.
-- Each tool dispatches via `docker exec -i <container> sh -c <cmd>` →
-  captures stdout/stderr/exit_code as a proper subprocess.
-- `read` / `write` / `list` / `str_replace` similarly use `docker exec`
-  directly (cat / docker cp + redirect / ls / inline python).
-- No tmux capture, no sentinel scraping, no pane viewport problems.
-- `TbCatAgent` selects backend: `docker_registry` by default for SWE-bench;
-  `tmux_registry` retained for tasks whose `task.yaml` declares an
-  interactive shell requirement.
-- Expected impact: eliminate all 4 `tool_environment` FAILs from v1.5-final
-  (django-10880 / 11239 / 12039 / 13315). Predicted solve rate uplift:
-  6/10 → 8-9/10 on the v1.5 swe10 slice without any cognitive change.
-
-**Gate test:** rerun the same 4 failed tasks via the new backend. PASS-rate
-must climb from 0/4 to ≥3/4 (allow 1 genuine model-limitation FAIL).
-
-#### 1.6.6.2 — First-class `ripgrep` + `fd` capabilities
-
-- Add `rg(pattern, paths, flags)` and `fd(pattern, paths, flags)` to the
-  default + docker registries.
-- Performer can call them directly instead of `bash("grep -rn ...")` —
-  10-100× faster on large codebases (Django: 10K+ files).
-- Reduces the "bash for everything" pattern and gives the performer
-  sharper primitives.
-
-#### 1.6.6.3 — Dedicated `pytest_run` capability
-
-- `pytest_run(test_ids, marker, timeout)` returns structured exit_code +
-  parsed pass/fail counts + first failure traceback.
-- Bypasses the bash → tmux → sentinel parsing chain.
-- Used by oracle criterion and any performer-initiated test runs.
-- Removes flakiness where pytest output exceeds the tmux viewport.
-
-### Gate criteria before v1.7
-
-- All three subtasks landed.
-- Unit tests still pass.
-- swe10-v1.5-envelope rerun on the new backend: ≥8/10 PASS (vs current 6/10).
-- DESIGN.md "Benchmark-adapter pattern" section published.
-
-### Result — v1.6.6 lifted swe10 solve rate 60% → 90% (DONE 2026-05-28)
-
-Stacked fixes shipped in v1.6.6 (all 6 subtasks + 2 follow-ups, all gates passed):
+| Token efficiency vs ReAct | **3.8× cheaper** | 2.0× cheaper | baseline |
+
+- CAT v14 only wins (4): matplotlib-26342, sklearn-26194, pytest-10081, pytest-6202
+- ReAct only wins (6): django-11239, django-12039, django-13315, django-14434, sympy-15349, sympy-15875
+- ReAct still better on exploratory tasks (large Django/sympy codebases)
+
+### v1.5 — Delete LIFE, realign to admission-gate theory (DONE 2026-05-27)
+
+**Why:** Of 5 load-bearing CAT mechanisms in DESIGN.md, 4 were LIFE imports
+(Action Realizer, Environment Spec preconditions, Circuit Breaker F2/F3/F4,
+Failure Attribution taxonomy). The layer the theory is *named* after
+(activation) was rhetorical — Step 6 was structurally identical to ReAct's act.
+
+**Shipped:**
+- Stripped all 4 LIFE imports from `cat/`
+- Renamed Step 6 ACTIVATE → INVOKE
+- Step 4 ACTIVATE is now the one-shot admission gate (boundary/environment/capacity → capability grant)
+- Contract lifecycle as state machine (LATENT / ELIGIBLE / ACTIVE / SUSPENDED / FULFILLED / FAILED / EXPIRED)
+- 60+ unit tests passing on the stripped code
+
+**Gate criteria all passed:** no LIFE refs in `cat/`, tests green, end-to-end SWE run works.
+
+**Decision log** (full detail in commits):
+- LIFE Circuit Breaker (F2 replan) replaced by SUSPENDED-with-watcher event-driven re-admission
+- Failure Attribution taxonomy replaced by contract-state reasons (which Criterion / Representation / admission check)
+- Action Realizer removed; tool errors surface naturally
+- Tool preconditions removed; tools just run and report errors
+
+### v1.6 — DAG-first observability + terminology alignment (DONE 2026-05-28)
+
+> See `docs/1.6.2.9_PRD_renaming_and_dijkstra.md` for the canonical terminology
+> rename decision record.
+
+**Goal:** promote the trace from flat event stream to typed reasoning DAG.
+
+**Shipped:**
+- `parent_id` discipline audit: every non-root event has a direct causal parent
+- `cat/dag.py` — RunDAG class with longest_chain / branch_points / path_to queries
+- `cat/dag_svg.py` — inline SVG visualizer (no external graphviz)
+- HTML KPI report (`cat/run_report.py`): DAG SVG + reasoning trace + cost-by-layer + cross-run INDEX
+- Structured run output layout: `data/runs/<bench>/<date>/<time>-<runid>/`
+- `scripts/run_bench.sh` launcher with manifest.json + auto-report
+- Terminology rename per PRD 1.6.2.9:
+  - role tags: `planner` → `stipulator`, `executor` → `performer`, `judge` → `attestor`
+  - methods: `_decompose` → `_stipulate`, `_invoke_once` → `_perform_once`
+  - event kinds: `contract_decompose` → `contract_stipulate`, `capability_invoke` → `capability_perform`
+  - step names: DECOMPOSE → STIPULATE, INVOKE → PERFORM, CLOSE → DISCHARGE
+  - backward-compat aliases preserved in `cat/dag.py` event-kind map
+
+**Gate:** 62/62 tests passing, sklearn-14141 PASS with new event kinds.
+
+### v1.6.5 — Diagnostic taxonomy + LLM attribution (DONE 2026-05-28)
+
+- `cat/attribution.py`: Attribution dataclass with limitation_kind, limitation_secondary, improvement_vector, improvement_specifics, narrative, confidence
+- v2 auditor prompt with 4-axis taxonomy (limitation_kind ∈ {framework_structural, framework_parameter, model_intelligence, model_prompt, tool_environment, task_complexity, none}; improvement_vector ∈ {framework_code, prompt, model, tool, infra, accept, none})
+- Parallelized attribution via ThreadPoolExecutor in run_report
+- HTML report includes per-task Diagnosis block + run-level histograms
+
+### v1.6.6 — Tool reliability (DONE 2026-05-28)
+
+**Headline:** swe10 PASS rate lifted from 60% (v1.5 baseline) to 90%.
 
 | Fix | Effect |
 |---|---|
 | 1.6.6.1 `docker exec` backend (replaces tmux) | tool error rate 80% → 21%; 3 of 4 v1.5 FAILs flip to PASS |
-| 1.6.6.2 first-class `rg` + `fd` (with grep/find fallback) | sharper search primitives; no measurable effect on v1.5 task set (codebases small enough) |
-| 1.6.6.3 (deferred) — docker exec already obsoletes the original `pytest_run` need | n/a |
-| 1.6.6.4 oracle restores `tests/` before applying `test_patch` | eliminates agent-oracle ↔ harness-verifier divergence |
-| 1.6.6.5 PERFORMER prompt: do not edit test files | preventive; reduces oracle confusion at the source |
-| 1.6.6.6 oracle includes PASS_TO_PASS regression sample (≤30) | matches harness's verifier; catches regressions the agent would otherwise stop on |
-| `bash -lc` login shell in docker exec (1.6.6.1 follow-up) | fixes PATH issues where pytest is in a conda env not on default docker-exec PATH (sphinx-10323 recovery) |
+| 1.6.6.2 first-class `rg` + `fd` | sharper search primitives |
+| 1.6.6.4 oracle restores `tests/` before applying test_patch | eliminates agent-oracle ↔ harness-verifier divergence |
+| 1.6.6.5 PERFORMER prompt: do not edit test files | preventive |
+| 1.6.6.6 oracle includes PASS_TO_PASS regression sample (≤30) | catches regressions agent would otherwise stop on |
+| `bash -lc` login shell in docker exec | fixes PATH/conda env issues (sphinx-10323 recovery) |
 
-Solve-rate progression on the swe10 slice:
+**Solve-rate progression on swe10:**
 
 | Run | Pass rate | Notable |
 |---|---|---|
-| v1.5-final (LIFE-stripped + admission gate, tmux backend) | 6/10 = 60% | 4 FAILs all diagnosed `tool_environment` by LLM auditor |
-| swe10-v1.6.6 (docker exec + rg/fd only) | 8/10 = 80% | 3 django FAILs → PASS; sphinx regressed (PATH issue) |
-| swe10-v1.6.6-all (+ bash -lc + oracle restore + prompt) | 8/10 = 80% | sphinx back; matplotlib regressed (incomplete oracle exposed) |
-| **swe10-v1.6.6-final (+ PASS_TO_PASS in oracle)** | **9/10 = 90%** | matplotlib recovered; only django-13315 remains (real model/task limit, 8% tool err) |
+| v1.5-final (LIFE-stripped, tmux backend) | 6/10 = 60% | 4 FAILs all diagnosed `tool_environment` |
+| swe10-v1.6.6 (docker exec + rg/fd only) | 8/10 = 80% | 3 django FAILs → PASS; sphinx regressed (PATH) |
+| swe10-v1.6.6-all (+ bash -lc + oracle restore + prompt) | 8/10 = 80% | sphinx back; matplotlib regressed |
+| **swe10-v1.6.6-final (+ PASS_TO_PASS in oracle)** | **9/10 = 90%** | only django-13315 remains |
 
-**+30 percentage points from one sprint of infrastructure work.** No cognitive
-change (no procedural memory, no multi-candidate search). The diagnostic
-auditor was correct: 4/4 v1.5 FAILs were `tool_environment`; once that bucket
-emptied, the headline jumped.
+**+30 percentage points from one sprint of infrastructure work.** The diagnostic auditor was correct: 4/4 v1.5 FAILs were `tool_environment`; once that bucket emptied, the headline jumped.
 
-Token efficiency wins as well — on PASSes, oracle restore + prompt
-discipline + accurate oracle let the agent stop early:
-- sklearn-14141: 240K → 13K → 46K  (eventual stop on PASS_TO_PASS)
-- sphinx-10323:  521K → 20K → 22K  (was envelope-exhausted, now clean)
-- pytest-6202:   162K → 60K → 24K
+### v1.6.6.7–14 — Tool-surface expansion + tightening (DONE 2026-05-29)
 
-The contract bookkeeping divergence we noted (agent state=failed yet harness=PASS)
-also resolved as a side effect — the oracle now matches the harness, so agent
-state machine closes FULFILLED rather than envelope-exhausted.
-
----
-
-## v1.6.6.7–10 + v1.7.0 + v1.8.0 — Tool-surface expansion (DONE 2026-05-28)
-
-After 1.6.6 lifted solve rate to 90% on swe10, the auditor surfaced a
-different bottleneck on the remaining FAIL (django-13315): the agent's plan
-called "apply patch" but no patch tool existed. Survey of 2026 SWE-bench
-agents (Pi/Earendil, Hermes/Nous, Claude Code) confirmed CAT was missing the
-**common high-leverage tool set**: multi-block edit, patch apply, structural
-navigation, first-class git ops. The user's reframing crystallized the
-direction:
-
-> "tooling is not cheating; framework's job is to optimize and minimize the
-> usage of tooling"
-
-CAT's value-add is contract discipline picking the *right* tool, not
-restricting the surface. So: give the performer a rich toolset, then measure
-tool-economy as a first-class KPI.
-
-### What landed
+**Capabilities added:**
 
 | # | Capability | Pattern source | Purpose |
 |---|---|---|---|
 | 1.6.6.7 | `apply_patch(patch)` | Hermes | Multi-hunk diff via `git apply --reject --whitespace=fix`; partial-apply with .rej listing |
 | 1.6.6.8 | `multi_edit(path, edits[])` | Pi `edit.ts` | Atomic N-hunk edit against ORIGINAL — order-independent, drift-free |
-| 1.6.6.9 | `git_status` + `git_diff(staged, path)` | own design | First-class git tools so the trace records accumulated changes |
-| 1.6.6.10 | `rg(context=N)` | Pi `grep.context` | -C N on the existing ripgrep wrapper; mid-context in one call instead of grep+read |
-| 1.7.0 | `goto_def`, `find_refs`, `outline` | Claude Code `LSP` | Jedi-backed Python structural nav; lazy `pip install --user jedi` inside container |
-| 1.8.0 | Tool-economy KPI | CAT-original | Per-task `tool_usage` + back-to-back + 4+-reads-same-file flags; HTML "Tool economy" panel |
+| 1.6.6.9 | `git_status` + `git_diff` first-class | own | First-class git tools so trace records accumulated changes |
+| 1.6.6.10 | `rg(context=N)` | Pi `grep.context` | -C N on existing ripgrep wrapper |
+| 1.7.0 | `goto_def`, `find_refs`, `outline` | Claude Code `LSP` | Jedi-backed Python navigation; lazy `pip install --user jedi` |
+| 1.8.0 | Tool-economy KPI | CAT-original | Per-task `tool_usage` + redundancy flags; HTML "Tool economy" panel |
+| 1.6.6.11 | stipulator SWE-bench guidance | own | "Don't plan to add tests" — closes django-13315 deadlock class |
+| 1.6.6.12 | pytest signal extractor (`cat/test_signals.py`) | own | Extracts top repo-internal frame from pytest traceback → stipulator evidence |
+| 1.6.6.13 | cost-per-PASS analysis (no code) | own | Diagnosed token bloat → drove 1.6.6.14 |
+| 1.6.6.14 | read truncation nudge (Pi/Claude-Code) | Pi | "showing X of Y lines; use offset=N to continue" + description nudge |
 
-11 capabilities total in the docker registry (was 7), with `PERFORMER_SYSTEM_PROMPT`
-expanded to enumerate tool-selection guidance ("prefer `outline` over `read` when
-you only need structure", etc.).
+11 total tools in docker registry (was 7). `PERFORMER_SYSTEM_PROMPT` expanded with tool-selection guidance.
 
-### Decision log
+**Results — swe10 v1.7-tools vs v1.6.6-final baseline:**
+- 9/10 effective PASS (parity)
+- **−55% tool calls per task** (42.7 → 19.4)
+- **−46% wall time** (92 min → 49.5 min)
+- +47% USD (driver: bigger per-call context from richer tool results; analysis in 1.6.6.13)
 
-- **1.6.6.7.a** `apply_patch` uses `git apply --reject --whitespace=fix`
-  (vs `patch -p1`). Why: --reject gives partial apply with .rej files the
-  agent can introspect; --whitespace=fix absorbs trailing-whitespace
-  mismatches that kill ~10% of LLM-generated diffs. Confirmed via test
-  `test_apply_patch_partial_apply_writes_rej`.
-- **1.6.6.8.a** multi_edit semantics: each `old_text` matches the ORIGINAL
-  file (Pi semantics), not incrementally. Why: line numbers don't drift,
-  edits are order-independent, partial application is well-defined. Test
-  `test_multi_edit_aborts_when_one_edit_misses` proves atomicity (no
-  partial writes when any edit fails). Pi's exact rationale was cleaner
-  than Claude Code's single-Edit-with-replace_all, which lacks atomic
-  multi-region semantics.
-- **1.7.0.a** Backend = jedi, not full LSP (pyright/pylsp per repo). Why:
-  SWE-bench is 100% Python; jedi is a single Python dep with no language
-  server process to manage. Trade-off acknowledged: when CAT moves to
-  non-Python benchmarks, swap to LSP via tree-sitter; jedi stays as the
-  Python fast path.
-- **1.7.0.b** Lazy install at first use: container-side script does
-  `pip install --user --quiet jedi>=0.19` if import fails. Avoids forcing
-  rebuild of every SWE-bench docker image. Cost: ~3 s one-time per task.
-- **1.8.0.a** Redundancy heuristic only counts perform-layer calls. Why:
-  REPRESENT probes (`rep-*`) and oracle calls (`oracle-*`) are framework
-  overhead — flagging them as "wasteful agent behavior" would mis-attribute.
-- **1.8.0.b** Re-running the new report on the v1.6.6-final run surfaced
-  concrete waste even on PASSing tasks: django-13315 read related.py 4×,
-  django-10880 read expressions.py 6× + aggregates.py 7×. These are
-  exactly the inefficiencies `outline` + `multi_edit` target.
-
-### Test coverage
-
-| File | New tests | Covers |
-|---|---|---|
-| `tests/test_capabilities.py` | 10 (apply_patch ×2, multi_edit ×3, git ×1, rg.context ×1, symbol_nav ×3) | docker registry semantics, atomicity, partial apply, jedi outline / goto / refs |
-| `tests/test_run_report.py` | 4 | tool_usage extraction, back-to-back detection, 4+-same-file detection, no-waste case |
-
-All 76 tests pass.
-
-### Gate criteria before v1.7.1+
-
-- All capability subtasks landed: ✓
-- Unit + integration tests pass: ✓ (76/76)
-- swe10 rerun with new toolset: ✓ (task #51, run-id swe10-v1.7-tools)
-  - Pass rate: 9/10 effective (90%, parity with v1.6.6-final), corrected for
-    one infra-failed task that PASSed on retry (#51-retry sympy-15875)
-  - tool_calls_per_task_avg: **19.4 vs 42.7 baseline = −55%**
-  - wall time: 49.5 min vs 92 min = −46%
-  - Hypothesis confirmed: rich tool surface + contract discipline = same
-    solve rate at materially less work.
-- django-13315 remained FAIL on retry with 1.6.6.11 stipulator guidance, but
-  for a strictly more advanced reason (stipulator picked the wrong target
-  function). Bottleneck has migrated from `framework_structural` (missing
-  patch) to `framework_parameter` (stipulator quality + in-loop pathology).
-  This is the natural inflection point into the v1.7.1+ learning-system
-  phase.
-
-### Bottleneck migration so far
+**Bottleneck migration:**
 
 | Generation | Dominant failure layer | Fix vector |
 |---|---|---|
-| v1.5 | `tool_environment` (tmux fragility) | v1.6.6 docker exec backend |
+| v1.5 | `tool_environment` (tmux) | v1.6.6 docker exec |
 | v1.6.6 | `tool_environment` (oracle ≠ harness) | v1.6.6.4–6 oracle alignment |
 | v1.7-tools | `framework_structural` + `framework_code` (missing tools + bad plans) | v1.6.6.7–11 tools + stipulator guidance |
-| **1.6.6.11** | **`framework_parameter` (planner quality + in-loop pathology)** | **1.7.x / 1.8.x — learning + multi-candidate** |
+| **post-1.6.6.11** | **`framework_parameter` (planner picks wrong target)** | **v1.7 learning loop** |
 
-Each generation peeled the next layer up. The pattern is monotonic: fixing
-the dominant layer reliably exposes the next layer's bottleneck. CAT's
-instrumentation makes the bottleneck observable; what's missing is the
-loop where the framework's own diagnostic triggers its own next fix.
+Each generation peeled the next layer up.
 
-### Cost-per-PASS analysis (1.6.6.13, 2026-05-29)
+### v1.7.0 — Offline simulation: CEGAR + Dijkstra (DONE 2026-05-30)
 
-v1.7-tools spent $0.462 on swe10 vs v1.6.6-final's $0.313 (+47%) despite
-−55% tool calls. Per-task breakdown traced the increase to:
+External research (TriCEGAR mechanism + Ferns/Precup criterion + Dijkstra
+objective) reframed the v1.7 design as:
+- raw_features stay UNHASHED — predicate tree applies a function over them
+- starts maximally coarse (one leaf per obligation), splits earn into the tree via counterexamples
+- Trigger B (value_split): leaf with highest CV of realized_cost_to_goal
+- Decision-tree-stump split: minimum weighted variance on raw_features (hand-rolled, no sklearn)
+- Backward Dijkstra → d*(s) per leaf
+- Two-tier features: domain-agnostic core vs domain-specific extensions
 
-- **PERFORM layer ONLY.** Stipulator/Attestor per-call costs were flat
-  (×1.03); performer per-call cost grew ×1.58 (5,932 → 9,388 input
-  tokens/call). LLM call counts were stable (203 → 196).
-- **Same turns, bigger turns.** The fewer-but-fatter pattern: agents made
-  fewer tool calls, but each performer LLM call carried ~3,500 more input
-  tokens. Driver: `read` alone accounts for 95% of all tool-output bytes
-  (1.05 MB across 55 calls, avg 19 KB each). The new tools we worried
-  about (`goto_def`, `find_refs`, `outline`) returned tiny outputs (224 B,
-  274 B, 0 B). `outline` had **zero** calls — the LLM never reached for
-  the cheapest option.
-- **LLM keeps doing bare big reads after `goto_def`.** After `goto_def`
-  returns `{path, line}`, the LLM tends to follow with `read(path)` rather
-  than `read(path, offset=line-5, limit=50)`. Nothing in the `read` tool
-  description or its truncation message nudges narrow reading.
-- **django-13315 outlier real but partial.** Burned its full 500K budget
-  in v1.7 (vs giving up at 106K in v1.6.6) because the new tools made
-  progress *seem* tractable. Accounts for $0.08 of the $0.15 increase.
-- **Per-PASS economics: $0.032 → $0.045 (+39%)**, not the naive +66% — the
-  budget-burn task inflates the naive figure. Roughly even once
-  django-13315's planner issue is fixed at v1.7+ (procedural memory or
-  multi-candidate stipulation).
+**Validated on merged swe10 corpus (19 traces, 392 samples):**
+- 38 leaves after CEGAR refinement (was 10 coarse leaves at start)
+- **22 of 30 splits domain-agnostic** (73%) — `verify_attempt_count`, `iter_since_durable_change`, `durable_change_count`
+- d* values now meaningful (range 0–285K tokens, not all zero like v1)
+- Predicates picked match human-predicted failure modes (pytest-loop, drift signals, post-edit state)
 
-Surgical fix landed as **1.6.6.14** — borrow Pi/Claude-Code truncation
-pattern: explicit "showing X of Y lines" message + description nudge "use
-offset/limit; continue with offset until complete." ~10 lines of code, no
-schema change.
+**Artifacts:**
+- `scripts/dijsktra_simulation.py` — POC simulator
+- `docs/dijsktralayer_manual_by_hand_draft.md` — 12-section walkthrough with real data
 
-What was NOT fixed and deferred to v2.x: the structural overhead from
-having 14 tools available on every call (~$0.05/run static floor). The
-proper fix is **capability granting at the admission gate** — only expose
-tools the contract genuinely needs. See v2.x note below.
+### v1.7 Phase A.1 — Corpus + LIBRARIAN (advisory) (DONE 2026-05-30)
 
----
+Wires the simulator into runtime as a lightweight advisor.
 
-## v1.7 — Learning Loop (revised plan, 2026-05-30)
+**Shipped:**
+- `cat/state_class.py` — shared canonicalization (Sample, PredicateTree, action_intent, abstract counters)
+- `cat/corpus.py` — SQLite (trajectory + sample tables); dedup on trace_id
+- `cat/librarian.py` — runtime query: `recommend(raw_features) → Optional[Recommendation]`
+- `cat/activator.py` — optional `librarian=` kwarg; `_librarian_hint()` builds transient system message
+- `cat/tb_agents.py` — constructs Librarian when `CAT_CORPUS_DB` env var is set
+- `scripts/seed_corpus.py` — bulk ingest from existing run dirs
+- `scripts/run_bench.sh` — post-run writeback after each run
+- Seeded corpus: 25 trajectories, 540 samples (after smoke writeback)
+- 94/94 tests passing (6 new for corpus + librarian)
 
-Supersedes the previous v1.7.x / v1.8.x split. After the design walkthrough +
-literature scan (offline-RL Q estimation + Dijkstra over learned weights),
-the two were never independent initiatives — they are the data layer and the
-algorithm layer of one offline-RL + online-search system. Splitting them
-defers any meaningful validation until both ship; instead we build the
-vertical slice end-to-end and validate as one machine.
+**Smoke test (3 tasks):**
 
-### The full loop (architecture)
+| Task | v1.7-tools baseline | A.1 (with Librarian) | Δ tokens |
+|---|---|---|---|
+| pytest-6202 | PASS, 28K | PASS, 32K | +14% (hint overhead on small task) |
+| django-12039 | PASS, 445K | PASS, 365K | **−18%** (−80K) |
+| django-13315 | FAIL, 489K | FAIL, 368K | **−25%** (−121K) |
 
-```
-trace events with parent_id (existing)
-            ↓
-post-run outcome tagging (pass/fail/dead_end/neutral on DAG subtrees)
-            ↓
-state_class hash + action_class hash (canonicalization)
-            ↓
-SQLite + FTS5 corpus of trajectories — each (s, a) pair gets
-  • running mean tokens-in cost Q̂(s,a)
-  • Beta(α,β) success posterior — Bayesian P̂(success|s,a)
-  • visit count n(s,a)
-            ↓
-LIBRARIAN — at PERFORM-step 5, given current state_class:
-  retrieve top-k (s,a) edges with Q̂, P̂, n
-            ↓
-Step 5a candidate generation — LLM emits N candidate tool calls
-            ↓
-Step 5b ADVISOR scoring (math, not LLM):
-  score(a) = Q̂(s,a)/P̂(success|s,a) − κ·√(2·ln N(s) / n(s,a))
-              ↑                       ↑
-       expected cost-given-survival   UCB1 exploration bonus
-  Unseen (s,a) → fall back to global prior, high exploration bonus
-            ↓
-Step 5c ELECTION — argmin score(a). Losing candidates recorded in DAG
-for retrospective analysis (Voyager-style: nothing deleted).
-            ↓
-PERFORM — execute the elected action.
-            ↓
-... continues to VERIFY / DISCHARGE ...
-            ↓
-Post-run writeback: outcome-label the just-completed DAG, ingest each
-edge into the corpus, update Q̂ / posterior. Corpus grows by one
-trajectory's worth.
-```
+Same solve rate, significant token savings on bigger tasks. Hint IS visible to the LLM but math doesn't FORCE the choice — that's Phase A.2.
 
-### Why integrated, not split
-
-| Splitting risks | Why it matters |
-|---|---|
-| LIBRARIAN ships alone | Built, but no consumer — only inspection value. No validation signal |
-| ADVISOR ships alone | Falls back to LATS/MCTS without learned weights. The "Dijkstra over learned costs" hypothesis is never tested |
-| Two separate gates | First gate's design freezes the interface between them — and either it survives (lucky) or it doesn't (rework) |
-| End-to-end validation deferred | The state_class canonicalization recipe is load-bearing; you only learn what works by running the whole loop |
-
-The honest framing: this is *one* offline-RL + online-search loop. The pieces are dependency-ordered but ship together.
-
-### Subtasks (one vertical slice, then iterate)
-
-**Phase A — minimum viable loop (one PR, one validation):**
-
-1. **Outcome-tagging** — `cat/dag.py`: add `outcome`, `outcome_decided_at`,
-   `outcome_observed_at`, `invalidated` fields on `Node`. `tag_outcomes(dag)`
-   walks bottom-up after a run finishes with ~5 deterministic rules. No LLM.
-2. **Canonicalization** — `cat/state_class.py` (new): `state_class(node)` and
-   `action_class(tool_call)` produce stable hashes. Critical detail; will need
-   tuning. Start with the simplest possible recipe (obligation hash + plan
-   step index + tool name + canonical args path).
-3. **Corpus** — `cat/corpus.py` (new): SQLite + FTS5 schema (trajectory, edge,
-   q_estimate aggregate tables). Writeback hook in the activator's post-run
-   path. No vector store, no embeddings, no Neo4j.
-4. **LIBRARIAN** — `cat/librarian.py` (new): given a state_class, return top-k
-   edges with `(Q̂, σ², Beta(α,β), n)`. Simple SQL.
-5. **Step-5 split in activator** — currently the performer emits one tool_call
-   per turn. Refactor to: emit N=2 candidates (LLM default + one LIBRARIAN-
-   suggested if any), score by formula above, ELECT. N=2 keeps churn small
-   while still exercising the scoring path.
-6. **ADVISOR scoring** — `cat/advisor.py` (new): the formula. Stateless
-   function: given `(state_class, candidates, librarian_response)` → returns
-   scored candidates. Uses Bayesian P̂(success) (MACLA's robust-to-small-N
-   trick) rather than frequentist `n_pass/n_total`.
-7. **ELECTION** — `cat/election.py` (new): argmin scored. Losers go into
-   trace as `capability_perform_rejected` events for the DAG to record.
-
-Validation: re-run swe10 with cold corpus → swe10 again with warm corpus
-(seeded by the cold run + the v1.6.6.14 swe10 we have on disk) → measure
-solve rate AND cost-per-PASS delta. The hypothesis is that the warm-corpus
-run beats the cold-corpus run on at least one of those.
-
-If the validation moves the needle, iterate the canonicalization, exploration
-constant κ, and candidate count N. If it doesn't, the design is wrong —
-likely the state_class hash recipe — and we re-design before shipping more.
-
-**Phase B — separable extensions:**
-
-- **SUSPENDED resume DAG-grounded** (formerly 1.7.3): when contract enters
-  SUSPENDED, walk back to last `neutral` ancestor, prune dead-end subtree,
-  resume from there. Independent of the main loop's value-add but uses the
-  same outcome-tagged DAG.
-- **A* heuristic h(v)** — learned from corpus, admissible-by-construction
-  via 25th-percentile cost-to-goal of past PASS trajectories. Ships when
-  Phase A's flat Dijkstra has a stable interface.
-- **Multi-objective reward** (tokens + dollars + wall, not just tokens).
-  Skip in Phase A; revisit if cost/PASS dominates evaluation.
-
-### Validation discipline
-
-The only meaningful unit of validation is the full loop. Sub-pieces have
-unit tests (outcome-tagging rules, hash stability, corpus schema), but
-solve-rate / cost-per-PASS is measured exactly once: after the vertical
-slice ships.
-
-### Open canonicalization questions
-
-These will be empirically resolved during Phase A; flagging them so we
-can watch:
-
-1. How granular should `state_class` be? Too narrow → every (s,a) has N=1.
-   Too broad → Q estimates collapse useful signal. Start narrow (full
-   obligation hash + tool + path) and widen if collisions are too sparse.
-2. Should the LIBRARIAN re-rank exact-hash matches by FTS5 over obligation
-   text? Probably yes for tie-breaking, but the LLM doesn't need to be
-   involved unless ambiguity is real.
-3. Beta prior strength: weak (Beta(1,1) = uniform) vs informed (Beta(α₀,β₀)
-   from global success rate). Start uniform; tune later.
-
-### Gate criteria before v2.x
-
-- Vertical slice ships, end-to-end working
-- swe10 cold-vs-warm corpus validation shows measurable improvement on
-  at least one of: solve rate, cost-per-PASS, tool-calls-per-task avg
-- Trace + DAG + corpus tables remain queryable for offline analysis (no
-  black-box "memory blob" — every Q estimate must be inspectable)
+**Bug found mid-smoke:** docker compose project names must be lowercase. Added guard in `run_bench.sh` (commit `df104ba`).
 
 ---
 
-## v1.4 — tau-bench (planned)
+## Roadmap — what comes after v1.7 A.2
 
-Goal: Validate CAT on customer-service conversations (non-coding domain).
+### v1.7 Phase B — SUSPENDED resume (DAG-grounded)
 
-### tau-bench integration
+When contract enters SUSPENDED, walk DAG back to last `neutral` ancestor,
+prune dead-end subtree, resume from there. Separable from A.1/A.2 but
+reuses the same outcome-tagged DAG.
 
-### Track B: tau-bench (customer service, non-coding)
+### v1.7 Phase C — A* heuristic h(v) learned from corpus
 
-**What:** Simulated customer service conversations. LLM plays the customer,
-agent uses domain API tools (cancel_order, change_flight, etc.). Oracle
-compares final database state against ground truth.
+Upgrade Dijkstra to A*: learned admissible-by-construction heuristic
+h(v) = 25th-percentile cost-to-goal of past PASS trajectories through
+similar states. Ships after Phase A has a stable interface.
 
-**Engineering work:**
+### v1.7.0.x — Two-tier feature refactor formalization
 
-1. **tau-bench integration** (`cat/bench/taubench.py`)
-   - Clone tau-bench repo (or tau3-bench for latest).
-   - Load task definitions: each has a user goal, initial DB state, expected
-     final DB state, available API tools, and policy rules.
+`action_intent` classification declared at Capability-registration time
+(not hardcoded). Move code-Python-specific features (`workdir_sig`,
+`env_facts`, `last_bash_class`) into `domain_features` dict. Sets up
+cross-domain transfer for tau-bench arrival.
 
-2. **Capability adapter**
-   - Wrap each tau-bench API tool as a CAT Capability.
-   - Example: `cancel_order(order_id)` becomes a Capability with JSON schema,
-     handler calls the tau-bench environment's API.
+Already drafted in v1.7.0 work — just needs the cleanup pass.
 
-3. **Criterion adapter**
-   - Map tau-bench goal-state annotations to CAT Criterion predicates.
-   - `(State) -> bool` where State includes the DB snapshot.
-   - Compare actual DB state against expected: row-by-row equality check.
+### v1.4 — tau-bench (cross-domain validation)
 
-4. **User simulator integration**
-   - tau-bench provides an LLM-based user that plays the customer role.
-   - Need to wire this into the conversation loop: executor talks to user
-     simulator AND uses tools. This is a new interaction pattern for CAT —
-     currently the executor only talks to tools.
-   - Option A: user simulator messages injected as tool results.
-   - Option B: extend the Activator to support multi-party conversations.
+Goal: validate CAT on customer-service conversations (non-coding).
 
-5. **Policy constraints**
-   - tau-bench tasks have policy rules (e.g., "refund only if within 30 days").
-   - Map these to CAT Constraints or Conditions on the Contract.
+- Simulated CS conversations; LLM plays customer, agent uses domain API
+  tools (cancel_order, change_flight, etc.); oracle compares final DB
+  state against ground truth
+- Capability adapter: wrap each tau-bench API tool as a CAT Capability
+- Criterion adapter: row-by-row DB state equality
+- User simulator: tau-bench provides LLM-based user; need to wire into
+  conversation loop (new interaction pattern for CAT)
+- Retail + airline domains, ≥30 instances each, 4 reps for pass^k
 
-6. **Run configuration**
-   - Retail + airline domains, >=30 instances each.
-   - 4 reps per instance for pass^k.
-   - Total: 60 instances x 2 agents x 4 reps = 480 trials.
+**Risk:** user simulator adds a second LLM call per turn — doubles cost
+on this domain. Acceptable.
 
-**Risks:**
-- User simulator requires a second LLM call per conversation turn -> doubles
-  token cost and adds latency.
-- tau-bench policy rules are natural language, not predicates — need to decide
-  whether to encode them as CAT Conditions or leave them in the system prompt.
-- DB state comparison may need fuzzy matching for some fields.
+### v1.8 — Coding domain hardening (gate before v2.0)
 
-### Cross-cutting work
-
-1. **pass^k metric** (`cat/compare.py`)
-   - Group trials by instance_id, check if all k reps passed.
-   - Report pass^1, pass^2, pass^4 in the summary table.
-   - This is the key consistency metric — high pass^1 but low pass^4 means
-     the agent is unreliable.
-
-2. **Pi baseline** (`cat/bench/pi_adapter.py`)
-   - Run same instances through Pi (stateless ReAct baseline).
-   - Either vendor Pi's runner or call it as subprocess.
-   - Report head-to-head: CAT vs ReAct vs Pi.
-
-3. **Benchmark runner** (`cat/bench/runner.py`)
-   - Extend runner.py to handle bench="swebench" and bench="taubench"
-     in addition to bench="synthetic".
-   - Unified CLI: `python -m cat.bench --suite swebench-lite --reps 4`
-
-**Deliverables:**
-- SWE-bench Lite results (>=30 instances, pass^1 and pass^4)
-- tau-bench results (>=60 instances across 2 domains, pass^1 and pass^4)
-- Pi baseline comparison on both tracks
-- Summary report with CAT vs ReAct vs Pi head-to-head
-
----
-
-## v1.6 — Failure handling and re-planning
-
-Goal: Make CAT robust to mid-run failures instead of failing the whole
-contract on first unrecoverable error.
-
-**Engineering work:**
-
-1. **Failure propagation** (`cat/activator.py`)
-   - When a child contract FAILs, parent gets one chance to re-plan.
-   - Parent's Activator detects child FAILED -> decomposes again with failure
-     context ("step X failed because Y, find alternative").
-   - If re-plan also fails -> parent FAILs with full trace.
-   - Limit: exactly one re-plan per parent. No infinite retry loops.
-
-2. **SUSPENDED -> re-ELIGIBLE flow** (`cat/contracts.py`)
-   - Contracts blocked on external state (test run in progress, API rate
-     limit) transition to SUSPENDED.
-   - When the blocking condition clears, contract becomes ELIGIBLE again.
-   - Activator polls or receives notification.
-
-3. **Recovery stress tests** (new synthetic tasks)
-   - Task where the first approach fails (wrong file, missing dependency)
-     and the agent must recover.
-   - Task with a flaky test that passes on retry.
-   - Oracle checks that recovery happened AND final state is correct.
-
-4. **Contract-native failure classification** (replaces v1.2's LIFE attribution)
-   - Failures are now attributed by contract state: which Criterion failed,
-     which Representation was violated, which admission check rejected.
-   - Tool errors are tool errors — no separate substring-based taxonomy.
-   - Report: distribution of FAILED contracts by terminal `state_reason`,
-     SUSPENDED contracts by `suspend_reason`. Feeds v1.8's procedural skills.
-
-**Deliverables:**
-- Re-plan on child failure (one retry, contract-native, not LIFE replan)
-- SUSPENDED state flow working end-to-end (event-driven re-admission)
-- Recovery stress test tasks + benchmark results
-- Contract-state-based failure breakdown from v1.4/v1.5 runs
-
----
-
-## v1.8 — Coding domain hardening (HARD GATE)
-
-Goal: Prove CAT matches or beats an established coding agent on a recognized
-benchmark. This is the gate to v2.0 — must pass before expanding to other
-domains.
-
-**Engineering work:**
-
-1. **Head-to-head vs established agent**
-   - Pick one: Pi, Hermes, or Claude Code.
-   - Run on shared benchmark (SWE-bench Lite from v1.4).
-   - Target: >= parity on solve rate, measurable advantage on token cost.
-
-2. **LIFE-Harness external baseline** (arxiv 2605.22166)
-   - LIFE is now an EXTERNAL comparison target only — not absorbed.
-   - Run CAT (no-LIFE) vs published LIFE-Harness numbers on shared tau-bench.
-   - Direct test: top-down design (CAT contract gate) vs bottom-up learned
-     interventions (LIFE four-layer harness). Same model backbone.
-   - Critical ablation: does CAT-without-LIFE-imports match what we had
-     with LIFE-imports absorbed in v1.2-v1.4?
-
-3. **AgentBench subset** (THUDM, ICLR 2024)
-   - Add OS environment (Linux shell tasks, 144 instances).
-   - Add DBBench (SQL tasks, 261 instances).
-   - Optional: ALFWorld (household tasks, 134 instances).
-   - All deterministic, published LIFE-Harness numbers available.
-   - Criterion adapters: file/exit-code for OS, query-result for DB.
-
-4. **Event sourcing** (`cat/trace.py`)
-   - Every state transition emits a replayable event (already partially done).
-   - Build replay tool: given a trace, reconstruct the full execution.
-   - Post-hoc analysis: where exactly does ReAct drift vs where CAT stays.
-
-5. **Procedural skills (first cut)** (`cat/skills.py`)
-   - Mine successful trajectories from v1.4-v1.6 runs.
-   - Extract common decomposition patterns (e.g., "read -> diagnose -> edit ->
-     test -> verify" for bug-fix tasks).
-   - Planner queries skill library before LLM call.
-   - Cross-run memory: long-term store of what plans worked.
-
-6. **pass^k across all environments**
-   - Report pass^1, pass^2, pass^4 for SWE-bench, tau-bench, AgentBench.
-   - Consistency is the key differentiator for CAT.
+- **Head-to-head vs established agent** — pick one of Pi, Hermes,
+  Claude Code; run on SWE-bench Lite; target ≥ parity on solve rate +
+  measurable token-cost advantage
+- **AgentBench subset** (THUDM, ICLR 2024) — OS environment (Linux shell,
+  144 tasks), DBBench (SQL, 261 tasks); deterministic, comparable to
+  published numbers
+- **Pass^k across environments** — pass^1, pass^2, pass^4 for SWE-bench,
+  tau-bench, AgentBench; consistency is CAT's differentiator
 
 **Gate criteria:**
-- CAT >= parity on solve rate vs at least one established agent.
-- CAT measurably cheaper (tokens or USD) on same benchmark.
-- Results reproducible (pass^4 > 50% on solved instances).
-- Results published (internal report or external paper).
+- ≥ parity on solve rate vs one established agent
+- Measurably cheaper (tokens or USD) on same benchmark
+- Pass^4 > 50% on solved instances
+- Internal report or external paper
 
-**If gate fails:** Iterate on v1.6-v1.8 (improve failure handling, add skills,
-tune SUSPENDED re-admission semantics, derive real capability grants) until
-gate criteria are met. Do NOT proceed to v2.0.
+### v1.9 — GAIA (near-verifiable open-ended)
 
----
+Bridge between deterministic and subjective criteria. Multi-step research
+questions with exact-match or near-match answers (Wikipedia-grounded).
+Three difficulty levels. Tests whether plan-first discipline reduces
+unnecessary web lookups on hard questions.
 
-## v1.9 — GAIA (near-verifiable open-ended tasks)
+### v2.0 — Domain-agnostic expansion (gated on v1.8)
 
-Goal: Bridge between deterministic and subjective criteria before tackling
-fully open-ended benchmarks.
-
-**Why GAIA:** Multi-step research questions with exact-match or near-match
-answers (Wikipedia-grounded). Three difficulty levels. Tests whether CAT's
-plan-first discipline reduces unnecessary web lookups on hard questions.
-
-**Criterion design:**
-- Exact-string + normalized-string match as deterministic criterion.
-- Fall back to LLM judge only for Level 3 (hardest) questions.
-- Judge called **once at task end**, not per tool call.
-
----
-
-## v2.0 — Domain-agnostic expansion (gated on v1.8)
-
-Goal: Prove CAT's discipline advantage transfers across domains, not just
-coding.
-
-**Prestige benchmarks:**
-
-| Benchmark | Domain | Tasks | Oracle type |
+| Benchmark | Domain | Tasks | Oracle |
 |---|---|---|---|
-| WebArena | Web browsing (Reddit, GitLab, shopping) | 812 | Page state validators |
-| OSWorld | Desktop control (files, apps, browser) | 369 | System state validators |
-| Spider 2.0 | Enterprise SQL (Snowflake, BigQuery) | 632 | Query result comparison |
+| WebArena | Web browsing | 812 | Page state validators |
+| OSWorld | Desktop control | 369 | System state validators |
+| Spider 2.0 | Enterprise SQL | 632 | Query result comparison |
 
-**Criterion adapter taxonomy:**
-
-| State type | Adapter | Used by |
-|---|---|---|
-| File system | `file_content(path) == expected` | OS, SWE-bench, OSWorld |
-| Database rows | `db_state == gold_state` | tau-bench, DBBench, Spider 2.0 |
-| Web/DOM | `page_element(selector) == expected` | WebArena, WebShop |
-| Object location | `object_at(room, surface)` | ALFWorld |
-
-**Engineering work:**
-
-1. **Adapter framework** — generic base class for connecting external
-   benchmarks to CAT (task loader, capability wrapper, criterion mapper,
-   grader adapter). Should be pluggable so adding a new benchmark is mostly
-   config + one adapter file.
-
-2. **Per-benchmark adapters** — one module per benchmark under `cat/bench/`.
-
-3. **WebArena criterion design** — run WebArena's built-in evaluator
-   (programmatic where possible) + LLM judge on final page state only for
-   ambiguous cases. Judge called **once at task end**, not per tool call.
-   Human eval on a sample of 50 trials as a publication-level sanity check.
-
-4. **Cross-domain analysis** — do failure attribution patterns differ by
-   domain? Does the circuit breaker fire more in some domains? Does the
-   skill library transfer across domains?
-
-5. **Publication** — write up the full v1.0-v2.0 story: theory, synthetic
-   proof, real benchmarks, cross-domain validation.
+Adapter framework: generic base class for connecting external benchmarks
+(task loader, capability wrapper, criterion mapper, grader adapter).
+One module per benchmark under `cat/bench/`.
 
 ---
 
-## v2.x — Open design questions (deferred)
+## v2.x — Open design questions (deferred, but real)
 
-- **Procedural memory / automaticity** — task classification + cued retrieval
-  of past DAGs as reusable skills. Brain analogy: declarative (in-context per
-  run) vs procedural (DAG corpus across runs). See DESIGN.md "Declarative vs
-  procedural memory" section. Predicted observable: token cost per task
-  drops on recurring patterns as the agent develops automaticity. Requires
-  v1.6 DAG infrastructure first.
-- **Cross-domain working memory via two-tier features** *(forward note from
-  1.7.0 v1 simulation, 2026-05-30)* — v1.7 builds the offline-RL + online-
-  search loop on swe10 (code domain). The framework GENERALIZES to other
-  domains (tau-bench, WebArena, OSWorld) only if the canonicalization
-  separates **domain-agnostic core features** from **domain-specific
-  extensions**. Concretely:
+These are not "we might do this" — they are **known taxes the framework is
+carrying** that need architectural answers when scale or domain demands it.
 
-  Domain-agnostic core (every domain populates these):
-    `obligation_hash`, `plan_idx`, `last_outcome`,
-    `durable_change_count`, `iter_since_durable_change`,
-    `verify_attempt_count`, `investigate_attempt_count`, `mutate_attempt_count`,
-    `n_unique_actions`, `action_intent ∈ {investigate, mutate, verify, other}`
+### Procedural memory / automaticity
 
-  Domain-specific extensions (sparse dict):
-    code-Python: `{workdir_sig, env_facts, last_bash_class}`
-    tau-bench:   `{api_endpoint_class, db_table_touched, ...}`
-    WebArena:    `{dom_section_class, last_form_id, ...}`
+Task classification + cued retrieval of past DAGs as reusable skills.
+Brain analogy: declarative (in-context per run) vs procedural (DAG corpus
+across runs). See DESIGN.md "Declarative vs procedural memory" section.
 
-  Each Capability registration declares an `intent` classification. The
-  CEGAR predicate tree then learns predicates over the domain-agnostic
-  features primarily — `verify_attempt_count > 3` would fire identically
-  in swe10 AND tau-bench, catching domain-independent failure modes (the
-  pytest-loop pattern, but generalized). The LIBRARIAN does cross-domain
-  *action-level* transfer via embedding; the predicate tree does cross-
-  domain *reasoning-pattern* transfer via shared features.
+Predicted observable: token cost per task drops on recurring patterns as
+the agent develops automaticity. Requires v1.7 DAG infrastructure first
+(now in place).
 
-  The minimum refactor (~50 lines) is queued as **task 1.7.0.x**, to land
-  AFTER v2 CEGAR splits validate the math on swe10. Bigger architecture
-  question — whether the cognitive layers (REPRESENT/STIPULATE/PERFORM/
-  VERIFY) themselves need cross-domain abstraction — deferred to v2.x
-  when a second domain creates pressure.
+### Cross-domain working memory via two-tier features
 
-- **Cost-efficiency optimization layer** *(forward note from 1.6.6.13)* —
-  the v1.7-tools cost-per-PASS analysis revealed three structural sources
-  of per-call cost inflation that no single fix at the loop layer cleanly
-  addresses:
-    1. **Static tool-schema overhead** — every performer LLM call carries
-       all 14 tool schemas (~1KB of JSON per call), even when the contract
-       only needs 3 of them. The fix is **capability granting at the
-       admission gate (Step 4)**: only register the tools the contract
-       genuinely requires. Requires understanding contract → required-tool
-       mapping, likely co-developed with 1.7.x procedural memory which
-       can learn this mapping from past DAGs.
-    2. **History accumulation through context** — by turn 10, the LLM
-       re-reads 9 prior tool results every call. CAT today has no
-       in-context compaction beyond gross turn-summary squashing. A real
-       fix needs **tool-result summarization at history-write time**
-       (replace verbose results with their salient fact once the agent
-       has moved on from them) — likely a new attestor-adjacent role.
-    3. **LLM tool-selection bias** — the LLM defaults to `read` (familiar)
-       over `outline` (cheaper, less familiar in pretraining), even when
-       outline would dominate. 1.6.6.14 patches this with a description
-       nudge, but the principled fix is **cost-aware multi-candidate
-       generation at Step 5b** (the Dijkstra ADVISOR could score
-       candidates partly on expected-bytes-out and not just on plan fit).
-  These three together form a coherent "cost-efficiency layer" — schema
-  granting (Step 4), history compaction (post-Step 7), and cost-aware
-  candidate scoring (Step 5b). All three want each other's infrastructure;
-  none ships before v1.7+/v1.8. The placeholder name is intentionally
-  bland: this is not premature optimization, it's a *known* tax we're
-  carrying that needs an architectural answer in v2.x.
-- **Speculative activation** — pre-activate capabilities while ELIGIBLE to
-  reduce latency.
-- **Contract markets** — auction protocol when multiple agents bid on a
-  contract.
-- **Persistence and distribution** — contracts that survive process restarts,
-  cross-agent handoff.
-- **Multi-agent** — multiple CAT agents collaborating on decomposed contracts.
+*(forward note from 1.7.0 v1 simulation, 2026-05-30)* — v1.7 builds the
+offline-RL + online-search loop on swe10 (code domain). The framework
+GENERALIZES to other domains (tau-bench, WebArena, OSWorld) only if the
+canonicalization separates **domain-agnostic core features** from
+**domain-specific extensions**.
+
+**Domain-agnostic core** (every domain populates):
+- `obligation_hash`, `plan_idx`, `last_outcome`
+- `durable_change_count`, `iter_since_durable_change`
+- `verify_attempt_count`, `investigate_attempt_count`, `mutate_attempt_count`
+- `n_unique_actions`, `action_intent ∈ {investigate, mutate, verify, other}`
+
+**Domain-specific extensions** (sparse dict):
+- code-Python: `{workdir_sig, env_facts, last_bash_class}`
+- tau-bench: `{api_endpoint_class, db_table_touched, ...}`
+- WebArena: `{dom_section_class, last_form_id, ...}`
+
+Each Capability registration declares an `intent` classification. The
+CEGAR predicate tree learns predicates over domain-agnostic features
+primarily — `verify_attempt_count > 3` fires identically in swe10 and
+tau-bench, catching domain-independent failure modes. LIBRARIAN does
+cross-domain *action-level* transfer via embedding; predicate tree does
+cross-domain *reasoning-pattern* transfer via shared features.
+
+The minimum refactor is queued as **v1.7.0.x** above. Bigger question
+(whether REPRESENT/STIPULATE/PERFORM/VERIFY themselves need cross-domain
+abstraction) — deferred to v2.x when a second domain creates pressure.
+
+### Cost-efficiency optimization layer
+
+*(forward note from 1.6.6.13)* — v1.7-tools cost analysis revealed three
+structural sources of per-call cost inflation:
+
+1. **Static tool-schema overhead** — every performer LLM call carries all
+   14 tool schemas (~1KB JSON), even when the contract only needs 3 of them.
+   Fix: **capability granting at the admission gate (Step 4)** — only
+   register tools the contract genuinely requires. Co-developed with v1.7
+   procedural memory (learns the contract → required-tool mapping).
+
+2. **History accumulation through context** — by turn 10, the LLM
+   re-reads 9 prior tool results every call. No in-context compaction
+   beyond gross turn-summary squashing. Fix: **tool-result summarization
+   at history-write time** (replace verbose results with their salient
+   fact once the agent has moved on).
+
+3. **LLM tool-selection bias** — LLM defaults to `read` (familiar) over
+   `outline` (cheaper). 1.6.6.14 patches with description nudge; the
+   principled fix is **cost-aware multi-candidate generation at Step 5b**
+   (ADVISOR scores partly on expected-bytes-out, not just plan fit).
+
+These three form a coherent "cost-efficiency layer" — schema granting,
+history compaction, cost-aware candidate scoring. None ships before v1.7+.
+
+### Speculative activation
+
+Pre-activate capabilities while ELIGIBLE to reduce latency. v3+ probably.
+
+### Contract markets
+
+Auction protocol when multiple agents bid on a contract. Only relevant
+if multi-agent (below) is real.
+
+### Persistence and distribution
+
+Contracts that survive process restarts; cross-agent handoff. Foundations
+already exist (the corpus is persistent storage); just needs the
+hand-off protocol.
+
+### Multi-agent
+
+Multiple CAT agents collaborating on decomposed contracts. Plausible
+v3 work; needs contract-as-message-format first.
 
 ---
 
@@ -1659,7 +470,7 @@ signals (aligned with OTel GenAI semantic conventions):
 |---|---|---|
 | `tokens_in/out` | `gen_ai.usage.input_tokens` | Primary cost driver |
 | `tokens_cache_read` | `gen_ai.usage.cache_read.*` | Prompt caching savings |
-| `llm_calls_by_role` | `gen_ai.operation` (extended) | Planner/executor/judge overhead split |
+| `llm_calls_by_role` | `gen_ai.operation` (extended) | Per-role overhead split |
 | `tool_calls_by_name` | `gen_ai.tool.name` | Which tools dominate |
 | `tool_errors` | — | Reliability signal |
 | `wall_s_llm / wall_s_tools` | `gen_ai.client.operation.duration` | Where time is spent |
@@ -1668,15 +479,25 @@ signals (aligned with OTel GenAI semantic conventions):
 | `criterion_checks` | CAT-specific | How often criterion evaluated |
 | `plan_completion_rate` | CAT-specific | Did executor follow the plan? |
 | `budget_*_used_pct` | CAT-specific | Budget utilization per constraint |
+| `tool_calls_per_task_avg` | CAT-specific (1.8.0) | Efficiency canary |
+| `tool_waste_count` | CAT-specific (1.8.0) | Tasks with redundant tool calls |
 
 ---
 
 ## References
 
-- LIFE-Harness: arxiv 2605.22166 (Xu et al. 2026)
+- LIFE-Harness: arxiv 2605.22166 (Xu et al. 2026) — absorbed v1.2, removed v1.5
 - tau-bench: arxiv 2406.12045 (Yao et al. 2024), github.com/sierra-research/tau-bench
 - SWE-bench: github.com/princeton-nlp/SWE-bench
 - AgentBench: github.com/THUDM/AgentBench (ICLR 2024)
 - WebArena: github.com/web-arena-x/webarena
 - OSWorld: github.com/xlang-ai/OSWorld
 - Spider 2.0: arxiv 2411.07763, github.com/xlang-ai/Spider2
+- Pi agent: github.com/earendil-works/pi
+- Hermes Agent (Nous Research): github.com/NousResearch/hermes-agent
+- Claude Code tools reference: code.claude.com/docs/en/tools-reference
+- TriCEGAR (predicate-tree CEGAR for agent traces): arxiv (cited in v1.7.0)
+- Ferns/Precup — Bisimulation Metrics are Optimal Value Functions, UAI 2014
+- Step-Level Q-Value Models (Zhai et al., AAAI 2025): arxiv 2409.09345
+- Graph Memory + RL: arxiv 2511.07800
+- MACLA (hierarchical procedural memory): arxiv 2512.18950
