@@ -380,7 +380,7 @@ class ActivatorV2(Activator):
             oc, attention_node.phase_name, attention_node.intent, run.run_counts  # type: ignore[attr-defined]
         )
 
-        # Surprise vector
+        # Surprise vector (mechanical signals only)
         sv = compute_surprise(
             expects=attention_node.expects,
             actual_cost=float(actual_cost),
@@ -388,7 +388,25 @@ class ActivatorV2(Activator):
             actual_files_modified=actual_files,
         )
 
-        # Record surprise event
+        # AUTHORITY: attestor on the current attention node decides "step done?"
+        # This MUST run before the trace event so attestor_reason is captured.
+        attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
+        sv.details["attestor_reason"] = attestor_reason
+        sv.details["attestor_done"] = "yes" if attestor_done else "no"
+
+        # Combine attestor + mechanical:
+        # - attestor=YES is sufficient
+        # - attestor=NO but strong mechanical evidence (mutate hit expected files,
+        #   or verify saw expected outcome) can override
+        if attestor_done:
+            step_done = True
+        elif self._mechanical_evidence_strong(attention_node, sv):
+            step_done = True
+            sv.details["override"] = "mechanical evidence overrode attestor=NO"
+        else:
+            step_done = False
+
+        # Record surprise event (now includes attestor verdict)
         self.recorder.append(TraceEvent(
             event_id=f"sup-{uuid.uuid4().hex[:6]}",
             parent_id=run.last_perform_event_id or run.last_iter_anchor,
@@ -399,6 +417,7 @@ class ActivatorV2(Activator):
                 "attention_id": attention_node.id,
                 "state_now": state_now_class,
                 "state_next": state_next_class,
+                "step_done": step_done,
                 **sv.to_dict(),
             },
         ))
@@ -418,24 +437,6 @@ class ActivatorV2(Activator):
                 )
             except Exception:
                 pass
-
-        # AUTHORITY: call attestor on the current attention node to decide
-        # whether the step is complete. This replaces the per-intent heuristic
-        # as primary; heuristic still serves as the empty-tool-result short-circuit.
-        attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
-        sv.details["attestor_reason"] = attestor_reason
-
-        # Combine attestor + mechanical:
-        # - attestor=YES is sufficient
-        # - attestor=NO but strong mechanical evidence (mutate hit expected files,
-        #   or verify saw expected outcome) can override
-        if attestor_done:
-            step_done = True
-        elif self._mechanical_evidence_strong(attention_node, sv):
-            step_done = True
-            sv.details["override"] = "mechanical evidence overrode attestor=NO"
-        else:
-            step_done = False
 
         if step_done:
             self._default_advance(plan_tree, attention_node, run)
