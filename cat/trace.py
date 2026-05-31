@@ -35,6 +35,16 @@ EventKind = Literal[
     "capability_perform",      # Step 6 PERFORM: one performance act (was: capability_invoke)
     "election",                # v1.7 A.2 ADVISOR+ELECTION: math arbitrated between candidates
     "librarian_hint",          # v1.7 A.1 advisory hint was injected into performer context
+    # v2 (iteration loop redesign) — plan tree events
+    "plan_commit",
+    "plan_checkout",
+    "plan_drop",
+    "plan_commit_new",
+    "plan_refine",
+    "plan_branch",
+    "plan_merge",
+    "surprise",                # surprise vector at end-of-iter
+    "stipulate_inloop",        # in-loop re-stipulate fired
     # Legacy aliases (kept readable for pre-rename traces):
     "contract_decompose",      # legacy alias for contract_stipulate
     "capability_invoke",       # legacy alias for capability_perform

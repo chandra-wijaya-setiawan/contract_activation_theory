@@ -355,8 +355,12 @@ Rules:
   verifier_outcome=PASS.
 - If ENVIRONMENT provides an INITIAL_TEST_FAILURE, use it to make mutate \
   steps SPECIFIC: name the exact function, the exact field, the exact value.
-- Plans should be 8-20 steps across 3-5 phases. Brief tasks may be smaller; \
-  do not pad.
+- Plans should be 8-20 steps across 3-5 phases (typically 4-6 MAP + 1-2 \
+  DESIGN + 2-5 IMPLEMENT + 1-2 VERIFY). Tasks like "add SSL env vars to \
+  postgres dbshell client" need at minimum: read the client.py, read the \
+  base client.py, read the test_postgresql.py, identify the env-var \
+  mapping, decide return-type, edit the function, run the test. That's \
+  7+ steps. Brief tasks may be smaller; do not pad.
 - DO NOT execute anything. DO NOT include reasoning. Output ONLY the JSON.
 
 Output a JSON object with this exact shape:

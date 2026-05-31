@@ -283,15 +283,40 @@ class TbCatAgent(BaseAgent):
                     print(f"warning: librarian init failed ({exc}); continuing without advisor")
                     librarian = None
 
-            activator = Activator(
-                llm=llm,
-                registry=registry,
-                recorder=recorder,
-                max_iterations=self._max_iterations,
-                criterion_check_interval=self._criterion_check_interval,
-                window_size=self._window_size,
-                librarian=librarian,
-            )
+            # v2 (iteration_loop_redesign): use ActivatorV2 when CAT_V2=1
+            use_v2 = os.environ.get("CAT_V2", "0") == "1"
+            if use_v2:
+                from cat.activator_v2 import ActivatorV2
+                # v2 librarian: persistent plan trees + edges across tasks
+                librarian_v2 = None
+                v2_db = os.environ.get("CAT_LIBRARIAN_V2_DB", "").strip()
+                if v2_db:
+                    try:
+                        from cat.librarian_v2 import LibrarianV2
+                        librarian_v2 = LibrarianV2(v2_db)
+                    except Exception as exc:
+                        print(f"warning: librarian_v2 init failed ({exc}); continuing without it")
+                        librarian_v2 = None
+                activator = ActivatorV2(
+                    llm=llm,
+                    registry=registry,
+                    recorder=recorder,
+                    max_iterations=self._max_iterations,
+                    criterion_check_interval=self._criterion_check_interval,
+                    window_size=self._window_size,
+                    librarian=librarian,
+                    librarian_writer=librarian_v2,
+                )
+            else:
+                activator = Activator(
+                    llm=llm,
+                    registry=registry,
+                    recorder=recorder,
+                    max_iterations=self._max_iterations,
+                    criterion_check_interval=self._criterion_check_interval,
+                    window_size=self._window_size,
+                    librarian=librarian,
+                )
             activator.run(contract, state)
 
         if isinstance(recorder, Recorder):
