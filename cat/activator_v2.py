@@ -202,7 +202,37 @@ class ActivatorV2(Activator):
 
             # ACTION (Step 5+6: SELECT + PERFORM)
             keep_going = self._perform_once(contract, state, run)
+            cost_after = contract.cost.tokens_in + contract.cost.tokens_out
+            actual_cost = cost_after - cost_before
+
             if not keep_going:
+                # Defensive: distinguish a REAL "DONE" signal from a degenerate
+                # LLM response (zero tokens, no text, no tool calls). The former
+                # is the LLM saying it's finished; the latter is a transient
+                # API error (rate limit, content filter, etc.) and should NOT
+                # terminate the contract.
+                degenerate = (actual_cost == 0) and not (run.final_text or "").strip()
+                if degenerate:
+                    # Treat as transient — emit a trace event, force-advance
+                    # attention (so we don't loop here forever), and continue
+                    self.recorder.append(TraceEvent(
+                        event_id=f"err-{uuid.uuid4().hex[:6]}",
+                        parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                        ts=utcnow_iso(),
+                        kind="surprise",
+                        payload={
+                            "iter": run.iterations,
+                            "error": "degenerate_llm_response",
+                            "note": "performer returned 0 tokens / no text / no tools; treating as transient",
+                        },
+                    ))
+                    if plan_tree and attention_node:
+                        self._default_advance(plan_tree, attention_node, run)
+                    # Reset run.final_text so v1 doesn't think we exited
+                    run.final_text = None
+                    # Don't break — continue the loop
+                    continue
+                # Real DONE: check criteria + terminate
                 if self._verify_criteria(contract, state, run):
                     self._transition(contract, ContractState.FULFILLED,
                                      "executor stopped and criteria satisfied", run)
@@ -211,9 +241,6 @@ class ActivatorV2(Activator):
                                      "executor stopped before criteria satisfied", run)
                     run.failure_reason = "executor_quit_early"
                 break
-
-            cost_after = contract.cost.tokens_in + contract.cost.tokens_out
-            actual_cost = cost_after - cost_before
 
             # OBSERVE phase — wrapped to guarantee loop continues even if helpers fail
             try:
@@ -502,7 +529,8 @@ class ActivatorV2(Activator):
         """Call the attestor on the current attention node + recent evidence.
 
         Authority for step-done. Returns (complete: bool, reason: str).
-        Errors are swallowed (returns False, reason explaining the error).
+        Errors / degenerate responses fall back to False (step not done)
+        so the loop continues safely rather than crashing or false-committing.
         """
         try:
             # State summary: last few tool outputs + assistant text
@@ -517,7 +545,7 @@ class ActivatorV2(Activator):
                     break
             state_summary = "\n---\n".join(reversed(recent_tool_msgs)) or "(no tool output yet)"
             # Add expects hint to the description for attestor's reference
-            expects = attention_node.expects or {}
+            expects = attention_node.expects if isinstance(attention_node.expects, dict) else {}
             extended_desc = (
                 f"{attention_node.description}\n"
                 f"  expected durable_change: {expects.get('durable_change', False)}; "
@@ -531,6 +559,12 @@ class ActivatorV2(Activator):
                 parent_event_id=run.last_perform_event_id or run.last_iter_anchor,
             )
             self._charge_llm(contract, llm_result)
+            # Degenerate attestor response (no tokens) → conservative False
+            if llm_result is None or (
+                getattr(llm_result, "tokens_in", 0) == 0
+                and getattr(llm_result, "tokens_out", 0) == 0
+            ):
+                return False, "attestor returned empty response (fallback)"
             return bool(complete), (reason or "")[:300]
         except Exception as e:
             return False, f"attestor error: {e}"[:300]
@@ -626,17 +660,23 @@ class ActivatorV2(Activator):
         state_summary = f"state_class={state_now_class[:8]}"
         recent_trace = self._recent_trace_text(run, n_iters=3)
 
-        ops, llm_result = call_stipulator_inloop(
-            self.llm,
-            contract.obligation,
-            plan_tree_outline=outline,
-            attention_id=attention_id,
-            state_class_summary=state_summary,
-            recent_trace=recent_trace,
-            surprise_dims=surprise.to_dict(),
-            parent_event_id=run.last_perform_event_id or run.last_iter_anchor,
-        )
-        self._charge_llm(contract, llm_result)
+        try:
+            ops, llm_result = call_stipulator_inloop(
+                self.llm,
+                contract.obligation,
+                plan_tree_outline=outline,
+                attention_id=attention_id,
+                state_class_summary=state_summary,
+                recent_trace=recent_trace,
+                surprise_dims=surprise.to_dict(),
+                parent_event_id=run.last_perform_event_id or run.last_iter_anchor,
+            )
+        except Exception as e:
+            # Fallback: don't crash on LLM failure
+            return 0
+        if llm_result is not None:
+            self._charge_llm(contract, llm_result)
+        ops = ops or []  # ensure never None downstream
 
         # Emit a trace event for the in-loop call
         self.recorder.append(TraceEvent(
