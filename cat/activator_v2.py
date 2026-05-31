@@ -418,12 +418,16 @@ class ActivatorV2(Activator):
         attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
         sv.details["attestor_reason"] = attestor_reason
 
-        # Combine: attestor=YES is sufficient; otherwise fall back to per-intent heuristic
+        # Combine attestor + mechanical:
+        # - attestor=YES is sufficient
+        # - attestor=NO but strong mechanical evidence (mutate hit expected files,
+        #   or verify saw expected outcome) can override
         if attestor_done:
             step_done = True
+        elif self._mechanical_evidence_strong(attention_node, sv):
+            step_done = True
+            sv.details["override"] = "mechanical evidence overrode attestor=NO"
         else:
-            # Attestor said NO. Still allow step_appears_done to override
-            # ONLY if it's a strong positive (verifier/durable match for mutate/verify).
             step_done = False
 
         if step_done:
@@ -443,6 +447,26 @@ class ActivatorV2(Activator):
             run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
             if run._stall_count[att_id] >= 3:
                 self._default_advance(plan_tree, attention_node, run)
+
+    def _mechanical_evidence_strong(self, attention_node, sv: SurpriseVector) -> bool:
+        """Override-attestor-NO when mechanical signals are unambiguously positive.
+
+        - mutate intent: durable_match AND files_match AND expected_durable=True
+        - verify intent: verifier_match AND expects.verifier_outcome in {"PASS","FAIL"}
+        For investigate / design / other intents, attestor remains authoritative.
+        """
+        intent = getattr(attention_node, "intent", "other")
+        expects = attention_node.expects or {}
+        if intent == "mutate":
+            return (
+                bool(expects.get("durable_change", False))
+                and sv.durable_match
+                and sv.files_match
+            )
+        if intent == "verify":
+            expected_v = expects.get("verifier_outcome", "N/A")
+            return expected_v in ("PASS", "FAIL") and sv.verifier_match
+        return False
 
     def _attestor_verdict(
         self, contract: Contract, run: ActivatorRun, attention_node,
