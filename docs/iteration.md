@@ -311,13 +311,52 @@ PLAN is deterministic by default, with ONE conditional LLM escape:
 | steady (no surprise, forecast OK) | **2** | Performer + Attestor |
 | surprise in OBSERVE | **3** | Performer + Attestor + Stipulator-in-loop |
 | bad forecast in PLAN | **3** | Stipulator-in-loop + Performer + Attestor |
-| both | **4** | Performer + Attestor + Stipulator-in-loop ×2 |
+| stall escalation (Resolver fires) | **3** | Performer + Attestor + Resolver (LLM) |
+| stall + restipulate decision | **4** | Performer + Attestor + Resolver + Stipulator-in-loop |
+| stall + give_up | terminates | (no further iters) |
 
 The deliberate omission is "Plan-reasoner LLM" — an unconditional LLM call
 in PLAN that re-reasons about the upcoming step. We don't have it because:
 (a) the step.description IS the LLM's prior reasoning emitted at Stipulate
 time, (b) the Performer implicitly imagines before emitting the tool call,
 (c) adding an unconditional 3rd LLM call would inflate steady-state cost.
+
+### Stall escalation — the Resolver
+
+When `step_done = False` for `stall_threshold` (default 3) iters on the
+same attention node, the inner loop **escalates to a Resolver** instead of
+silently force-advancing.
+
+```
+Resolver receives StallContext:
+  attention node + intent + phase + expects
+  surprise_dims (the 7-dimension vector)
+  stall_count, restip_count, backward_count
+  recent tool activity (last 3-5 iters)
+  plan tree outline
+  obligation brief
+  state_now_class
+
+Resolver returns ResolverDecision ∈ {forward, restipulate, backward, give_up}
+```
+
+| Decision | Action |
+|---|---|
+| `forward` | force-COMMIT current + advance attention (today's force-advance, but explicit) |
+| `restipulate` | call Stipulator-in-loop with surprise context |
+| `backward` | DROP current subtree + restore attention to last completed mutate ancestor |
+| `give_up` | mark contract FAILED with reason `"resolver_gave_up_at_<X>"` |
+
+**Pluggable**: `Resolver` is an ABC. Default is `LLMResolver` (small focused
+LLM call). For tests use `StubResolver(fixed)`. For cold-start/no-LLM, use
+`HeuristicResolver`.
+
+**Configurable thresholds** on `ActivatorV2`:
+- `stall_threshold` (default 3) — iters on same node before escalation
+- `max_restip_per_task` (default 5) — cap on Stipulator-in-loop calls
+- `max_backwards_per_task` (default 2) — cap on backward restorations
+
+Source: `cat/resolver.py`. Wired into `_observe_phase` in `cat/activator_v2.py`.
 
 ---
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from cat.activator import Activator, ActivatorRun, _PlanStep, PERFORMER_SYSTEM_PROMPT
 from cat.contracts import Contract, ContractState, State
@@ -49,12 +49,22 @@ class ActivatorV2(Activator):
         self,
         *args,
         max_restip_per_task: int = 5,
+        stall_threshold: int = 3,
+        max_backwards_per_task: int = 2,
+        resolver: "Optional[Any]" = None,
         librarian_writer=None,  # optional: object with .record_edge / .record_plan_tree
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.max_restip_per_task = max_restip_per_task
+        self.stall_threshold = stall_threshold
+        self.max_backwards_per_task = max_backwards_per_task
         self.librarian_writer = librarian_writer
+        # Default resolver is LLMResolver if not provided
+        if resolver is None:
+            from cat.resolver import LLMResolver
+            resolver = LLMResolver(self.llm)
+        self.resolver = resolver
 
     def run(self, contract: Contract, state: State) -> ActivatorRun:
         """v2 discharge loop."""
@@ -468,23 +478,206 @@ class ActivatorV2(Activator):
             except Exception:
                 pass
 
+        # Track stall count per attention node (resets when attention moves)
+        att_id = attention_node.id
+        run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
+        run.backward_count = getattr(run, "backward_count", 0)  # type: ignore[attr-defined]
+
         if step_done:
+            # Natural progress — COMMIT + advance
             self._default_advance(plan_tree, attention_node, run)
-        elif sv.any_surprised and getattr(run, "restip_count", 0) < self.max_restip_per_task:
+            run._stall_count[att_id] = 0
+            return
+
+        # Step is NOT done. Increment stall counter for this node.
+        run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
+        below_stall_threshold = run._stall_count[att_id] < self.stall_threshold
+
+        if below_stall_threshold:
+            # Below threshold → let the LLM (Performer) take another shot
+            # at the same attention next iter. No Resolver call yet.
+            return
+
+        # Stall threshold hit — ESCALATE to Resolver
+        decision = self._invoke_resolver(
+            contract, run, plan_tree, attention_node, sv, state_now_class,
+        )
+        self._apply_resolver_decision(
+            contract, run, plan_tree, attention_node, decision, sv, state_now_class,
+        )
+
+    def _invoke_resolver(
+        self,
+        contract: Contract,
+        run: ActivatorRun,
+        plan_tree: PlanTree,
+        attention_node,
+        sv: SurpriseVector,
+        state_now_class: str,
+    ):
+        """Build a StallContext and invoke the configured Resolver."""
+        from cat.resolver import StallContext
+
+        recent: list[dict[str, Any]] = []
+        # Pull last few assistant→tool pairs from message history
+        for i in range(len(run.messages) - 1, -1, -1):
+            m = run.messages[i]
+            if m.get("role") == "tool" and len(recent) < 5:
+                content = m.get("content", "") or ""
+                recent.append({
+                    "tool": "?",
+                    "args": "",
+                    "output_summary": content[:120] if isinstance(content, str) else "",
+                })
+        recent.reverse()
+
+        ctx = StallContext(
+            attention_node_id=attention_node.id,
+            attention_description=attention_node.description,
+            attention_intent=attention_node.intent,
+            attention_phase=attention_node.phase_name,
+            expects=attention_node.expects if isinstance(attention_node.expects, dict) else {},
+            surprise_dims=sv.to_dict(),
+            stall_count=run._stall_count.get(attention_node.id, 0),  # type: ignore[attr-defined]
+            restip_count=getattr(run, "restip_count", 0),
+            plan_tree_outline=plan_tree.render_outline(),
+            recent_tool_calls=recent,
+            obligation_brief=(contract.obligation or "")[:500],
+            state_now_class=state_now_class,
+        )
+
+        try:
+            decision = self.resolver.resolve(ctx)
+        except Exception:
+            decision = "forward"  # safest fallback
+
+        # Trace event for the escalation
+        self.recorder.append(TraceEvent(
+            event_id=f"res-{uuid.uuid4().hex[:6]}",
+            parent_id=run.last_perform_event_id or run.last_iter_anchor,
+            ts=utcnow_iso(),
+            kind="surprise",
+            payload={
+                "iter": run.iterations,
+                "resolver_escalation": True,
+                "attention_id": attention_node.id,
+                "stall_count": run._stall_count.get(attention_node.id, 0),  # type: ignore[attr-defined]
+                "decision": decision,
+            },
+        ))
+        return decision
+
+    def _apply_resolver_decision(
+        self,
+        contract: Contract,
+        run: ActivatorRun,
+        plan_tree: PlanTree,
+        attention_node,
+        decision: str,
+        sv: SurpriseVector,
+        state_now_class: str,
+    ) -> None:
+        """Translate the Resolver's decision into concrete actions."""
+        att_id = attention_node.id
+
+        if decision == "forward":
+            # Force COMMIT + advance, same as if step was done
+            self._default_advance(plan_tree, attention_node, run)
+            run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+
+        elif decision == "restipulate":
+            if getattr(run, "restip_count", 0) >= self.max_restip_per_task:
+                # Cap hit — fall back to forward
+                self._default_advance(plan_tree, attention_node, run)
+                run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+                return
             ops_applied = self._run_inloop_stipulate(contract, run, plan_tree, sv, state_now_class)
             run.restip_count = getattr(run, "restip_count", 0) + 1  # type: ignore[attr-defined]
             if ops_applied == 0:
-                att_id = attention_node.id
-                run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
-                run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
-                if run._stall_count[att_id] >= 3:
-                    self._default_advance(plan_tree, attention_node, run)
-        else:
-            att_id = attention_node.id
-            run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
-            run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
-            if run._stall_count[att_id] >= 3:
+                # Re-stipulate returned nothing — force forward
                 self._default_advance(plan_tree, attention_node, run)
+                run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+            else:
+                # Successfully applied ops — reset stall counter for current attention
+                if plan_tree.attention_id and plan_tree.attention_id in plan_tree.nodes:
+                    run._stall_count[plan_tree.attention_id] = 0  # type: ignore[attr-defined]
+
+        elif decision == "backward":
+            if getattr(run, "backward_count", 0) >= self.max_backwards_per_task:
+                # Backward cap hit — fall back to forward
+                self._default_advance(plan_tree, attention_node, run)
+                run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+                return
+            self._apply_backward(plan_tree, attention_node, run)
+            run.backward_count = getattr(run, "backward_count", 0) + 1  # type: ignore[attr-defined]
+            run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+
+        elif decision == "give_up":
+            # Mark contract FAILED with explicit reason
+            self._transition(
+                contract, ContractState.FAILED,
+                f"resolver gave up at {att_id} after {run._stall_count[att_id]} iters",  # type: ignore[attr-defined]
+                run,
+            )
+            run.failure_reason = f"resolver_gave_up_at_{att_id}"
+
+        else:
+            # Unknown decision — treat as forward to keep loop progressing
+            self._default_advance(plan_tree, attention_node, run)
+            run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+
+    def _apply_backward(self, plan_tree: PlanTree, attention_node, run: ActivatorRun) -> None:
+        """Backward op: DROP the current subtree, restore attention to the
+        last completed mutate ancestor (or root if none)."""
+        # Find last completed mutate node before current attention
+        target_id: Optional[str] = None
+        order: list[str] = []
+        for phase_id in plan_tree.phase_order:
+            for child_id in plan_tree.nodes[phase_id].children:
+                order.append(child_id)
+        try:
+            cur_idx = order.index(attention_node.id) if attention_node.id in order else len(order)
+        except ValueError:
+            cur_idx = len(order)
+        for nid in order[:cur_idx][::-1]:
+            n = plan_tree.nodes[nid]
+            if n.status == "complete" and n.intent == "mutate":
+                target_id = nid
+                break
+        # DROP current
+        plan_tree.apply_op(
+            TreeEditOp(
+                op="DROP",
+                payload={"node_id": attention_node.id, "reason": "resolver: backward"},
+                reflection="resolver: backward — current subtree abandoned",
+            ),
+            iter_n=run.iterations,
+        )
+        self.recorder.append(TraceEvent(
+            event_id=f"pl-{uuid.uuid4().hex[:6]}",
+            parent_id=run.last_perform_event_id or run.last_iter_anchor,
+            ts=utcnow_iso(),
+            kind="plan_drop",
+            payload={"node_id": attention_node.id, "reason": "resolver: backward",
+                     "reflection": "resolver: backward — current subtree abandoned"},
+        ))
+        # If we found a mutate ancestor, advance to next pending leaf after it
+        if target_id:
+            # Reset attention by advancing from target_id's position
+            nxt = plan_tree._next_pending_leaf_after(target_id)
+            if nxt and nxt in plan_tree.nodes:
+                plan_tree.nodes[nxt].status = "active"
+                plan_tree.attention_id = nxt
+                self.recorder.append(TraceEvent(
+                    event_id=f"pl-{uuid.uuid4().hex[:6]}",
+                    parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                    ts=utcnow_iso(),
+                    kind="plan_checkout",
+                    payload={"node_id": nxt, "reflection": "resolver: backward — restored attention"},
+                ))
+                return
+        # No mutate ancestor — advance to next pending leaf overall
+        plan_tree.advance_attention()
 
     def _mechanical_evidence_strong(self, attention_node, sv: SurpriseVector) -> bool:
         """Override-attestor-NO when mechanical signals are unambiguously positive.
