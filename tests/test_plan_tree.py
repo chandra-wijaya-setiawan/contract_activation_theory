@@ -218,3 +218,53 @@ def test_unknown_op():
     ok, err = tree.apply_op(TreeEditOp("WHIMSY", {}, ""))
     assert not ok
     assert "unknown" in err
+
+
+def test_malformed_expects_string_coerced():
+    """Regression: LLM may emit `expects` as a string. Should coerce to {}."""
+    bad_plan = {
+        "phases": [{"name": "MAP", "steps": [
+            {"description": "x", "intent": "investigate", "expects": "not-a-dict"}
+        ]}]
+    }
+    tree = PlanTree.from_phased_plan(bad_plan)
+    assert tree.nodes["A1"].expects == {}
+
+
+def test_refine_with_string_substep_skipped():
+    """Regression: REFINE with substeps that are strings (not dicts) should not crash."""
+    tree = PlanTree.from_phased_plan(SAMPLE_PLAN)
+    ok, err = tree.apply_op(TreeEditOp("REFINE", {
+        "node_id": "A1",
+        "substeps": ["string_not_dict", {"description": "real", "intent": "investigate"}],
+    }, "test"))
+    assert ok, err
+    # Only the valid substep should be added
+    assert "A1.1" in tree.nodes
+    assert tree.nodes["A1.1"].description == "real"
+    assert "A1.2" not in tree.nodes
+
+
+def test_branch_with_string_alt_step_filtered():
+    """Regression: BRANCH with non-dict alt_step items should be filtered."""
+    tree = PlanTree.from_phased_plan(SAMPLE_PLAN)
+    # Need A1 to not be branched at root; checkout to a leaf first
+    tree.apply_op(TreeEditOp("COMMIT", {"node_id": "A1", "reason": ""}, ""))
+    tree.apply_op(TreeEditOp("COMMIT", {"node_id": "A2", "reason": ""}, ""))
+    tree.apply_op(TreeEditOp("CHECKOUT", {"node_id": "B1"}, ""))
+    ok, err = tree.apply_op(TreeEditOp("BRANCH", {
+        "node_id": "B1",
+        "alt_steps": ["bad", {"description": "good alt", "intent": "mutate"}],
+    }, "test"))
+    assert ok, err
+
+
+def test_commit_new_rejects_string_new_step():
+    """Regression: COMMIT_NEW with new_step as string should reject, not crash."""
+    tree = PlanTree.from_phased_plan(SAMPLE_PLAN)
+    ok, err = tree.apply_op(TreeEditOp("COMMIT_NEW", {
+        "parent_id": "A",
+        "new_step": "string-not-dict",
+    }, "test"))
+    assert not ok
+    assert "dict" in err.lower()

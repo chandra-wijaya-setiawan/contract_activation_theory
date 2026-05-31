@@ -83,21 +83,26 @@ Total est ~1000 LOC. Aggressive.
 - Fix landed: `_step_appears_done` per-intent heuristic + stall-counter
 - Committed.
 
-### M5 — in-loop Stipulator + swe3 ✓ (architecturally; running validation)
-- In-loop Stipulator already integrated into ActivatorV2 in M4
-- swe3 running with chronological persistent librarian: sphinx-10323,
-  django-10880, django-11239
+### M5 — in-loop Stipulator + swe3 ✓
+- swe3 ran: **1/3 PASS** (sphinx-10323 ✓; django-10880, django-11239 ✗)
+- Tokens used: 211K vs 545K baseline equivalent → ~60% reduction
+- Telemetry across the run: 23 surprises, 6 restipulates, 16 commits, 2 drops, 1 refine, 2 commit_news
+- Found + fixed `'str object has no attribute get'` bug: malformed `expects`
+  field from in-loop LLM was passed through. Defensive isinstance() coerce
+  in plan_tree.py for from_phased_plan, COMMIT_NEW, REFINE, BRANCH.
 
-### M6 — librarian writes + chronological swe10
-- `cat/librarian_v2.py` written, 5/5 unit tests green
-- Persistent SQLite DB at `data/librarian_v2/v2.db`
-- Read (templates + anti-templates) wired into Stipulator cold-start
-- Write (plan_trees + edges) wired into ActivatorV2 finalization
-- swe10 to follow swe3
+### M6 — librarian writes + chronological swe10 (running)
+- `cat/librarian_v2.py` 5/5 unit tests green
+- Persistent SQLite at `data/librarian_v2/v2.db`
+- Plan-tree write + edge write per iter wired
+- Cold-start Stipulate sees prior PASS+FAIL templates by obligation_class
+- swe10 launched concurrency=3, persistent librarian
 
 ### M7 — comparison
 - `scripts/compare_v2_vs_baseline.py` written
 - Baseline: v1.7 A.2 fixed at 8/10
+- swe3 partial result: -7 vs proportional baseline (1/3 vs 8/10) but at
+  much lower token cost
 
 ## Risk log
 
