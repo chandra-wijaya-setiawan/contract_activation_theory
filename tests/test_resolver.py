@@ -30,7 +30,7 @@ def _mk_ctx(**overrides) -> StallContext:
             "state_match": True,
         },
         stall_count=3,
-        restip_count=1,
+        patch_plan_count=1,
         plan_tree_outline="A1 [x] read\nC1 [>] edit\nD1 [ ] verify",
         recent_tool_calls=[
             {"tool": "read", "args": {"path": "foo.py"}, "output_summary": "got file"},
@@ -77,7 +77,7 @@ def test_stub_resolver_default_forward():
 
 def test_heuristic_forward_at_restip_cap():
     r = HeuristicResolver()
-    out = r.resolve(_mk_ctx(restip_count=5))
+    out = r.resolve(_mk_ctx(patch_plan_count=5))
     assert out.decision == "forward"
 
 
@@ -86,47 +86,47 @@ def test_heuristic_backward_on_verify_fail():
     out = r.resolve(_mk_ctx(
         attention_intent="verify",
         surprise_dims={"verifier_match": False, "any_surprised": True},
-        restip_count=2,
+        patch_plan_count=2,
     ))
     assert out.decision == "backward"
 
 
 def test_heuristic_give_up_on_long_stall():
     r = HeuristicResolver()
-    out = r.resolve(_mk_ctx(stall_count=6, restip_count=2))
+    out = r.resolve(_mk_ctx(stall_count=6, patch_plan_count=2))
     assert out.decision == "give_up"
 
 
-def test_heuristic_restipulate_default():
+def test_heuristic_patch_plan_default():
     r = HeuristicResolver()
-    out = r.resolve(_mk_ctx(stall_count=3, restip_count=1, attention_intent="investigate",
+    out = r.resolve(_mk_ctx(stall_count=3, patch_plan_count=1, attention_intent="investigate",
                              intent_tool_counts={"investigate": 3, "mutate": 0}))
-    assert out.decision == "restipulate"
+    assert out.decision == "patch_plan"
 
 
 def test_heuristic_mutate_no_mutate_tool_gives_directive():
-    """Heuristic should restipulate with a directive when mutate-intent + 0 mutate tools."""
+    """Heuristic should patch_plan with a directive when mutate-intent + 0 mutate tools."""
     r = HeuristicResolver()
     out = r.resolve(_mk_ctx(
         attention_intent="mutate",
         intent_tool_counts={"investigate": 5, "mutate": 0},
-        restip_count=2,
+        patch_plan_count=2,
     ))
-    assert out.decision == "restipulate"
+    assert out.decision == "patch_plan"
     assert "str_replace" in out.next_instruction or "write" in out.next_instruction
 
 
 # === Deterministic guards ===============================================
 
 def test_guard_overrides_forward_on_unmutated_mutate():
-    """forward on mutate step with 0 mutate tools → restipulate."""
+    """forward on mutate step with 0 mutate tools → patch_plan."""
     out = ResolverOutput(decision="forward", reason="LLM said done")
     ctx = _mk_ctx(
         attention_intent="mutate",
         intent_tool_counts={"investigate": 5, "mutate": 0},
     )
     guarded = enforce_guards(out, ctx)
-    assert guarded.decision == "restipulate"
+    assert guarded.decision == "patch_plan"
     assert "GUARD" in guarded.reason
     assert "str_replace" in guarded.next_instruction
 
@@ -143,20 +143,20 @@ def test_guard_allows_forward_on_mutate_with_mutate_tool():
 
 
 def test_guard_overrides_forward_on_verify_fail():
-    """forward on verify step with verifier_match=False → restipulate."""
+    """forward on verify step with verifier_match=False → patch_plan."""
     out = ResolverOutput(decision="forward", reason="LLM said done")
     ctx = _mk_ctx(
         attention_intent="verify",
         surprise_dims={"verifier_match": False, "any_surprised": True},
     )
     guarded = enforce_guards(out, ctx)
-    assert guarded.decision == "restipulate"
+    assert guarded.decision == "patch_plan"
     assert "GUARD" in guarded.reason
 
 
 def test_guard_preserves_non_forward_decisions():
-    """Guards don't touch backward / restipulate / give_up."""
-    for d in ("backward", "restipulate", "give_up"):
+    """Guards don't touch backward / patch_plan / give_up."""
+    for d in ("backward", "patch_plan", "give_up"):
         out = ResolverOutput(decision=d, reason="x")
         # Use any context where guards might apply if d were forward
         ctx = _mk_ctx(attention_intent="mutate", intent_tool_counts={"mutate": 0})
@@ -173,7 +173,7 @@ def test_guard_preserves_existing_next_instruction():
     )
     ctx = _mk_ctx(attention_intent="mutate", intent_tool_counts={"mutate": 0})
     guarded = enforce_guards(out, ctx)
-    assert guarded.decision == "restipulate"
+    assert guarded.decision == "patch_plan"
     assert guarded.next_instruction == "LLM's directive"  # preserved
 
 
@@ -203,14 +203,14 @@ def test_stall_context_payload_includes_attestor_history():
 def test_llm_resolver_parses_full_output():
     llm = MagicMock()
     llm.chat.return_value = MagicMock(text=json.dumps({
-        "decision": "restipulate",
+        "decision": "patch_plan",
         "reason": "missing edit",
         "diagnosis": "agent searched but never edited",
         "next_instruction": "Use str_replace on /testbed/foo.py",
     }))
     r = LLMResolver(llm)
     out = r.resolve(_mk_ctx())
-    assert out.decision == "restipulate"
+    assert out.decision == "patch_plan"
     assert out.reason == "missing edit"
     assert "searched but never edited" in out.diagnosis
     assert "str_replace" in out.next_instruction
@@ -221,7 +221,7 @@ def test_llm_resolver_falls_back_on_invalid_json():
     llm.chat.return_value = MagicMock(text="{not valid")
     r = LLMResolver(llm)
     out = r.resolve(_mk_ctx())
-    assert out.decision in ("forward", "restipulate", "backward", "give_up")
+    assert out.decision in ("forward", "patch_plan", "backward", "give_up")
 
 
 def test_llm_resolver_falls_back_on_empty():
@@ -229,7 +229,7 @@ def test_llm_resolver_falls_back_on_empty():
     llm.chat.return_value = MagicMock(text="")
     r = LLMResolver(llm)
     out = r.resolve(_mk_ctx())
-    assert out.decision in ("forward", "restipulate", "backward", "give_up")
+    assert out.decision in ("forward", "patch_plan", "backward", "give_up")
 
 
 def test_llm_resolver_falls_back_on_exception():
@@ -237,7 +237,7 @@ def test_llm_resolver_falls_back_on_exception():
     llm.chat.side_effect = RuntimeError("api down")
     r = LLMResolver(llm)
     out = r.resolve(_mk_ctx())
-    assert out.decision in ("forward", "restipulate", "backward", "give_up")
+    assert out.decision in ("forward", "patch_plan", "backward", "give_up")
 
 
 def test_llm_resolver_falls_back_on_unknown_decision():
@@ -245,7 +245,7 @@ def test_llm_resolver_falls_back_on_unknown_decision():
     llm.chat.return_value = MagicMock(text=json.dumps({"decision": "huh"}))
     r = LLMResolver(llm)
     out = r.resolve(_mk_ctx())
-    assert out.decision in ("forward", "restipulate", "backward", "give_up")
+    assert out.decision in ("forward", "patch_plan", "backward", "give_up")
 
 
 # === safe_fallback ======================================================
@@ -255,9 +255,9 @@ def test_safe_fallback_forward_on_long_stall():
     assert out.decision == "forward"
 
 
-def test_safe_fallback_restipulate_default():
+def test_safe_fallback_patch_plan_default():
     out = _safe_fallback(_mk_ctx(stall_count=2))
-    assert out.decision == "restipulate"
+    assert out.decision == "patch_plan"
 
 
 def test_resolver_abc_not_instantiable():

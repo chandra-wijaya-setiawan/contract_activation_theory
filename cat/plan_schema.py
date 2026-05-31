@@ -186,12 +186,12 @@ class AttestorVerdict(BaseModel):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Revisor — tree-edit ops emitted on stall
+# PlanPatcher — tree-edit ops emitted on stall
 # ────────────────────────────────────────────────────────────────────────────
 
 
-class _RevisorOpBase(BaseModel):
-    """Common fields for all Revisor ops; reflection is mandatory per §6.3."""
+class _PlanPatcherOpBase(BaseModel):
+    """Common fields for all PlanPatcher ops; reflection is mandatory per §6.3."""
 
     reflection: str = Field(
         min_length=1,
@@ -199,55 +199,55 @@ class _RevisorOpBase(BaseModel):
     )
 
 
-class CommitOp(_RevisorOpBase):
+class CommitOp(_PlanPatcherOpBase):
     op: Literal["COMMIT"]
     node_id: str
     reason: str
 
 
-class CheckoutOp(_RevisorOpBase):
+class CheckoutOp(_PlanPatcherOpBase):
     op: Literal["CHECKOUT"]
     node_id: str
 
 
-class DropOp(_RevisorOpBase):
+class DropOp(_PlanPatcherOpBase):
     op: Literal["DROP"]
     node_id: str
     reason: str
 
 
-class CommitNewOp(_RevisorOpBase):
+class CommitNewOp(_PlanPatcherOpBase):
     op: Literal["COMMIT_NEW"]
     parent_id: str
     new_step: dict = Field(description="A PlanStep-shape dict (validated downstream).")
 
 
-class RefineOp(_RevisorOpBase):
+class RefineOp(_PlanPatcherOpBase):
     op: Literal["REFINE"]
     node_id: str
     substeps: list[dict] = Field(min_length=1)
 
 
-class BranchOp(_RevisorOpBase):
+class BranchOp(_PlanPatcherOpBase):
     op: Literal["BRANCH"]
     node_id: str
     alt_steps: list[dict] = Field(min_length=1)
 
 
-class MergeOp(_RevisorOpBase):
+class MergeOp(_PlanPatcherOpBase):
     op: Literal["MERGE"]
     branch_id: str
     target_id: str
 
 
 # Discriminated union — Pydantic picks the right model by `op` field.
-RevisorOp = CommitOp | CheckoutOp | DropOp | CommitNewOp | RefineOp | BranchOp | MergeOp
+PlanPatcherOp = CommitOp | CheckoutOp | DropOp | CommitNewOp | RefineOp | BranchOp | MergeOp
 
 
-class RevisorOps(BaseModel):
-    """Top-level container for the Revisor's ops list."""
+class PlanPatcherOps(BaseModel):
+    """Top-level container for the PlanPatcher's ops list."""
 
-    ops: list[RevisorOp] = Field(
+    ops: list[PlanPatcherOp] = Field(
         default_factory=list,
         description="Tree-edit ops; the Activator applies them in order.",
     )
@@ -264,10 +264,10 @@ class ResolverVerdict(BaseModel):
     Mirrors the existing ResolverOutput dataclass in cat/resolver.py but
     enforced at the schema boundary so malformed LLM responses fall back
     to _safe_fallback() via ValidationError instead of silently returning
-    forward/restipulate on best-effort string matching.
+    forward/patch_plan on best-effort string matching.
     """
 
-    decision: Literal["forward", "restipulate", "backward", "give_up"]
+    decision: Literal["forward", "patch_plan", "backward", "give_up"]
     reason: str = Field(default="", description="Truncated to 300 by caller.")
     diagnosis: str = Field(default="", description="Truncated to 500 by caller.")
     next_instruction: str = Field(default="", description="Truncated to 500 by caller.")

@@ -112,7 +112,7 @@ def test_parse_inloop_ops_drops_missing_required():
 
 def test_parse_inloop_ops_rejects_unknown_op():
     """Pydantic discriminated-union strict-rejects unknown ops; the whole
-    batch fails so the Revisor retry path (or _safe_fallback) handles it,
+    batch fails so the PlanPatcher retry path (or _safe_fallback) handles it,
     rather than silently dropping novel-named ops and applying partial work."""
     text = json.dumps({
         "ops": [

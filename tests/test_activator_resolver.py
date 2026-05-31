@@ -54,7 +54,7 @@ def _mk_run(plan_tree):
     run.last_perform_event_id = "evt-1"
     run.last_iter_anchor = "evt-0"
     run.plan_tree = plan_tree
-    run.restip_count = 0
+    run.patch_plan_count = 0
     run.backward_count = 0
     run._stall_count = {}
     return run
@@ -157,14 +157,14 @@ def test_resolver_backward_cap_falls_back_to_forward():
     assert tree.nodes["C1"].status == "complete"  # forward, not pruned
 
 
-def test_resolver_restipulate_cap_falls_back_to_forward():
-    """If restip_count >= max_restip_per_task, restipulate falls back to forward."""
+def test_resolver_patch_plan_cap_falls_back_to_forward():
+    """If patch_plan_count >= max_restip_per_task, patch_plan falls back to forward."""
     tree = PlanTree.from_phased_plan(SAMPLE_PHASED_PLAN)
-    activator = _mk_activator(StubResolver("restipulate"))
+    activator = _mk_activator(StubResolver("patch_plan"))
     activator.max_restip_per_task = 5
     run = _mk_run(tree)
     run._stall_count = {"A1": 3}
-    run.restip_count = 5  # at cap
+    run.patch_plan_count = 5  # at cap
     attention = tree.get_attention()
     sv = SurpriseVector()
     contract = MagicMock(obligation="test obligation", id="task-1")

@@ -1,7 +1,7 @@
 """Resolver + Reflection — supervises stalled attention steps.
 
 R6+ extension: the Resolver is now both a *decision* layer (forward /
-restipulate / backward / give_up) AND a *reflection* layer (diagnosis
+patch_plan / backward / give_up) AND a *reflection* layer (diagnosis
 of why we stalled + an actionable next_instruction for the next iter).
 
 Cost-wise this is one LLM call per stall point — same as the basic
@@ -13,7 +13,7 @@ Resolver — but the output is richer:
                       (used for cross-task transfer + retrospection)
   - next_instruction: a specific directive injected into the next iter's
                       attention hint (when forward/backward) or into the
-                      Stipulator-in-loop prompt (when restipulate)
+                      Stipulator-in-loop prompt (when patch_plan)
 
 Three implementations:
   - LLMResolver (default): focused LLM call with diagnostic prompt
@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 
-ResolverDecision = Literal["forward", "restipulate", "backward", "give_up"]
+ResolverDecision = Literal["forward", "patch_plan", "backward", "give_up"]
 
 
 @dataclass
@@ -45,7 +45,7 @@ class StallContext:
     expects: dict[str, Any]
     surprise_dims: dict[str, Any]       # SurpriseVector.to_dict()
     stall_count: int
-    restip_count: int
+    patch_plan_count: int
     plan_tree_outline: str
     recent_tool_calls: list[dict[str, Any]]
     obligation_brief: str
@@ -90,7 +90,7 @@ class StallContext:
             f"  expects: {json.dumps(self.expects)[:200]}\n\n"
             f"WHY STUCK:\n"
             f"  stall_count    = {self.stall_count} iters on this node\n"
-            f"  restip_count   = {self.restip_count} re-stipulates so far\n"
+            f"  patch_plan_count   = {self.patch_plan_count} re-stipulates so far\n"
             f"  intent_tools   = {intent_summary} (counts by tool intent)\n"
             f"  files          = {files_match_summary}\n"
             f"  surprise dims  = {json.dumps(self.surprise_dims)[:400]}\n\n"
@@ -126,7 +126,7 @@ def enforce_guards(output: ResolverOutput, ctx: StallContext) -> ResolverOutput:
     if output.decision == "forward" and ctx.attention_intent == "mutate":
         if ctx.intent_tool_counts.get("mutate", 0) == 0:
             return ResolverOutput(
-                decision="restipulate",
+                decision="patch_plan",
                 reason=f"GUARD: refused 'forward' on un-mutated mutate step "
                        f"(intent_tool_counts.mutate=0). Original: {output.reason[:120]}",
                 diagnosis=(output.diagnosis or "")
@@ -135,11 +135,11 @@ def enforce_guards(output: ResolverOutput, ctx: StallContext) -> ResolverOutput:
                                  or "Use str_replace, multi_edit, apply_patch, or write to "
                                     "modify the target file. Do not use read/rg/outline.",
             )
-    # Guard 2: 'forward' on verify step with failed verifier → restipulate
+    # Guard 2: 'forward' on verify step with failed verifier → patch_plan
     if output.decision == "forward" and ctx.attention_intent == "verify":
         if not ctx.surprise_dims.get("verifier_match", True):
             return ResolverOutput(
-                decision="restipulate",
+                decision="patch_plan",
                 reason=f"GUARD: refused 'forward' on verify step with verifier_match=False. "
                        f"Original: {output.reason[:120]}",
                 diagnosis=output.diagnosis,
@@ -188,7 +188,7 @@ class HeuristicResolver(Resolver):
 
     def resolve(self, ctx: StallContext) -> ResolverOutput:
         # Hard rules first
-        if ctx.restip_count >= 5:
+        if ctx.patch_plan_count >= 5:
             return ResolverOutput(
                 decision="forward",
                 reason="restip cap hit; force forward",
@@ -204,16 +204,16 @@ class HeuristicResolver(Resolver):
                 decision="give_up",
                 reason="long stall; budget exhausted",
             )
-        # Mutate-intent w/ no mutate calls → strong restipulate
+        # Mutate-intent w/ no mutate calls → strong patch_plan
         if ctx.attention_intent == "mutate" and ctx.intent_tool_counts.get("mutate", 0) == 0:
             return ResolverOutput(
-                decision="restipulate",
+                decision="patch_plan",
                 reason="mutate step but no write tool used",
                 diagnosis="agent did not use a write-tool on a mutate step",
                 next_instruction="Use str_replace/multi_edit/apply_patch/write to modify the target file.",
             )
         return ResolverOutput(
-            decision="restipulate",
+            decision="patch_plan",
             reason="default: revise plan",
         )
 
@@ -226,7 +226,7 @@ progressed for several iterations.
 You receive a structured stall report. Diagnose why the agent is stuck and \
 output FOUR fields:
 
-  decision         one of: forward | restipulate | backward | give_up
+  decision         one of: forward | patch_plan | backward | give_up
   reason           1-sentence rationale
   diagnosis        2-3 sentences: what's actually stuck, what evidence shows it
   next_instruction a SPECIFIC, ACTIONABLE directive injected into the next iter
@@ -246,7 +246,7 @@ DECISION CRITERIA — read carefully:
                    is 0. That means the agent never edited anything; the step is
                    not done.
 
-  restipulate      Revise the plan. Use this when:
+  patch_plan      Revise the plan. Use this when:
                    - the surprise reveals new info (code is structured differently
                      than the plan assumed)
                    - the agent is on a mutate step but only used read/rg tools
@@ -258,11 +258,11 @@ DECISION CRITERIA — read carefully:
   backward         Abandon the current subtree, restore attention to last completed
                    mutate ancestor. Use when:
                    - verify step failed AND prior edit was likely wrong
-                   - multiple restipulates already tried on same node
+                   - multiple patch_plans already tried on same node
                    - the current path is a dead end
 
   give_up          Mark the contract FAILED. Use ONLY when:
-                   - restip_count >= 5 AND no progress
+                   - patch_plan_count >= 5 AND no progress
                    - max backwards already tried
                    - further iterations would waste budget
 
@@ -276,12 +276,12 @@ DIAGNOSIS HINTS:
   - If same attestor reason appears in attestor_reasons history → agent doesn't
     understand the step. Re-frame in next_instruction.
   - If many investigate calls in a row → maybe forward (info gathered) OR
-    restipulate (info wasn't useful).
+    patch_plan (info wasn't useful).
 
 NEXT_INSTRUCTION FORMAT:
 
   - For forward: 1 sentence on what to focus on at the next attention step
-  - For restipulate: 1-2 sentences with SPECIFIC instructions (file paths,
+  - For patch_plan: 1-2 sentences with SPECIFIC instructions (file paths,
     function names, expected changes) that the in-loop Stipulator should bake
     into the new plan
   - For backward: 1 sentence on what to do differently when restored
@@ -343,4 +343,4 @@ def _safe_fallback(ctx: StallContext) -> ResolverOutput:
     """When LLMResolver fails, fall back to a conservative default."""
     if ctx.stall_count >= 5:
         return ResolverOutput(decision="forward", reason="fallback: long stall")
-    return ResolverOutput(decision="restipulate", reason="fallback: default replan")
+    return ResolverOutput(decision="patch_plan", reason="fallback: default replan")

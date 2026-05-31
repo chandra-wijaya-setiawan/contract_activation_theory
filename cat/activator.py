@@ -8,7 +8,7 @@ _init_executor_messages, _build_user_prompt, _prune_to_window.
 run() implements the v2 flow:
     pre-loop:  REPRESENT → obligation_class → STIPULATE-phased → ACTIVATE
     iter:      PLAN (state_class, attention) → ACTION (_perform_once)
-               → OBSERVE (surprise) → tree-edit (in-loop Revisor on
+               → OBSERVE (surprise) → tree-edit (in-loop PlanPatcher on
                surprise) OR COMMIT + advance attention
     post-loop: FINALIZE plan tree (write to librarian if available)
 """
@@ -27,7 +27,7 @@ from cat._legacy.activator import (
 from cat.contracts import Contract, ContractState, State
 from cat.llm import (
     call_stipulator_phased,
-    call_revisor,
+    call_plan_patcher,
     call_attestor,
 )
 from cat.obligation_class import compute_obligation_class
@@ -96,7 +96,7 @@ class Activator(_BaseActivator):
         )
         run.obligation_class = oc  # type: ignore[attr-defined]
         run.run_counts = RunCounts()  # type: ignore[attr-defined]
-        run.restip_count = 0  # type: ignore[attr-defined]
+        run.patch_plan_count = 0  # type: ignore[attr-defined]
 
         # Retrieve PASS/FAIL templates from the librarian (if any)
         plan_templates = []
@@ -135,7 +135,7 @@ class Activator(_BaseActivator):
         else:
             # R12 follow-up: phased stipulator exhausted its retry budget.
             # Do NOT fall back to v1 flat plan — that disables every piece of
-            # v2 machinery (no surprise, no plan_commit, no Revisor) and burns
+            # v2 machinery (no surprise, no plan_commit, no PlanPatcher) and burns
             # tokens running "naked". Fail the contract cleanly instead.
             run.plan = []
             run.plan_tree = None  # type: ignore[attr-defined]
@@ -751,7 +751,7 @@ class Activator(_BaseActivator):
             expects=expects,
             surprise_dims=sv.to_dict(),
             stall_count=run._stall_count.get(attention_node.id, 0),  # type: ignore[attr-defined]
-            restip_count=getattr(run, "restip_count", 0),
+            patch_plan_count=getattr(run, "patch_plan_count", 0),
             plan_tree_outline=plan_tree.render_outline(),
             recent_tool_calls=recent[-6:],
             obligation_brief=(contract.obligation or "")[:500],
@@ -807,14 +807,14 @@ class Activator(_BaseActivator):
             self._default_advance(plan_tree, attention_node, run)
             run._stall_count[att_id] = 0  # type: ignore[attr-defined]
 
-        elif decision == "restipulate":
-            if getattr(run, "restip_count", 0) >= self.max_restip_per_task:
+        elif decision == "patch_plan":
+            if getattr(run, "patch_plan_count", 0) >= self.max_restip_per_task:
                 # Cap hit — fall back to forward
                 self._default_advance(plan_tree, attention_node, run)
                 run._stall_count[att_id] = 0  # type: ignore[attr-defined]
                 return
-            ops_applied = self._run_revisor(contract, run, plan_tree, sv, state_now_class)
-            run.restip_count = getattr(run, "restip_count", 0) + 1  # type: ignore[attr-defined]
+            ops_applied = self._run_plan_patcher(contract, run, plan_tree, sv, state_now_class)
+            run.patch_plan_count = getattr(run, "patch_plan_count", 0) + 1  # type: ignore[attr-defined]
             if ops_applied == 0:
                 # Re-stipulate returned nothing — force forward
                 self._default_advance(plan_tree, attention_node, run)
@@ -1053,7 +1053,7 @@ class Activator(_BaseActivator):
             ))
         plan_tree.advance_attention()
 
-    def _run_revisor(
+    def _run_plan_patcher(
         self,
         contract: Contract,
         run: ActivatorRun,
@@ -1068,7 +1068,7 @@ class Activator(_BaseActivator):
         recent_trace = self._recent_trace_text(run, n_iters=3)
 
         try:
-            ops, llm_result = call_revisor(
+            ops, llm_result = call_plan_patcher(
                 self.llm,
                 contract.obligation,
                 plan_tree_outline=outline,
@@ -1090,7 +1090,7 @@ class Activator(_BaseActivator):
             event_id=f"sip-{uuid.uuid4().hex[:6]}",
             parent_id=self.recorder.traj.events[-1].event_id if self.recorder.traj.events else None,
             ts=utcnow_iso(),
-            kind="revise",
+            kind="plan_patch",
             payload={
                 "iter": run.iterations,
                 "surprise": surprise.to_dict(),

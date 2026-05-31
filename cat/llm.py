@@ -507,11 +507,11 @@ Output a JSON object matching this exact shape:
 """
 
 
-REVISOR_SYSTEM_PROMPT = """\
-You are the REVISOR for a contract-disciplined agent.
+PLAN_PATCHER_SYSTEM_PROMPT = """\
+You are the PLAN PATCHER for a contract-disciplined agent.
 
 The Stipulator already wrote the full plan tree (strategic, A-to-Z). Your job \
-is NARROW: emit a small list of TREE-EDIT OPS that revise the existing tree \
+is NARROW: emit a small list of TREE-EDIT OPS that patch the existing tree \
 in response to a stall. You DO NOT plan A-Z; you do not invent a new plan. \
 You PATCH one region.
 
@@ -549,7 +549,7 @@ Output shape:
 """
 
 # Legacy alias kept for back-compat with older trace events.
-STIPULATOR_INLOOP_SYSTEM_PROMPT = REVISOR_SYSTEM_PROMPT
+STIPULATOR_INLOOP_SYSTEM_PROMPT = PLAN_PATCHER_SYSTEM_PROMPT
 
 
 def call_stipulator_phased(
@@ -690,7 +690,7 @@ def _parse_phased_plan(text: str) -> Optional[dict[str, Any]]:
     return {"phases": cleaned_phases}
 
 
-def call_revisor(
+def call_plan_patcher(
     llm: LLM,
     obligation: str,
     plan_tree_outline: str,
@@ -700,10 +700,10 @@ def call_revisor(
     surprise_dims: dict[str, Any],
     parent_event_id: Optional[str] = None,
 ) -> tuple[Optional[list[dict[str, Any]]], LLMResult]:
-    """Revisor — local tree-edit ops in response to a stall.
+    """PlanPatcher — local tree-edit ops in response to a stall.
 
     Distinct from Stipulator (which is strategic, runs once at start).
-    Revisor revises a region of the existing plan tree based on observed
+    PlanPatcher revises a region of the existing plan tree based on observed
     surprise. Returns (ops_list_or_None, llm_result).
     """
     user_msg = (
@@ -716,13 +716,13 @@ def call_revisor(
         f"Emit a minimal list of tree-edit ops to react. Include `reflection` on every op."
     )
     messages = [
-        {"role": "system", "content": REVISOR_SYSTEM_PROMPT},
+        {"role": "system", "content": PLAN_PATCHER_SYSTEM_PROMPT},
         {"role": "user", "content": user_msg},
     ]
     result = llm.chat(
         messages=messages,
         response_format={"type": "json_object"},
-        role_tag="revisor",
+        role_tag="plan_patcher",
         temperature=0.1,
         parent_event_id=parent_event_id,
     )
@@ -733,17 +733,17 @@ def call_revisor(
 
 
 def _parse_inloop_ops(text: str) -> Optional[list[dict[str, Any]]]:
-    """Validate Revisor ops via the Pydantic RevisorOps schema (§6.4).
+    """Validate PlanPatcher ops via the Pydantic PlanPatcherOps schema (§6.4).
 
     Returns a clean list of op-dicts (each with `op` discriminator, required
     fields, and `reflection`) or None on validation failure. The Pydantic
     discriminated union handles per-op required-field enforcement; before
     this, ~30 lines of manual key checks did the same thing more loosely.
     """
-    from cat.plan_schema import RevisorOps
+    from cat.plan_schema import PlanPatcherOps
     from pydantic import ValidationError
     try:
-        parsed = RevisorOps.model_validate_json(text)
+        parsed = PlanPatcherOps.model_validate_json(text)
     except ValidationError:
         return None
     if not parsed.ops:
@@ -755,5 +755,5 @@ def _parse_inloop_ops(text: str) -> Optional[list[dict[str, Any]]]:
 PLANNER_SYSTEM_PROMPT = STIPULATOR_SYSTEM_PROMPT
 JUDGE_SYSTEM_PROMPT = ATTESTOR_SYSTEM_PROMPT
 
-# Backward-compat: previous name for the Revisor role; do not remove until v1.8+
-call_stipulator_inloop = call_revisor
+# Backward-compat: previous name for the PlanPatcher role; do not remove until v1.8+
+call_stipulator_inloop = call_plan_patcher
