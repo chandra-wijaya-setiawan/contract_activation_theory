@@ -53,13 +53,58 @@ def test_phased_plan_validates_json():
                 {"description": "edit y", "intent": "mutate",
                  "expects": {"durable_change": True, "files_modified": ["y.py"]}}
             ]},
+            {"name": "VERIFY", "steps": [
+                {"description": "run pytest", "intent": "verify",
+                 "expects": {"verifier_outcome": "PASS"}}
+            ]},
         ]
     })
     plan = PhasedPlan.model_validate_json(text)
-    assert len(plan.phases) == 2
+    assert len(plan.phases) == 3
     assert plan.phases[0].name == "MAP"
     assert plan.phases[0].steps[0].expects.result == "we read x"
     assert plan.phases[1].steps[0].expects.durable_change is True
+    assert plan.phases[2].steps[0].intent == "verify"
+
+
+def test_phased_plan_rejects_missing_verify_step():
+    """Stipulator must emit at least one verify step — otherwise the agent
+    can exhaust the plan without running the test (django-12039 regression)."""
+    from pydantic import ValidationError
+    text = json.dumps({
+        "phases": [
+            {"name": "MAP", "steps": [
+                {"description": "read x", "intent": "investigate"}
+            ]},
+            {"name": "IMPLEMENT", "steps": [
+                {"description": "edit y", "intent": "mutate",
+                 "expects": {"durable_change": True}}
+            ]},
+        ]  # no VERIFY phase, no verify-intent step
+    })
+    with pytest.raises(ValidationError) as exc:
+        PhasedPlan.model_validate_json(text)
+    assert "verify" in str(exc.value).lower()
+
+
+def test_phased_plan_accepts_verify_outside_verify_phase():
+    """The check is per-step intent, not phase name. A verify step inside
+    an OTHER-named phase still satisfies the requirement."""
+    text = json.dumps({
+        "phases": [
+            {"name": "MAP", "steps": [
+                {"description": "read x", "intent": "investigate"}
+            ]},
+            {"name": "IMPLEMENT", "steps": [
+                {"description": "edit y", "intent": "mutate",
+                 "expects": {"durable_change": True}},
+                {"description": "run pytest", "intent": "verify",
+                 "expects": {"verifier_outcome": "PASS"}},
+            ]},
+        ]
+    })
+    plan = PhasedPlan.model_validate_json(text)
+    assert any(s.intent == "verify" for p in plan.phases for s in p.steps)
 
 
 def test_phased_plan_rejects_bad_intent():
@@ -68,7 +113,11 @@ def test_phased_plan_rejects_bad_intent():
         "phases": [
             {"name": "MAP", "steps": [
                 {"description": "x", "intent": "whatever"}
-            ]}
+            ]},
+            {"name": "VERIFY", "steps": [
+                {"description": "test", "intent": "verify",
+                 "expects": {"verifier_outcome": "PASS"}}
+            ]},
         ]
     })
     # _parse_phased_plan coerces unknown intent to 'other'
@@ -77,13 +126,24 @@ def test_phased_plan_rejects_bad_intent():
     assert plan_dict["phases"][0]["steps"][0]["intent"] == "other"
 
 
+def _verify_phase():
+    """Tail VERIFY phase appended to test fixtures so they satisfy the
+    R12-mandatory verify-step validator without distracting from each test's
+    actual focus."""
+    return {"name": "VERIFY", "steps": [
+        {"description": "run pytest", "intent": "verify",
+         "expects": {"verifier_outcome": "PASS"}}
+    ]}
+
+
 def test_phased_plan_rejects_bad_phase_name():
     """_parse_phased_plan coerces unknown phase to OTHER."""
     text = json.dumps({
         "phases": [
             {"name": "WHATEVER", "steps": [
                 {"description": "x", "intent": "investigate"}
-            ]}
+            ]},
+            _verify_phase(),
         ]
     })
     plan_dict = _parse_phased_plan(text)
@@ -97,7 +157,8 @@ def test_phased_plan_drops_empty_step_descriptions():
             {"name": "MAP", "steps": [
                 {"description": "", "intent": "investigate"},
                 {"description": "real one", "intent": "investigate"},
-            ]}
+            ]},
+            _verify_phase(),
         ]
     })
     plan = _parse_phased_plan(text)
@@ -111,7 +172,8 @@ def test_phased_plan_drops_invalid_expects_dict():
         "phases": [
             {"name": "MAP", "steps": [
                 {"description": "x", "intent": "investigate", "expects": "not-a-dict"}
-            ]}
+            ]},
+            _verify_phase(),
         ]
     })
     plan = _parse_phased_plan(text)
@@ -136,7 +198,8 @@ def test_phased_plan_backward_compat_knowledge_gained():
             {"name": "MAP", "steps": [
                 {"description": "x", "intent": "investigate",
                  "expects": {"knowledge_gained": "we will know x"}}
-            ]}
+            ]},
+            _verify_phase(),
         ]
     })
     plan = _parse_phased_plan(text)
@@ -187,7 +250,8 @@ def test_phased_plan_with_suggestion_round_trips():
                  "suggested_tool": "read",
                  "suggested_args": {"path": "/testbed/x.py"},
                  "expects": {"result": "x is read"}}
-            ]}
+            ]},
+            _verify_phase(),
         ]
     })
     plan = _parse_phased_plan(text)

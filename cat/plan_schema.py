@@ -134,6 +134,37 @@ class PhasedPlan(BaseModel):
 
     phases: list[Phase] = Field(default_factory=list)
 
+    @field_validator("phases", mode="after")
+    @classmethod
+    def _require_verify_step(cls, phases: list[Phase]) -> list[Phase]:
+        """Every plan must include at least one step with intent='verify'.
+
+        Without this, the LLM stipulator occasionally emits a plan that stops
+        at IMPLEMENT — the agent runs all its mutate steps and exhausts the
+        plan tree without ever running the test (observed on django-12039:
+        7 steps across MAP/DESIGN/IMPLEMENT, no VERIFY phase → plan exhausted
+        → failed criteria check at the end → wasted 164K tokens).
+
+        Reject the plan at the schema boundary so the existing retry-on-
+        correction loop in call_stipulator_phased asks the LLM again with an
+        explicit correction message.
+        """
+        if not phases:
+            return phases  # empty plan handled elsewhere
+        has_verify = any(
+            step.intent == "verify"
+            for phase in phases
+            for step in phase.steps
+        )
+        if not has_verify:
+            raise ValueError(
+                "PhasedPlan must include at least one step with intent='verify' "
+                "(typically the last step: 'Run the oracle test command and confirm "
+                "it exits 0'). Plans that stop at IMPLEMENT skip the test and "
+                "fail final criteria check without running pytest."
+            )
+        return phases
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Attestor — per-step "is this step done?" verdict

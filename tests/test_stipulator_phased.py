@@ -5,6 +5,12 @@ from unittest.mock import MagicMock
 from cat.llm import _parse_phased_plan, _parse_inloop_ops, call_stipulator_phased, LLMResult
 
 
+_VERIFY_PHASE = {"name": "VERIFY", "steps": [
+    {"description": "run pytest", "intent": "verify",
+     "expects": {"verifier_outcome": "PASS"}}
+]}
+
+
 def test_parse_phased_plan_basic():
     text = json.dumps({
         "phases": [
@@ -14,11 +20,12 @@ def test_parse_phased_plan_basic():
             {"name": "IMPLEMENT", "steps": [
                 {"description": "edit Y", "intent": "mutate", "expects": {"durable_change": True, "files_modified": ["y.py"]}}
             ]},
+            _VERIFY_PHASE,
         ]
     })
     plan = _parse_phased_plan(text)
     assert plan is not None
-    assert len(plan["phases"]) == 2
+    assert len(plan["phases"]) == 3
     assert plan["phases"][0]["name"] == "MAP"
     assert plan["phases"][1]["steps"][0]["expects"]["durable_change"] is True
 
@@ -30,6 +37,7 @@ def test_parse_phased_plan_drops_empty_steps():
                 {"description": "", "intent": "investigate"},
                 {"description": "real one", "intent": "investigate"},
             ]},
+            _VERIFY_PHASE,
         ]
     })
     plan = _parse_phased_plan(text)
@@ -43,6 +51,7 @@ def test_parse_phased_plan_normalizes_bad_intent():
             {"name": "MAP", "steps": [
                 {"description": "x", "intent": "whatever"},
             ]},
+            _VERIFY_PHASE,
         ]
     })
     plan = _parse_phased_plan(text)
@@ -55,6 +64,7 @@ def test_parse_phased_plan_normalizes_bad_phase():
             {"name": "WEIRD", "steps": [
                 {"description": "x", "intent": "investigate"},
             ]},
+            _VERIFY_PHASE,
         ]
     })
     plan = _parse_phased_plan(text)
@@ -124,6 +134,7 @@ def _good_phased_json():
                 {"description": "read X", "intent": "investigate",
                  "expects": {"durable_change": False}}
             ]},
+            _VERIFY_PHASE,
         ]
     })
 
@@ -148,7 +159,7 @@ def test_call_stipulator_phased_succeeds_first_try():
     llm.chat.return_value = _mk_llm_result(_good_phased_json())
     plan, _ = call_stipulator_phased(llm, "obligation X")
     assert plan is not None
-    assert len(plan["phases"]) == 1
+    assert len(plan["phases"]) == 2  # MAP + VERIFY (the verify-required validator)
     assert llm.chat.call_count == 1
 
 
