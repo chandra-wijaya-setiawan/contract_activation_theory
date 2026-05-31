@@ -259,12 +259,6 @@ class ActivatorV2(Activator):
             # 218K performer-input tokens because of unbounded growth).
             turn_msgs = run.messages[iter_start_len:]
             self._prune_to_window(contract, run, turn_msgs)
-            self._update_plan_checklist(contract, run)
-
-            # P1 sliding window prune (same as v1)
-            iter_start_len = len(run.messages)
-            # Note: messages already extended by _perform_once and may include the SYSTEM hint;
-            # prune still works.
 
         # Post-loop persistence
         if plan_tree and self.librarian_writer is not None:
