@@ -202,6 +202,71 @@ def test_infer_verifier_outcome_empty_messages():
     assert activator._infer_verifier_outcome(run) is None
 
 
+# ── R16: oracle command bound to verify steps ─────────────────────────────
+
+
+def test_bind_oracle_to_verify_steps_injects_command():
+    """Verify steps without a concrete command should get the oracle command
+    from contract.representations (key='judge_strategy', 'oracle: <cmd>')."""
+    from cat.contracts import Representation
+    plan_dict = json.loads(PHASED_PLAN_JSON)
+    # Add a verify step so the binder has something to bind
+    plan_dict["phases"].append({"name": "VERIFY", "steps": [
+        {"description": "Run the oracle test command",
+         "intent": "verify",
+         "expects": {"verifier_outcome": "PASS"}}
+    ]})
+    tree = PlanTree.from_phased_plan(plan_dict)
+    activator = Activator.__new__(Activator)
+    contract = MagicMock()
+    contract.representations = [
+        Representation(key="judge_strategy", value="oracle: cd /testbed && python -m pytest tests/foo.py", evidence=""),
+    ]
+    n_bound = activator._bind_oracle_to_verify_steps(tree, contract)
+    assert n_bound == 1
+    verify_nodes = [n for n in tree.nodes.values() if getattr(n, "intent", None) == "verify"]
+    assert len(verify_nodes) == 1
+    assert verify_nodes[0].suggested_tool == "bash"
+    assert verify_nodes[0].suggested_args["command"].startswith("cd /testbed")
+
+
+def test_bind_oracle_skips_when_command_already_present():
+    """If the Stipulator already provided a concrete command, don't overwrite it."""
+    from cat.contracts import Representation
+    plan_dict = json.loads(PHASED_PLAN_JSON)
+    plan_dict["phases"].append({"name": "VERIFY", "steps": [
+        {"description": "Run pytest",
+         "intent": "verify",
+         "suggested_tool": "bash",
+         "suggested_args": {"command": "pytest -x"},
+         "expects": {"verifier_outcome": "PASS"}}
+    ]})
+    tree = PlanTree.from_phased_plan(plan_dict)
+    activator = Activator.__new__(Activator)
+    contract = MagicMock()
+    contract.representations = [
+        Representation(key="judge_strategy", value="oracle: python -m pytest different.py", evidence=""),
+    ]
+    n_bound = activator._bind_oracle_to_verify_steps(tree, contract)
+    assert n_bound == 0
+    verify_nodes = [n for n in tree.nodes.values() if getattr(n, "intent", None) == "verify"]
+    assert verify_nodes[0].suggested_args["command"] == "pytest -x"  # untouched
+
+
+def test_bind_oracle_no_op_without_oracle_strategy():
+    """When representations don't include oracle judge_strategy, return 0."""
+    plan_dict = json.loads(PHASED_PLAN_JSON)
+    plan_dict["phases"].append({"name": "VERIFY", "steps": [
+        {"description": "Run pytest", "intent": "verify"}
+    ]})
+    tree = PlanTree.from_phased_plan(plan_dict)
+    activator = Activator.__new__(Activator)
+    contract = MagicMock()
+    contract.representations = []  # no judge_strategy
+    n_bound = activator._bind_oracle_to_verify_steps(tree, contract)
+    assert n_bound == 0
+
+
 # ── R12 Bug A: _observe_phase must no-op on attention_node=None ────────────
 
 

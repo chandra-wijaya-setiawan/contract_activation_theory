@@ -124,6 +124,7 @@ class Activator(_BaseActivator):
         if phased_plan and phased_plan.get("phases"):
             plan_tree = PlanTree.from_phased_plan(phased_plan, obligation_class=oc)
             run.plan_tree = plan_tree  # type: ignore[attr-defined]
+            self._bind_oracle_to_verify_steps(plan_tree, contract)
             # Mirror the flat list for v1 admission gate compat
             flat_steps: list[_PlanStep] = []
             for phase_id in plan_tree.phase_order:
@@ -318,6 +319,53 @@ class Activator(_BaseActivator):
 
     # ── helpers ──────────────────────────────────────────────────────────
     _ATTENTION_HINT_MARKER = "PLAN ATTENTION (focus on this one step):"
+
+    def _bind_oracle_to_verify_steps(
+        self,
+        plan_tree: PlanTree,
+        contract: Contract,
+    ) -> int:
+        """R16: bind verify-intent steps to the actual oracle command.
+
+        The Stipulator emits verify steps with descriptions like 'Run the
+        oracle test command...' but typically leaves `suggested_args` empty
+        or with a guessed command. The Performer then guesses a pytest path,
+        runs it, gets misleading 'passed' output, attestor approves, and
+        the final criterion_check (which runs the REAL oracle) discovers
+        nothing was actually validated.
+
+        Fix: post-process the plan tree. For each verify-intent step that
+        has no concrete bash command in suggested_args, inject the oracle
+        command read from `contract.representations` (key='judge_strategy',
+        format 'oracle: <cmd>'). The Performer then runs the exact oracle
+        verbatim via the existing STIPULATOR SUGGESTS hint.
+
+        Returns the number of verify steps bound (for trace / debugging).
+        """
+        # Pull the oracle command from representations (same source the
+        # Activator already uses to inject the oracle criterion).
+        oracle_cmd = ""
+        for r in (contract.representations or []):
+            if r.key == "judge_strategy" and r.value.startswith("oracle:"):
+                oracle_cmd = r.value[len("oracle:"):].strip()
+                break
+        if not oracle_cmd:
+            return 0
+
+        bound = 0
+        for node in plan_tree.nodes.values():
+            if getattr(node, "intent", None) != "verify":
+                continue
+            # Don't overwrite a Stipulator-suggested command that already
+            # contains a concrete invocation — only fill the gap when
+            # suggested_args lacks a 'command' key.
+            existing = getattr(node, "suggested_args", None) or {}
+            if isinstance(existing, dict) and existing.get("command"):
+                continue
+            node.suggested_tool = "bash"  # type: ignore[attr-defined]
+            node.suggested_args = {"command": oracle_cmd, "timeout_s": 300}  # type: ignore[attr-defined]
+            bound += 1
+        return bound
 
     def _inject_plan_attention(self, run: ActivatorRun, plan_tree: PlanTree) -> None:
         """Inject the attention hint as a USER message.
