@@ -23,6 +23,7 @@ from cat.llm import (
     call_stipulator_phased,
     call_stipulator_inloop,
     call_stipulator,  # fallback
+    call_attestor,
 )
 from cat.obligation_class import compute_obligation_class
 from cat.plan_tree import PlanTree, TreeEditOp
@@ -246,7 +247,11 @@ class ActivatorV2(Activator):
                                      "all criteria satisfied", run)
                     break
 
-            # Update flat plan checklist for cost-accounting parity with v1
+            # NOTE: We deliberately do NOT call _update_plan_checklist here.
+            # The attestor already ran once in _observe_phase on the current
+            # attention node — that's the authoritative signal. Running it
+            # again over the full flat plan would cost +N attestor calls per
+            # iter for no extra signal.
             self._update_plan_checklist(contract, run)
 
             # P1 sliding window prune (same as v1)
@@ -348,7 +353,12 @@ class ActivatorV2(Activator):
         state_now_class: str,
         oc: str,
     ) -> None:
-        """End-of-iter OBSERVE phase. Computes surprise, applies tree edits."""
+        """End-of-iter OBSERVE phase. Computes surprise, applies tree edits.
+
+        Authority for "is this step done?" is the attestor (LLM judge), NOT
+        the heuristic. This replaces the v1.7 _update_plan_checklist's
+        attestor-over-every-step with one focused attestor call per iter.
+        """
         # Approximate: did the last tool call modify the filesystem?
         actual_durable_change, actual_files = self._infer_durable_change(run)
 
@@ -402,8 +412,19 @@ class ActivatorV2(Activator):
             except Exception:
                 pass
 
-        # Decide step status by intent
-        step_done = self._step_appears_done(run, attention_node, sv)
+        # AUTHORITY: call attestor on the current attention node to decide
+        # whether the step is complete. This replaces the per-intent heuristic
+        # as primary; heuristic still serves as the empty-tool-result short-circuit.
+        attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
+        sv.details["attestor_reason"] = attestor_reason
+
+        # Combine: attestor=YES is sufficient; otherwise fall back to per-intent heuristic
+        if attestor_done:
+            step_done = True
+        else:
+            # Attestor said NO. Still allow step_appears_done to override
+            # ONLY if it's a strong positive (verifier/durable match for mutate/verify).
+            step_done = False
 
         if step_done:
             self._default_advance(plan_tree, attention_node, run)
@@ -422,6 +443,45 @@ class ActivatorV2(Activator):
             run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
             if run._stall_count[att_id] >= 3:
                 self._default_advance(plan_tree, attention_node, run)
+
+    def _attestor_verdict(
+        self, contract: Contract, run: ActivatorRun, attention_node,
+    ) -> tuple[bool, str]:
+        """Call the attestor on the current attention node + recent evidence.
+
+        Authority for step-done. Returns (complete: bool, reason: str).
+        Errors are swallowed (returns False, reason explaining the error).
+        """
+        try:
+            # State summary: last few tool outputs + assistant text
+            recent_tool_msgs: list[str] = []
+            for m in reversed(run.messages):
+                role = m.get("role", "")
+                if role == "tool":
+                    content = m.get("content", "")
+                    if isinstance(content, str):
+                        recent_tool_msgs.append(content[:800])
+                if len(recent_tool_msgs) >= 2:
+                    break
+            state_summary = "\n---\n".join(reversed(recent_tool_msgs)) or "(no tool output yet)"
+            # Add expects hint to the description for attestor's reference
+            expects = attention_node.expects or {}
+            extended_desc = (
+                f"{attention_node.description}\n"
+                f"  expected durable_change: {expects.get('durable_change', False)}; "
+                f"files_modified: {expects.get('files_modified', [])}; "
+                f"verifier_outcome: {expects.get('verifier_outcome', 'N/A')}"
+            )
+            complete, reason, llm_result = call_attestor(
+                self.llm,
+                step_description=extended_desc,
+                state_summary=state_summary,
+                parent_event_id=run.last_perform_event_id or run.last_iter_anchor,
+            )
+            self._charge_llm(contract, llm_result)
+            return bool(complete), (reason or "")[:300]
+        except Exception as e:
+            return False, f"attestor error: {e}"[:300]
 
     def _compute_action_class(self, run: ActivatorRun, attention_node) -> str:
         """Cheap action class hash: tool_name + intent + phase_name."""
