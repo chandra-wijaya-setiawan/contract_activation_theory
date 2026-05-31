@@ -295,23 +295,20 @@ class ActivatorV2(Activator):
         if intent == "mutate":
             files = attention.expects.get("files_modified", [])
             intent_directive = (
-                "\n⚠️ THIS IS A MUTATE STEP. You MUST use str_replace, multi_edit, "
-                "apply_patch, or write tool to modify a file THIS TURN. DO NOT "
-                "read, search, outline, or otherwise investigate — investigation "
-                "is already complete for this step. "
+                " Intent=mutate: the next tool call should write to a file via "
+                "str_replace, multi_edit, apply_patch, or write."
             )
             if files:
-                intent_directive += f"Target file(s): {files}. "
+                intent_directive += f" Target file(s): {files}."
         elif intent == "verify":
             intent_directive = (
-                "\n⚠️ THIS IS A VERIFY STEP. You MUST use bash to run the test "
-                "command described. DO NOT investigate or modify code further. "
+                " Intent=verify: the next tool call should run the test command "
+                "(typically bash with python -m pytest or python -m django test)."
             )
         elif intent == "investigate":
             intent_directive = (
-                "\nThis is an INVESTIGATE step. Use a read/outline/rg/find_refs/"
-                "goto_def tool. Do NOT mutate files yet. After this step gathers "
-                "the needed evidence, attention will move on to the next step."
+                " Intent=investigate: use a read/outline/rg/find_refs/goto_def "
+                "tool to gather evidence for this step."
             )
 
         hint = (
