@@ -590,17 +590,48 @@ def call_stipulator_phased(
         {"role": "system", "content": STIPULATOR_COLD_SYSTEM_PROMPT},
         {"role": "user", "content": f"OBLIGATION:\n{obligation}{env_section}{templates_section}"},
     ]
-    result = llm.chat(
-        messages=messages,
-        response_format={"type": "json_object"},
-        role_tag="stipulator",
-        temperature=0.1,
-        parent_event_id=parent_event_id,
-    )
-    if not result.text:
-        return None, result
-    parsed = _parse_phased_plan(result.text)
-    return parsed, result
+
+    # R12 follow-up: retry-on-schema-failure. Cheap "flash" LLMs sometimes
+    # collapse the phased schema into a v1-style flat array even though the
+    # response is valid JSON; the previous behaviour silently fell through
+    # to v1 call_stipulator and burned tokens running naked. We now retry up
+    # to MAX_PHASED_RETRIES times with an explicit correction message before
+    # giving up — when the caller sees None it MUST fail the contract, not
+    # synthesize a flat plan.
+    MAX_PHASED_RETRIES = 2  # → 3 total attempts
+    last_result: Optional[LLMResult] = None
+    for attempt in range(MAX_PHASED_RETRIES + 1):
+        result = llm.chat(
+            messages=messages,
+            response_format={"type": "json_object"},
+            role_tag="stipulator",
+            temperature=0.1,
+            parent_event_id=parent_event_id,
+        )
+        last_result = result
+        if not result.text:
+            # Degenerate or empty — the underlying chat() already retried on
+            # this in R11; no point asking again in our loop. Bail.
+            return None, result
+        parsed = _parse_phased_plan(result.text)
+        if parsed is not None:
+            return parsed, result
+        # Schema mismatch — append a correction message and retry.
+        if attempt < MAX_PHASED_RETRIES:
+            messages = messages + [
+                {"role": "assistant", "content": result.text[:2000]},
+                {"role": "user", "content": (
+                    "Your previous response did not match the PhasedPlan schema. "
+                    "It must be a JSON object with a top-level `phases` array. "
+                    "Each phase has a `name` (one of MAP, DESIGN, IMPLEMENT, VERIFY) "
+                    "and a `steps` array. Each step has `description`, `intent` "
+                    "(one of investigate, design, mutate, verify, other), and "
+                    "an `expects` object. DO NOT emit a flat `[{id, description}]` "
+                    "list. Try again, JSON only, no prose."
+                )},
+            ]
+    # Exhausted retries — caller (activator) must fail the contract.
+    return None, last_result  # type: ignore[return-value]
 
 
 def _parse_phased_plan(text: str) -> Optional[dict[str, Any]]:

@@ -22,7 +22,6 @@ from cat.contracts import Contract, ContractState, State
 from cat.llm import (
     call_stipulator_phased,
     call_revisor,
-    call_stipulator,  # fallback
     call_attestor,
 )
 from cat.obligation_class import compute_obligation_class
@@ -125,19 +124,19 @@ class ActivatorV2(Activator):
                     flat_steps.append(_PlanStep(id=step_id, description=n.description))
             run.plan = flat_steps
         else:
-            # Fallback: use v1 call_stipulator
-            steps, planner_result2 = call_stipulator(
-                self.llm,
-                contract.obligation,
-                representations=contract.representations or None,
-                parent_event_id=represent_event_id,
-            )
-            self._charge_llm(contract, planner_result2)
-            if not steps:
-                steps = [{"id": "s1", "description": contract.obligation.strip().splitlines()[0][:200]}]
-            run.plan = [_PlanStep(id=s["id"], description=s["description"]) for s in steps]
-            plan_tree = None
+            # R12 follow-up: phased stipulator exhausted its retry budget.
+            # Do NOT fall back to v1 flat plan — that disables every piece of
+            # v2 machinery (no surprise, no plan_commit, no Revisor) and burns
+            # tokens running "naked". Fail the contract cleanly instead.
+            run.plan = []
             run.plan_tree = None  # type: ignore[attr-defined]
+            self._transition(
+                contract, ContractState.FAILED,
+                "stipulator failed to emit a valid PhasedPlan after retries", run,
+            )
+            run.failure_reason = "stipulator_schema_failure"
+            self._finalize(contract, run)
+            return run
 
         # Emit contract_stipulate (chains from planner llm_usage)
         event_id = f"dec-{uuid.uuid4().hex[:6]}"
@@ -433,6 +432,76 @@ class ActivatorV2(Activator):
                 return False, []
         return False, []
 
+    def _infer_verifier_outcome(self, run: ActivatorRun) -> Optional[str]:
+        """R12 Bug B: parse last test-running tool output for PASS/FAIL.
+
+        Without this, surprise.verifier_match defaults vacuously True and a
+        failing pytest can silently advance a verify step. Returns "PASS",
+        "FAIL", or None when the last tool call wasn't a recognizable test
+        invocation (so we don't false-positive on unrelated bash output).
+        """
+        if not run.messages:
+            return None
+        last_tool_msg_idx = None
+        for i in range(len(run.messages) - 1, -1, -1):
+            if run.messages[i].get("role") == "tool":
+                last_tool_msg_idx = i
+                break
+        if last_tool_msg_idx is None:
+            return None
+        # Find the assistant tool_call that produced this result
+        tool_name = ""
+        cmd = ""
+        for j in range(last_tool_msg_idx - 1, -1, -1):
+            m = run.messages[j]
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                tc = m["tool_calls"][0]
+                tool_name = tc.get("function", {}).get("name", "")
+                args_raw = tc.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except Exception:
+                    args = {}
+                cmd = (args.get("command", "") or "").lower()
+                break
+
+        # Only infer on test-runner commands: pytest, runtests.py, tox, unittest
+        # (bash invocations of test runners) — or our dedicated oracle capability.
+        is_test_invocation = (
+            tool_name in ("oracle", "runtests") or
+            (tool_name == "bash" and any(p in cmd for p in (
+                "pytest", "runtests", "tox", "unittest", "django-admin test",
+            )))
+        )
+        if not is_test_invocation:
+            return None
+
+        content = run.messages[last_tool_msg_idx].get("content", "") or ""
+        if not isinstance(content, str):
+            return None
+        if content.startswith("[ERROR]"):
+            return "FAIL"
+        lc = content.lower()
+        # Clear failure signatures first
+        fail_markers = (
+            " failed", "failed,", "failed]", "= fail", "errored",
+            "traceback (most recent call last)", "internalerror",
+            "no module named",
+        )
+        if any(m in lc for m in fail_markers):
+            return "FAIL"
+        # FAILED in caps (pytest summary)
+        if "FAILED" in content or "ERROR" in content[-2000:]:
+            return "FAIL"
+        # Pass signatures
+        if "passed" in lc and "failed" not in lc:
+            return "PASS"
+        # "no tests ran" — vacuously OK but the verify step is meaningless;
+        # treat as None so we don't false-advance.
+        if "no tests ran" in lc:
+            return None
+        return None
+
     def _observe_phase(
         self,
         contract: Contract,
@@ -449,8 +518,17 @@ class ActivatorV2(Activator):
         the heuristic. This replaces the v1.7 _update_plan_checklist's
         attestor-over-every-step with one focused attestor call per iter.
         """
+        # R12 Bug A: when the cold-start stipulator failed to emit a phased
+        # plan, we fell through to the v1 flat-plan path with plan_tree=None
+        # and attention_node=None. Dereferencing attention_node.intent below
+        # would crash; the try/except wrapping the caller would then spin
+        # without ever advancing. Skip observation entirely in that case.
+        if attention_node is None or plan_tree is None:
+            return
+
         # Approximate: did the last tool call modify the filesystem?
         actual_durable_change, actual_files = self._infer_durable_change(run)
+        actual_verifier_outcome = self._infer_verifier_outcome(run)
 
         # Update counts
         run.run_counts.bump(attention_node.intent)  # type: ignore[attr-defined]
@@ -469,6 +547,7 @@ class ActivatorV2(Activator):
             actual_cost=float(actual_cost),
             actual_durable_change=actual_durable_change,
             actual_files_modified=actual_files,
+            actual_verifier_outcome=actual_verifier_outcome,
         )
 
         # R7: step_done requires CONSISTENCY across all 7 dimensions

@@ -1,7 +1,8 @@
 """Tests for the v2 phased Stipulator + in-loop ops parser."""
 import json
+from unittest.mock import MagicMock
 
-from cat.llm import _parse_phased_plan, _parse_inloop_ops
+from cat.llm import _parse_phased_plan, _parse_inloop_ops, call_stipulator_phased, LLMResult
 
 
 def test_parse_phased_plan_basic():
@@ -113,6 +114,76 @@ def test_parse_inloop_ops_drops_unknown_op():
 
 def test_parse_inloop_ops_invalid_json():
     assert _parse_inloop_ops("{nope") is None
+
+
+def _good_phased_json():
+    return json.dumps({
+        "phases": [
+            {"name": "MAP", "steps": [
+                {"description": "read X", "intent": "investigate",
+                 "expects": {"durable_change": False}}
+            ]},
+        ]
+    })
+
+
+def _flat_v1_json():
+    """A response in the OLD v1 flat schema — what we observed deepseek-v4-flash
+    occasionally emit. Pydantic rejects this; the retry should fire."""
+    return json.dumps([
+        {"id": "s1", "description": "Edit X"},
+        {"id": "s2", "description": "Run pytest"},
+    ])
+
+
+def _mk_llm_result(text):
+    return LLMResult(text=text, tokens_in=10, tokens_out=10, usd=0.0, model="m",
+                     finish_reason="stop")
+
+
+def test_call_stipulator_phased_succeeds_first_try():
+    """Happy path: first LLM call returns valid PhasedPlan → no retry."""
+    llm = MagicMock()
+    llm.chat.return_value = _mk_llm_result(_good_phased_json())
+    plan, _ = call_stipulator_phased(llm, "obligation X")
+    assert plan is not None
+    assert len(plan["phases"]) == 1
+    assert llm.chat.call_count == 1
+
+
+def test_call_stipulator_phased_retries_on_flat_schema():
+    """v1 flat schema rejected → retry → second attempt returns good phased."""
+    llm = MagicMock()
+    llm.chat.side_effect = [
+        _mk_llm_result(_flat_v1_json()),
+        _mk_llm_result(_good_phased_json()),
+    ]
+    plan, _ = call_stipulator_phased(llm, "obligation X")
+    assert plan is not None
+    assert llm.chat.call_count == 2
+    # The second call must include the correction message
+    second_messages = llm.chat.call_args_list[1].kwargs["messages"]
+    assert any("PhasedPlan schema" in m.get("content", "") for m in second_messages)
+
+
+def test_call_stipulator_phased_exhausts_retries_returns_none():
+    """All 3 attempts return invalid schema → caller gets None (must fail contract)."""
+    llm = MagicMock()
+    llm.chat.return_value = _mk_llm_result(_flat_v1_json())
+    plan, result = call_stipulator_phased(llm, "obligation X")
+    assert plan is None
+    assert result is not None  # last result returned so caller can log
+    assert llm.chat.call_count == 3  # 1 initial + 2 retries
+
+
+def test_call_stipulator_phased_empty_response_no_retry():
+    """If LLM returns empty text, R11's chat() already handled retries —
+    don't retry again here, just bail."""
+    llm = MagicMock()
+    llm.chat.return_value = _mk_llm_result("")
+    plan, _ = call_stipulator_phased(llm, "obligation X")
+    assert plan is None
+    assert llm.chat.call_count == 1
 
 
 def test_inloop_branch_with_alt_steps():

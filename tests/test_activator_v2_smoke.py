@@ -110,3 +110,114 @@ def test_step_appears_done_tool_error_blocks():
     from cat.surprise import SurpriseVector
     sv = SurpriseVector()
     assert not activator._step_appears_done(run, attention, sv)
+
+
+# ── R12 Bug B: verifier_outcome inference from bash/test output ────────────
+
+
+def _mk_run_with_last_bash(command: str, output: str):
+    """Build a minimal ActivatorRun-like object exposing run.messages so
+    _infer_verifier_outcome can walk back to the assistant tool_call."""
+    run = MagicMock()
+    run.messages = [
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": json.dumps({"command": command})},
+        }]},
+        {"role": "tool", "tool_call_id": "c1", "content": output},
+    ]
+    return run
+
+
+def test_infer_verifier_outcome_pytest_pass():
+    activator = ActivatorV2.__new__(ActivatorV2)
+    run = _mk_run_with_last_bash(
+        "python -m pytest tests/",
+        "=========== 42 passed in 1.23s ===========",
+    )
+    assert activator._infer_verifier_outcome(run) == "PASS"
+
+
+def test_infer_verifier_outcome_pytest_fail():
+    activator = ActivatorV2.__new__(ActivatorV2)
+    run = _mk_run_with_last_bash(
+        "python -m pytest tests/",
+        "=========== 3 failed, 39 passed in 1.23s ===========",
+    )
+    assert activator._infer_verifier_outcome(run) == "FAIL"
+
+
+def test_infer_verifier_outcome_django_runtests_fail():
+    activator = ActivatorV2.__new__(ActivatorV2)
+    run = _mk_run_with_last_bash(
+        "python tests/runtests.py auth_tests",
+        "Ran 12 tests in 0.5s\nFAILED (failures=1)",
+    )
+    assert activator._infer_verifier_outcome(run) == "FAIL"
+
+
+def test_infer_verifier_outcome_traceback_is_fail():
+    activator = ActivatorV2.__new__(ActivatorV2)
+    run = _mk_run_with_last_bash(
+        "pytest -q",
+        "Traceback (most recent call last):\n  File ...\nImportError: no such module",
+    )
+    assert activator._infer_verifier_outcome(run) == "FAIL"
+
+
+def test_infer_verifier_outcome_tool_error_is_fail():
+    activator = ActivatorV2.__new__(ActivatorV2)
+    run = _mk_run_with_last_bash(
+        "pytest tests/",
+        "[ERROR] timed out after 120s",
+    )
+    assert activator._infer_verifier_outcome(run) == "FAIL"
+
+
+def test_infer_verifier_outcome_non_test_command_returns_none():
+    """A `bash` ls call must NOT be interpreted as a verifier outcome."""
+    activator = ActivatorV2.__new__(ActivatorV2)
+    run = _mk_run_with_last_bash(
+        "ls -la",
+        "passed/  failed/  README.md",  # words that look like markers but aren't a test run
+    )
+    assert activator._infer_verifier_outcome(run) is None
+
+
+def test_infer_verifier_outcome_no_tests_ran_is_none():
+    """`no tests ran` is too ambiguous to advance a verify step."""
+    activator = ActivatorV2.__new__(ActivatorV2)
+    run = _mk_run_with_last_bash(
+        "pytest tests/missing_module/",
+        "==== no tests ran in 0.01s ====",
+    )
+    assert activator._infer_verifier_outcome(run) is None
+
+
+def test_infer_verifier_outcome_empty_messages():
+    activator = ActivatorV2.__new__(ActivatorV2)
+    run = MagicMock()
+    run.messages = []
+    assert activator._infer_verifier_outcome(run) is None
+
+
+# ── R12 Bug A: _observe_phase must no-op on attention_node=None ────────────
+
+
+def test_observe_phase_noops_when_attention_none():
+    """When stipulator falls back to flat plan (plan_tree=None), the loop
+    sets attention_node=None. _observe_phase must not dereference .intent."""
+    activator = ActivatorV2.__new__(ActivatorV2)
+    activator.recorder = MagicMock()
+    activator.librarian_writer = None
+    contract = MagicMock()
+    run = MagicMock()
+    # Would crash on attention_node.intent if not guarded
+    activator._observe_phase(
+        contract, run,
+        plan_tree=None, attention_node=None,
+        actual_cost=100.0, state_now_class="", oc="abc",
+    )
+    # No surprise event should have been recorded
+    activator.recorder.append.assert_not_called()
