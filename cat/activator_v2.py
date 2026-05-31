@@ -276,8 +276,11 @@ class ActivatorV2(Activator):
         """Append a transient SYSTEM message showing attention + lookahead.
 
         Like the librarian_hint mechanism in v1.7 A.1: ephemeral hint for
-        this turn only; we don't keep it across turns (the next iter will
-        re-inject from updated tree state).
+        this turn only.
+
+        Intent-specific forceful guidance: the agent has a habit of staying
+        in investigate mode on mutate/verify steps. The hint now demands
+        the right tool family for each intent.
         """
         attention = plan_tree.get_attention()
         if not attention:
@@ -286,12 +289,38 @@ class ActivatorV2(Activator):
         lookahead_str = "\n".join(
             f"  - [{n.id}] ({n.intent}) {n.description[:100]}" for n in lookahead[1:]
         ) or "  (none)"
+
+        intent = attention.intent
+        intent_directive = ""
+        if intent == "mutate":
+            files = attention.expects.get("files_modified", [])
+            intent_directive = (
+                "\n⚠️ THIS IS A MUTATE STEP. You MUST use str_replace, multi_edit, "
+                "apply_patch, or write tool to modify a file THIS TURN. DO NOT "
+                "read, search, outline, or otherwise investigate — investigation "
+                "is already complete for this step. "
+            )
+            if files:
+                intent_directive += f"Target file(s): {files}. "
+        elif intent == "verify":
+            intent_directive = (
+                "\n⚠️ THIS IS A VERIFY STEP. You MUST use bash to run the test "
+                "command described. DO NOT investigate or modify code further. "
+            )
+        elif intent == "investigate":
+            intent_directive = (
+                "\nThis is an INVESTIGATE step. Use a read/outline/rg/find_refs/"
+                "goto_def tool. Do NOT mutate files yet. After this step gathers "
+                "the needed evidence, attention will move on to the next step."
+            )
+
         hint = (
             f"PLAN ATTENTION (focus on this one step):\n"
             f"  [{attention.id}] ({attention.phase_name}/{attention.intent}) {attention.description}\n"
             f"  expects: durable_change={attention.expects.get('durable_change', False)}, "
             f"files={attention.expects.get('files_modified', [])}, "
-            f"verifier={attention.expects.get('verifier_outcome', 'N/A')}\n"
+            f"verifier={attention.expects.get('verifier_outcome', 'N/A')}"
+            f"{intent_directive}\n"
             f"\nLOOKAHEAD (do NOT do these yet):\n{lookahead_str}\n"
         )
         # Append transient SYSTEM (will be present for THIS turn only; pruned next iter)
