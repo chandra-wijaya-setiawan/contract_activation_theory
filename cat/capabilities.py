@@ -836,7 +836,9 @@ def build_docker_registry(container: "object", default_workdir: str = "/testbed"
         pattern = args.get("pattern")
         if not isinstance(pattern, str) or not pattern:
             return ToolResult(tool="rg", is_error=True, output="missing 'pattern'")
-        paths = args.get("paths") or "."
+        # Accept both "paths" (canonical, plural) and "path" (singular — LLMs
+        # often use the singular form by analogy with read/list/etc).
+        paths = args.get("paths") or args.get("path") or "."
         if isinstance(paths, list):
             paths_str = " ".join(shlex.quote(str(p)) for p in paths)
         else:
@@ -1113,7 +1115,8 @@ def build_docker_registry(container: "object", default_workdir: str = "/testbed"
         pattern = args.get("pattern")
         if not isinstance(pattern, str) or not pattern:
             return ToolResult(tool="fd", is_error=True, output="missing 'pattern'")
-        paths = args.get("paths") or "."
+        # Accept both "paths" (canonical) and "path" (singular by analogy).
+        paths = args.get("paths") or args.get("path") or "."
         if isinstance(paths, list):
             paths_str = " ".join(shlex.quote(str(p)) for p in paths)
         else:
