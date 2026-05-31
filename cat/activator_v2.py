@@ -317,35 +317,18 @@ class ActivatorV2(Activator):
             f"  - [{n.id}] ({n.intent}) {n.description[:100]}" for n in lookahead[1:]
         ) or "  (none)"
 
-        intent = attention.intent
-        intent_directive = ""
-        if intent == "mutate":
-            files = attention.expects.get("files_modified", [])
-            intent_directive = (
-                " Intent=mutate: the next tool call should write to a file via "
-                "str_replace, multi_edit, apply_patch, or write."
-            )
-            if files:
-                intent_directive += f" Target file(s): {files}."
-        elif intent == "verify":
-            intent_directive = (
-                " Intent=verify: the next tool call should run the test command "
-                "(typically bash with python -m pytest or python -m django test)."
-            )
-        elif intent == "investigate":
-            intent_directive = (
-                " Intent=investigate: use a read/outline/rg/find_refs/goto_def "
-                "tool to gather evidence for this step."
-            )
-
+        # R3 intent-directive was rolled back — empirically the R4-validate
+        # run showed it caused 3-of-4 tasks to crash with degenerate LLM
+        # responses. Reverting to the original concise attention hint that
+        # the swe10 v2 baseline run (8/10 pass) used. Intent steering is
+        # already implicit in the description + expects fields.
         hint = (
             f"PLAN ATTENTION (focus on this one step):\n"
             f"  [{attention.id}] ({attention.phase_name}/{attention.intent}) {attention.description}\n"
             f"  expects: durable_change={attention.expects.get('durable_change', False)}, "
             f"files={attention.expects.get('files_modified', [])}, "
-            f"verifier={attention.expects.get('verifier_outcome', 'N/A')}"
-            f"{intent_directive}\n"
-            f"\nLOOKAHEAD (do NOT do these yet):\n{lookahead_str}\n"
+            f"verifier={attention.expects.get('verifier_outcome', 'N/A')}\n"
+            f"\nUPCOMING (informational, not for this turn):\n{lookahead_str}\n"
         )
         # Append transient SYSTEM (will be present for THIS turn only; pruned next iter)
         run.messages.append({"role": "system", "content": hint})

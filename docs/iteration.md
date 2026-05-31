@@ -205,8 +205,14 @@ new component is added or a role changes.
 ║       │  │   - compute state_class (deterministic)          │    │     ║
 ║       │  │   - read attention from PlanTree (no LLM)        │    │     ║
 ║       │  │   - lookahead (no LLM)                           │    │     ║
-║       │  │   - simulate from step.expects + Librarian       │    │     ║
-║       │  │     (deterministic lookup)                       │    │     ║
+║       │  │   - SIMULATE                                     │    │     ║
+║       │  │       mechanical: librarian.predict_det          │    │     ║
+║       │  │       reasoning:  read step.description +.expects│    │     ║
+║       │  │       (both deterministic; no new LLM call)      │    │     ║
+║       │  │   - DECIDE                                       │    │     ║
+║       │  │       if budget/PASS-confidence bad:             │    │     ║
+║       │  │         Stipulator-in-loop (LLM) ← conditional   │    │     ║
+║       │  │       else proceed to ACTION                     │    │     ║
 ║       │  │   - inject attention hint into Performer context │    │     ║
 ║       │  │                                                  │    │     ║
 ║       │  │ ACTION phase                                     │    │     ║
@@ -295,6 +301,23 @@ The Attestor is **one signal among seven**, not the gatekeeper.
 >
 > The **Criterion check** is the deterministic oracle test that decides
 > contract fulfillment. It lives in the outer loop, not the inner.
+
+### LLM-call cadence per iter
+
+PLAN is deterministic by default, with ONE conditional LLM escape:
+
+| iter shape | LLM calls | which roles |
+|---|---|---|
+| steady (no surprise, forecast OK) | **2** | Performer + Attestor |
+| surprise in OBSERVE | **3** | Performer + Attestor + Stipulator-in-loop |
+| bad forecast in PLAN | **3** | Stipulator-in-loop + Performer + Attestor |
+| both | **4** | Performer + Attestor + Stipulator-in-loop ×2 |
+
+The deliberate omission is "Plan-reasoner LLM" — an unconditional LLM call
+in PLAN that re-reasons about the upcoming step. We don't have it because:
+(a) the step.description IS the LLM's prior reasoning emitted at Stipulate
+time, (b) the Performer implicitly imagines before emitting the tool call,
+(c) adding an unconditional 3rd LLM call would inflate steady-state cost.
 
 ---
 
