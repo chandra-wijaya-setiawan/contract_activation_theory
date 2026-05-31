@@ -198,6 +198,7 @@ class ActivatorV2(Activator):
                 self._inject_plan_attention(run, plan_tree)
 
             cost_before = contract.cost.tokens_in + contract.cost.tokens_out
+            iter_start_len = len(run.messages)
 
             # ACTION (Step 5+6: SELECT + PERFORM)
             keep_going = self._perform_once(contract, state, run)
@@ -252,6 +253,12 @@ class ActivatorV2(Activator):
             # attention node — that's the authoritative signal. Running it
             # again over the full flat plan would cost +N attestor calls per
             # iter for no extra signal.
+
+            # P1 sliding window — drop oldest raw turn → compressed prior_attempts.
+            # Same as v1.7 to prevent message history bloat (pytest-6202 burned
+            # 218K performer-input tokens because of unbounded growth).
+            turn_msgs = run.messages[iter_start_len:]
+            self._prune_to_window(contract, run, turn_msgs)
             self._update_plan_checklist(contract, run)
 
             # P1 sliding window prune (same as v1)
