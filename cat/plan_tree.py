@@ -255,6 +255,27 @@ class PlanTree:
         # Filter out non-dict entries (LLM sometimes emits strings)
         substeps = [s for s in substeps if isinstance(s, dict)]
         parent = self.nodes[node_id]
+        # R17: intent-preservation rule. If the parent has mutate intent, at
+        # least one substep must also be mutate; otherwise the refine loses
+        # the original mutation requirement and the agent never writes the
+        # fix (observed on django-11239: PlanPatcher refined a mutate step
+        # into all-investigate substeps → plan exhausted without any edit).
+        # Same logic for verify-intent parents: a verify step refined into
+        # only investigate substeps drops the verification.
+        if parent.intent in ("mutate", "verify"):
+            sub_intents = [
+                s.get("intent") if s.get("intent") in (
+                    "investigate", "design", "mutate", "verify"
+                ) else "other"
+                for s in substeps
+            ]
+            if parent.intent not in sub_intents:
+                return False, (
+                    f"REFINE: parent {node_id!r} has intent={parent.intent!r} "
+                    f"but no substep preserves that intent (got {sub_intents}). "
+                    f"At least one substep must keep the parent's intent so "
+                    f"the original requirement is not dropped."
+                )
         # The refined node becomes a parent: its status pending; substeps become its children
         for idx, sub in enumerate(substeps, start=1):
             sub_id = f"{node_id}.{idx}"

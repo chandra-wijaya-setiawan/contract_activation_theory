@@ -537,6 +537,11 @@ When to use which (surprise → op):
 
 Rules:
 - Every op MUST include a `reflection` field (a short sentence on WHY this op).
+- ⭐ REFINE intent-preservation: if the parent step has intent='mutate', at
+  least ONE substep MUST also have intent='mutate' (the actual edit). Don't
+  refine a mutate step into only investigate substeps — you would lose the
+  edit and the agent would never write the fix. Same for verify: if parent
+  is intent='verify', at least one substep must remain verify.
 - Output ONLY JSON. No prose around it.
 
 Output shape:

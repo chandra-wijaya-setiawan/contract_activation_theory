@@ -120,6 +120,61 @@ def test_refine_op_shifts_attention():
     assert tree.nodes["B1.1"].status == "active"
 
 
+def test_refine_rejects_mutate_into_all_investigate():
+    """R17: REFINE of a mutate-intent parent must keep at least one mutate substep.
+    Otherwise the original mutation requirement is dropped (django-11239 pattern)."""
+    tree = PlanTree.from_phased_plan(SAMPLE_PLAN)
+    tree.apply_op(TreeEditOp("COMMIT", {"node_id": "A1", "reason": ""}, ""))
+    tree.apply_op(TreeEditOp("COMMIT", {"node_id": "A2", "reason": ""}, ""))
+    tree.apply_op(TreeEditOp("CHECKOUT", {"node_id": "B1"}, ""))
+    # parent B1 has intent=mutate (from SAMPLE_PLAN). Refine into all-investigate:
+    ok, err = tree.apply_op(TreeEditOp("REFINE", {
+        "node_id": "B1",
+        "substeps": [
+            {"description": "read file again", "intent": "investigate"},
+            {"description": "search for callers", "intent": "investigate"},
+        ],
+    }, "trying to learn more first"))
+    assert not ok
+    assert "mutate" in err.lower()
+    # The substeps must not have been created
+    assert "B1.1" not in tree.nodes
+    assert tree.attention_id == "B1"  # unchanged
+
+
+def test_refine_accepts_mutate_with_at_least_one_mutate_substep():
+    """R17 happy path: at least one mutate substep → accept."""
+    tree = PlanTree.from_phased_plan(SAMPLE_PLAN)
+    tree.apply_op(TreeEditOp("COMMIT", {"node_id": "A1", "reason": ""}, ""))
+    tree.apply_op(TreeEditOp("COMMIT", {"node_id": "A2", "reason": ""}, ""))
+    tree.apply_op(TreeEditOp("CHECKOUT", {"node_id": "B1"}, ""))
+    ok, err = tree.apply_op(TreeEditOp("REFINE", {
+        "node_id": "B1",
+        "substeps": [
+            {"description": "investigate the method", "intent": "investigate"},
+            {"description": "apply the str_replace edit", "intent": "mutate",
+             "expects": {"durable_change": True}},
+        ],
+    }, "split investigate + edit"))
+    assert ok, err
+    assert tree.nodes["B1.1"].intent == "investigate"
+    assert tree.nodes["B1.2"].intent == "mutate"
+
+
+def test_refine_allows_non_mutate_parent_into_anything():
+    """R17 doesn't restrict refinement of investigate/design parents."""
+    tree = PlanTree.from_phased_plan(SAMPLE_PLAN)
+    # A1 is investigate intent in SAMPLE_PLAN; refining to all-design is fine.
+    ok, err = tree.apply_op(TreeEditOp("REFINE", {
+        "node_id": "A1",
+        "substeps": [
+            {"description": "decide approach", "intent": "design"},
+            {"description": "consider alternatives", "intent": "design"},
+        ],
+    }, "redirect to design"))
+    assert ok, err
+
+
 def test_branch_op():
     tree = PlanTree.from_phased_plan(SAMPLE_PLAN)
     tree.apply_op(TreeEditOp("COMMIT", {"node_id": "A1", "reason": ""}, ""))
