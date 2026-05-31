@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 Intent = Literal["investigate", "design", "mutate", "verify", "other"]
@@ -95,9 +95,18 @@ class PlanStep(BaseModel):
             "{'pattern': 'def is_zero', 'paths': '/testbed/sympy/core/expr.py'} for rg, "
             "{'path': '/testbed/foo.py', 'old_str': 'return False', 'new_str': 'return None'} "
             "for str_replace. For mutate steps, BE SPECIFIC: include the exact target file, "
-            "the exact old_str pattern, the exact new_str replacement."
+            "the exact old_str pattern, the exact new_str replacement. "
+            "May be null/omitted for design steps that have no associated tool — "
+            "the validator coerces null to {} so downstream consumers can rely on dict-like access."
         ),
     )
+
+    @field_validator("suggested_args", mode="before")
+    @classmethod
+    def _coerce_none_to_empty_dict(cls, v):
+        # Stipulator system prompt allows null for design steps; downstream
+        # code accesses this as a dict (.get()), so normalize at the boundary.
+        return v if isinstance(v, dict) else {}
     expects: StepExpects = Field(
         default_factory=StepExpects,
         description="Predicted result of this step; used by the attestor.",

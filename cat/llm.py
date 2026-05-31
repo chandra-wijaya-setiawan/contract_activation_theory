@@ -668,6 +668,11 @@ def _parse_phased_plan(text: str) -> Optional[dict[str, Any]]:
                 exp = s.get("expects")
                 if not isinstance(exp, dict):
                     s["expects"] = {}
+                # suggested_args may be null (e.g. design steps without an
+                # associated tool) — Pydantic accepts None but we coerce here
+                # so downstream code that calls .get() on it doesn't break.
+                if s.get("suggested_args") is None:
+                    s["suggested_args"] = {}
         try:
             plan = PhasedPlan.model_validate(data)
         except ValidationError:
