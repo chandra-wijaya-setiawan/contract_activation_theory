@@ -213,70 +213,25 @@ class ActivatorV2(Activator):
             cost_after = contract.cost.tokens_in + contract.cost.tokens_out
             actual_cost = cost_after - cost_before
 
-            # OBSERVE phase
-            if plan_tree and attention_node:
-                # Approximate: did the last tool call modify the filesystem?
-                actual_durable_change, actual_files = self._infer_durable_change(run)
-                # Update counts
-                run.run_counts.bump(attention_node.intent)  # type: ignore[attr-defined]
-                if actual_durable_change:
-                    run.run_counts.mark_durable_change()  # type: ignore[attr-defined]
-                else:
-                    run.run_counts.tick_no_change()  # type: ignore[attr-defined]
-
-                state_next_class = compute_state_class(
-                    oc, attention_node.phase_name, attention_node.intent, run.run_counts  # type: ignore[attr-defined]
+            # OBSERVE phase — wrapped to guarantee loop continues even if helpers fail
+            try:
+                self._observe_phase(
+                    contract, run, plan_tree, attention_node, actual_cost,
+                    state_now_class, oc,
                 )
-
-                # Surprise vector
-                sv = compute_surprise(
-                    expects=attention_node.expects,
-                    actual_cost=float(actual_cost),
-                    actual_durable_change=actual_durable_change,
-                    actual_files_modified=actual_files,
-                )
-
-                # Record surprise event
+            except Exception as e:
+                # Log + force-advance to prevent infinite loop on crash
+                import traceback
                 self.recorder.append(TraceEvent(
-                    event_id=f"sup-{uuid.uuid4().hex[:6]}",
+                    event_id=f"err-{uuid.uuid4().hex[:6]}",
                     parent_id=run.last_perform_event_id or run.last_iter_anchor,
                     ts=utcnow_iso(),
                     kind="surprise",
-                    payload={
-                        "iter": run.iterations,
-                        "attention_id": attention_node.id,
-                        "state_now": state_now_class,
-                        "state_next": state_next_class,
-                        **sv.to_dict(),
-                    },
+                    payload={"error": str(e), "trace": traceback.format_exc()[:500]},
                 ))
-
-                # v2 — decide whether the step "looks done" by intent
-                step_done = self._step_appears_done(run, attention_node, sv)
-
-                if step_done:
-                    # Step looks complete → COMMIT + advance
+                if attention_node:
                     self._default_advance(plan_tree, attention_node, run)
-                elif sv.any_surprised and getattr(run, "restip_count", 0) < self.max_restip_per_task:
-                    # Step not done AND surprised → re-stipulate
-                    ops_applied = self._run_inloop_stipulate(contract, run, plan_tree, sv, state_now_class)
-                    run.restip_count = getattr(run, "restip_count", 0) + 1  # type: ignore[attr-defined]
-                    if ops_applied == 0:
-                        # Re-stipulate failed; give the LLM another shot at the same node
-                        # but cap stalling: if we've stalled here twice, force-advance
-                        att_id = attention_node.id
-                        run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
-                        run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
-                        if run._stall_count[att_id] >= 3:
-                            self._default_advance(plan_tree, attention_node, run)
-                else:
-                    # Not done, but not surprised — let the LLM take another shot at same node
-                    att_id = attention_node.id
-                    run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
-                    run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
-                    if run._stall_count[att_id] >= 3:
-                        # forced advance to prevent infinite loop
-                        self._default_advance(plan_tree, attention_node, run)
+
 
             # Step 7: VERIFY criterion on interval
             all_steps_done = bool(run.plan) and all(s.complete for s in run.plan)
@@ -382,6 +337,102 @@ class ActivatorV2(Activator):
                     return True, files
                 return False, []
         return False, []
+
+    def _observe_phase(
+        self,
+        contract: Contract,
+        run: ActivatorRun,
+        plan_tree: PlanTree,
+        attention_node,
+        actual_cost: float,
+        state_now_class: str,
+        oc: str,
+    ) -> None:
+        """End-of-iter OBSERVE phase. Computes surprise, applies tree edits."""
+        # Approximate: did the last tool call modify the filesystem?
+        actual_durable_change, actual_files = self._infer_durable_change(run)
+
+        # Update counts
+        run.run_counts.bump(attention_node.intent)  # type: ignore[attr-defined]
+        if actual_durable_change:
+            run.run_counts.mark_durable_change()  # type: ignore[attr-defined]
+        else:
+            run.run_counts.tick_no_change()  # type: ignore[attr-defined]
+
+        state_next_class = compute_state_class(
+            oc, attention_node.phase_name, attention_node.intent, run.run_counts  # type: ignore[attr-defined]
+        )
+
+        # Surprise vector
+        sv = compute_surprise(
+            expects=attention_node.expects,
+            actual_cost=float(actual_cost),
+            actual_durable_change=actual_durable_change,
+            actual_files_modified=actual_files,
+        )
+
+        # Record surprise event
+        self.recorder.append(TraceEvent(
+            event_id=f"sup-{uuid.uuid4().hex[:6]}",
+            parent_id=run.last_perform_event_id or run.last_iter_anchor,
+            ts=utcnow_iso(),
+            kind="surprise",
+            payload={
+                "iter": run.iterations,
+                "attention_id": attention_node.id,
+                "state_now": state_now_class,
+                "state_next": state_next_class,
+                **sv.to_dict(),
+            },
+        ))
+
+        # Record edge in librarian (if configured) for cross-task transfer
+        if self.librarian_writer is not None:
+            try:
+                action_class = self._compute_action_class(run, attention_node)
+                outcome_label = "PASS" if not sv.any_surprised else "SURPRISE"
+                self.librarian_writer.record_edge(
+                    state_now_class,
+                    action_class,
+                    state_next_class,
+                    int(actual_cost),
+                    outcome_label,
+                    task_id=contract.id,
+                )
+            except Exception:
+                pass
+
+        # Decide step status by intent
+        step_done = self._step_appears_done(run, attention_node, sv)
+
+        if step_done:
+            self._default_advance(plan_tree, attention_node, run)
+        elif sv.any_surprised and getattr(run, "restip_count", 0) < self.max_restip_per_task:
+            ops_applied = self._run_inloop_stipulate(contract, run, plan_tree, sv, state_now_class)
+            run.restip_count = getattr(run, "restip_count", 0) + 1  # type: ignore[attr-defined]
+            if ops_applied == 0:
+                att_id = attention_node.id
+                run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
+                run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
+                if run._stall_count[att_id] >= 3:
+                    self._default_advance(plan_tree, attention_node, run)
+        else:
+            att_id = attention_node.id
+            run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
+            run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
+            if run._stall_count[att_id] >= 3:
+                self._default_advance(plan_tree, attention_node, run)
+
+    def _compute_action_class(self, run: ActivatorRun, attention_node) -> str:
+        """Cheap action class hash: tool_name + intent + phase_name."""
+        import hashlib
+        last_tool = "?"
+        for m in reversed(run.messages):
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                last_tool = m["tool_calls"][0].get("function", {}).get("name", "?")
+                break
+        key = f"{last_tool}|{attention_node.intent}|{attention_node.phase_name}"
+        return hashlib.sha256(key.encode()).hexdigest()[:12]
 
     def _step_appears_done(self, run: ActivatorRun, attention_node, sv: SurpriseVector) -> bool:
         """Per-intent heuristic for whether the current attention node looks complete.

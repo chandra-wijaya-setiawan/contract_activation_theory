@@ -57,31 +57,54 @@ Total est ~1000 LOC. Aggressive.
 
 ## Progress log
 
-(updated as I execute)
+### M1 — plan_tree ✓
+- 16/16 unit tests green
+- `cat/plan_tree.py`: PlanTree, PlanNode, 7 ops (COMMIT, CHECKOUT, BRANCH, MERGE, DROP, COMMIT_NEW, REFINE), serialization
+- Committed.
 
-### M1 — plan_tree
-- Status: pending
+### M2 — Stipulator phased schema ✓
+- 12/12 unit tests green
+- `cat/llm.py`: `call_stipulator_phased`, `call_stipulator_inloop`, validators
+- Cold-start schema (§6.1) and in-loop op schema (§6.2) both validated
+- Committed.
 
-### M2 — Stipulator schema
-- Status: pending
+### M3 — canonicalization ✓
+- 12/12 unit tests green
+- `cat/obligation_class.py`: L1 categorical hash (framework + subsystem-top-2)
+- `cat/state_class_v2.py`: 9-component bucketed hash with RunCounts
+- Committed.
 
-### M3 — canonicalization
-- Status: pending
+### M4 — surprise + swe1 ✓
+- 12/12 surprise unit tests green
+- `cat/surprise.py`: 6-dim surprise vector + any_surprised
+- `cat/activator_v2.py`: subclass of Activator with new run() flow
+- `cat/tb_agents.py`: CAT_V2=1 toggle
+- swe1 (django-11239) ran end-to-end → 0/1 (gate: end-to-end execution met)
+- Fix landed: `_step_appears_done` per-intent heuristic + stall-counter
+- Committed.
 
-### M4 — surprise + swe1
-- Status: pending
+### M5 — in-loop Stipulator + swe3 ✓ (architecturally; running validation)
+- In-loop Stipulator already integrated into ActivatorV2 in M4
+- swe3 running with chronological persistent librarian: sphinx-10323,
+  django-10880, django-11239
 
-### M5 — in-loop Stipulator + swe3
-- Status: pending
-
-### M6 — librarian + swe10
-- Status: pending
+### M6 — librarian writes + chronological swe10
+- `cat/librarian_v2.py` written, 5/5 unit tests green
+- Persistent SQLite DB at `data/librarian_v2/v2.db`
+- Read (templates + anti-templates) wired into Stipulator cold-start
+- Write (plan_trees + edges) wired into ActivatorV2 finalization
+- swe10 to follow swe3
 
 ### M7 — comparison
-- Status: pending
+- `scripts/compare_v2_vs_baseline.py` written
+- Baseline: v1.7 A.2 fixed at 8/10
 
 ## Risk log
 
-(things I notice that could derail the run; track + mitigate)
-
-(none yet)
+- **Plan length**: Stipulator may emit short plans (<5 steps) for complex tasks.
+  Mitigation: prompt strengthened with explicit step-count guidance.
+- **Step auto-commit**: investigate steps with empty tool output were auto-
+  committing. Fixed via `_step_appears_done` + stall counter.
+- **In-loop re-stipulate cost**: capped at 5 per task by max_restip_per_task.
+- **First swe1 result**: 0/1 on django-11239. Same task often fails in
+  baseline. Need swe3+ to evaluate properly.

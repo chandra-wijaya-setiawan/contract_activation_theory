@@ -107,7 +107,7 @@ class PlanTree:
                     phase_name=phase_name,
                     description=desc,
                     intent=intent,
-                    expects=step.get("expects", {}) or {},
+                    expects=(step.get("expects") if isinstance(step.get("expects"), dict) else {}) or {},
                 )
                 tree.nodes[step_id] = step_node
                 phase_node.children.append(step_id)
@@ -212,7 +212,9 @@ class PlanTree:
         parent_id = p.get("parent_id")
         if not parent_id or parent_id not in self.nodes:
             return False, f"COMMIT_NEW: unknown parent_id {parent_id!r}"
-        new_step = p.get("new_step") or {}
+        new_step = p.get("new_step")
+        if not isinstance(new_step, dict):
+            return False, "COMMIT_NEW: new_step must be a dict"
         parent = self.nodes[parent_id]
         # Assign id: if parent is a phase, use phase-step counter; else parent.id + "." + idx
         if parent_id in self.phase_order:
@@ -230,7 +232,7 @@ class PlanTree:
             phase_name=parent.phase_name,
             description=new_step.get("description", ""),
             intent=intent,
-            expects=new_step.get("expects", {}) or {},
+            expects=(new_step.get("expects") if isinstance(new_step.get("expects"), dict) else {}) or {},
             created_at_iter=self._iter,
         )
         self.nodes[step_id] = node
@@ -242,6 +244,8 @@ class PlanTree:
         if not node_id or node_id not in self.nodes:
             return False, f"REFINE: unknown node_id {node_id!r}"
         substeps = p.get("substeps") or []
+        # Filter out non-dict entries (LLM sometimes emits strings)
+        substeps = [s for s in substeps if isinstance(s, dict)]
         parent = self.nodes[node_id]
         # The refined node becomes a parent: its status pending; substeps become its children
         for idx, sub in enumerate(substeps, start=1):
@@ -255,7 +259,7 @@ class PlanTree:
                 phase_name=parent.phase_name,
                 description=sub.get("description", ""),
                 intent=intent,
-                expects=sub.get("expects", {}) or {},
+                expects=(sub.get("expects") if isinstance(sub.get("expects"), dict) else {}) or {},
                 created_at_iter=self._iter,
             )
             self.nodes[sub_id] = node
@@ -273,6 +277,7 @@ class PlanTree:
         if not node_id or node_id not in self.nodes:
             return False, f"BRANCH: unknown node_id {node_id!r}"
         alt_steps = p.get("alt_steps") or []
+        alt_steps = [s for s in alt_steps if isinstance(s, dict)]
         if not alt_steps:
             return False, "BRANCH: alt_steps empty"
         orig = self.nodes[node_id]
@@ -316,7 +321,7 @@ class PlanTree:
                 phase_name=orig.phase_name,
                 description=sub.get("description", ""),
                 intent=intent,
-                expects=sub.get("expects", {}) or {},
+                expects=(sub.get("expects") if isinstance(sub.get("expects"), dict) else {}) or {},
                 created_at_iter=self._iter,
             )
             self.nodes[sub_id] = sub_node
