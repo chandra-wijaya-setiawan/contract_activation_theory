@@ -836,13 +836,22 @@ class ActivatorV2(Activator):
                 if len(recent_tool_msgs) >= 2:
                     break
             state_summary = "\n---\n".join(reversed(recent_tool_msgs)) or "(no tool output yet)"
-            # Add expects hint to the description for attestor's reference
+            # R9: build attestor input with the expects.result done-criterion as
+            # the explicit contract the attestor judges against.
             expects = attention_node.expects if isinstance(attention_node.expects, dict) else {}
+            # Backward-compat: read expects.result first; fall back to old name
+            # 'knowledge_gained' so legacy plans still attest sensibly.
+            expected_result = (
+                str(expects.get("result", "")
+                    or expects.get("knowledge_gained", "")).strip()
+            )
             extended_desc = (
-                f"{attention_node.description}\n"
-                f"  expected durable_change: {expects.get('durable_change', False)}; "
-                f"files_modified: {expects.get('files_modified', [])}; "
-                f"verifier_outcome: {expects.get('verifier_outcome', 'N/A')}"
+                f"description: {attention_node.description}\n"
+                f"intent: {attention_node.intent}\n"
+                f"expected_result: {expected_result or '(none specified)'}\n"
+                f"mechanical_predictions: durable_change={expects.get('durable_change', False)}, "
+                f"files_modified={expects.get('files_modified', [])}, "
+                f"verifier_outcome={expects.get('verifier_outcome', 'N/A')}"
             )
             complete, reason, llm_result = call_attestor(
                 self.llm,

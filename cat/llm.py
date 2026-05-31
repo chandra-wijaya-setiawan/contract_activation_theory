@@ -219,17 +219,28 @@ Output a JSON object with this exact shape:
 
 ATTESTOR_SYSTEM_PROMPT = """\
 You are the ATTESTOR role in a contract-disciplined agent. You receive a STEP \
-description and a STATE SUMMARY (recent tool outputs + workdir snapshot). \
+(description + expected_result + intent) and a STATE SUMMARY (recent tool \
+outputs).
 
-Your job: decide whether the step appears COMPLETE based on the evidence.
+Your job: decide whether `expected_result` HOLDS based on the evidence in \
+STATE SUMMARY. The step is complete iff expected_result is satisfied.
 
-Rules:
-- Be strict. If evidence is missing or ambiguous, mark complete=false.
-- Briefly state the single most important piece of evidence (or what is missing).
-- DO NOT propose actions. The executor decides what to do next.
+KEY INTERPRETATION RULES:
+- expected_result may include OR clauses with NEGATIVE-RESULT possibilities
+  (e.g., "X is defined here OR confirmed not defined here, implying inherited").
+  A search that returned 0 matches IS valid evidence for the negative branch.
+  If the agent searched the right place and got 0 results, that satisfies the
+  negative branch — mark complete=true.
+- expected_result is the CONTRACT. Do not require evidence the contract did
+  not ask for.
+- If expected_result mentions a fact and the STATE SUMMARY confirms or denies
+  that fact within the contract, the step is complete.
+- If the agent ran a tool with output suggesting "no match in requested
+  location, found in broader scope" — this is also a complete answer to a
+  "locate X" step (X is not at the asked location; we now know it's elsewhere).
 
 Output ONLY a JSON object:
-{"complete": true|false, "reason": "<short>"}
+{"complete": true|false, "reason": "<single most important piece of evidence>"}
 """
 
 
@@ -340,14 +351,32 @@ Phases (use this fixed vocabulary):
   - IMPLEMENT — mutate: edit code, write tests
   - VERIFY    — run tests / confirm criteria
 
-Each step has:
-  - description: prose imperative
-  - intent ∈ {investigate, design, mutate, verify}
-  - expects: structured prediction the activator can mechanically verify:
-      - durable_change: bool      — does this step modify files?
-      - files_modified: [paths]   — which files (empty if not a mutate)
-      - verifier_outcome: "PASS"|"FAIL"|"N/A"  — what test outcome to expect
-      - knowledge_gained: str (only for investigate steps; optional)
+Each step has these fields:
+  description: imperative prose (what to do)
+  intent     : "investigate" | "design" | "mutate" | "verify" | "other"
+  expects    : the planner's predictions for when the step is done:
+    - durable_change   bool, true iff this step is expected to modify files
+    - files_modified   list of expected modified file paths (only for mutate)
+    - verifier_outcome "PASS" | "FAIL" | "N/A" (only meaningful for verify)
+    - result           ⭐ THE KEY FIELD: prose statement of what should be
+                       true when this step is done. The attestor uses
+                       'result' as the explicit done-criterion.
+
+⭐ THE 'result' FIELD MUST INCLUDE NEGATIVE-RESULT POSSIBILITIES where they
+apply. A search that returns 0 matches is VALID evidence — write the
+'result' field so the attestor can recognize this. Examples:
+
+  bad result:  "is_zero is defined in numbers.py"
+  good result: "We have located is_zero in numbers.py, OR confirmed it is
+                NOT defined there (which means it is inherited from a parent class)."
+
+  bad result:  "all callers of foo() are identified"
+  good result: "We have a list of caller files for foo(), OR confirmed that
+                foo() has no callers outside its own module."
+
+  for mutate (no negative case needed):
+  good result: "settings.py has been modified: the SSL env vars (PGSSLMODE, ...)
+                are appended to the env dict returned by settings_to_cmd_args_env."
 
 Rules:
 - If ENVIRONMENT facts provide an oracle test command, the LAST step of \
@@ -355,15 +384,10 @@ Rules:
   verifier_outcome=PASS.
 - If ENVIRONMENT provides an INITIAL_TEST_FAILURE, use it to make mutate \
   steps SPECIFIC: name the exact function, the exact field, the exact value.
-- Plans should be 8-20 steps across 3-5 phases (typically 4-6 MAP + 1-2 \
-  DESIGN + 2-5 IMPLEMENT + 1-2 VERIFY). Tasks like "add SSL env vars to \
-  postgres dbshell client" need at minimum: read the client.py, read the \
-  base client.py, read the test_postgresql.py, identify the env-var \
-  mapping, decide return-type, edit the function, run the test. That's \
-  7+ steps. Brief tasks may be smaller; do not pad.
+- Plans should be 8-20 steps across 3-5 phases. Brief tasks smaller; do not pad.
 - DO NOT execute anything. DO NOT include reasoning. Output ONLY the JSON.
 
-Output a JSON object with this exact shape:
+Output a JSON object matching this exact shape:
 {
   "phases": [
     {
@@ -376,7 +400,7 @@ Output a JSON object with this exact shape:
             "durable_change": false,
             "files_modified": [],
             "verifier_outcome": "N/A",
-            "knowledge_gained": "<what you'll know after this>"
+            "result": "<what should be true when done; include negative-result clause if applicable>"
           }
         }
       ]
@@ -477,50 +501,53 @@ def call_stipulator_phased(
 
 
 def _parse_phased_plan(text: str) -> Optional[dict[str, Any]]:
-    """Validate and return a phased plan dict, or None on failure."""
+    """Validate via Pydantic and return a phased plan dict, or None on failure.
+
+    R9: replaces ~50 lines of manual field coercion with PhasedPlan.model_validate_json.
+    Pydantic enforces field types, normalizes intent / phase name enums, coerces
+    Unknown intents → 'other', unknown phase names → 'OTHER'. Steps with empty
+    descriptions are dropped post-validation.
+    """
+    from cat.plan_schema import PhasedPlan
+    from pydantic import ValidationError
+
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict) or "phases" not in data:
-        return None
-    phases = data.get("phases")
-    if not isinstance(phases, list) or not phases:
-        return None
+        plan = PhasedPlan.model_validate_json(text)
+    except (ValidationError, ValueError):
+        # Be lenient: try to coerce unknown enums down to allowed values, then retry
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("phases"), list):
+            return None
+        for p in data.get("phases", []):
+            if not isinstance(p, dict):
+                continue
+            if p.get("name") not in ("MAP", "DESIGN", "IMPLEMENT", "VERIFY", "OTHER"):
+                p["name"] = "OTHER"
+            for s in p.get("steps", []) or []:
+                if not isinstance(s, dict):
+                    continue
+                if s.get("intent") not in ("investigate", "design", "mutate", "verify", "other"):
+                    s["intent"] = "other"
+                exp = s.get("expects")
+                if not isinstance(exp, dict):
+                    s["expects"] = {}
+        try:
+            plan = PhasedPlan.model_validate(data)
+        except ValidationError:
+            return None
+
+    # Drop steps with empty descriptions and empty phases
     cleaned_phases: list[dict[str, Any]] = []
-    for p in phases:
-        if not isinstance(p, dict):
-            continue
-        name = p.get("name", "OTHER")
-        if name not in ("MAP", "DESIGN", "IMPLEMENT", "VERIFY", "OTHER"):
-            name = "OTHER"
-        steps = p.get("steps") or []
-        if not isinstance(steps, list):
-            steps = []
-        cleaned_steps: list[dict[str, Any]] = []
-        for s in steps:
-            if not isinstance(s, dict):
-                continue
-            desc = str(s.get("description", "")).strip()
-            if not desc:
-                continue
-            intent = s.get("intent", "other")
-            if intent not in ("investigate", "design", "mutate", "verify"):
-                intent = "other"
-            expects = s.get("expects") or {}
-            if not isinstance(expects, dict):
-                expects = {}
-            # Coerce expects fields
-            ec = {
-                "durable_change": bool(expects.get("durable_change", False)),
-                "files_modified": list(expects.get("files_modified", []) or []),
-                "verifier_outcome": str(expects.get("verifier_outcome", "N/A")),
-            }
-            if "knowledge_gained" in expects:
-                ec["knowledge_gained"] = str(expects.get("knowledge_gained", ""))
-            cleaned_steps.append({"description": desc, "intent": intent, "expects": ec})
-        if cleaned_steps:
-            cleaned_phases.append({"name": name, "steps": cleaned_steps})
+    for phase in plan.phases:
+        steps = [s for s in phase.steps if (s.description or "").strip()]
+        if steps:
+            cleaned_phases.append({
+                "name": phase.name,
+                "steps": [s.model_dump() for s in steps],
+            })
     if not cleaned_phases:
         return None
     return {"phases": cleaned_phases}

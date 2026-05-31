@@ -822,44 +822,98 @@ def build_docker_registry(container: "object", default_workdir: str = "/testbed"
         )
 
     def _rg(args: dict, state: State) -> ToolResult:
-        """ripgrep-flavored search; falls back to `grep -rn` when rg unavailable.
+        """ripgrep-flavored search with self-confident output.
 
-        1.6.6.2 — sharper search primitive than `bash("grep ...")`. Same
-        interface whether rg is installed or not; the wrapper picks at
-        invoke-time. On large codebases (Django, sympy) ripgrep is 10-100×
-        faster than grep.
+        R9b: returns STRUCTURED output that distinguishes positive matches,
+        zero-matches-in-requested-path, and a broader-scope fallback. The
+        attestor can recognize "no result here" as a complete answer to
+        a "locate X in Y" step.
 
-        1.6.6.10 — `context: int` adds -C N (both rg and grep), so callers can
-        ask for N lines of surrounding context in one call instead of grep
-        then read.
+        Auto-fallback: when 0 matches in the requested path AND the
+        requested path was narrower than /testbed, search /testbed and
+        include excerpts so the agent doesn't need a second call.
         """
         pattern = args.get("pattern")
         if not isinstance(pattern, str) or not pattern:
             return ToolResult(tool="rg", is_error=True, output="missing 'pattern'")
-        # Accept both "paths" (canonical, plural) and "path" (singular — LLMs
-        # often use the singular form by analogy with read/list/etc).
+        # Accept both "paths" (canonical) and "path" (singular synonym).
         paths = args.get("paths") or args.get("path") or "."
-        if isinstance(paths, list):
-            paths_str = " ".join(shlex.quote(str(p)) for p in paths)
-        else:
-            paths_str = shlex.quote(str(paths))
         flags = str(args.get("flags") or "")
         ctx = args.get("context")
         if isinstance(ctx, (int, float)) and int(ctx) > 0:
-            # -C is supported by both rg and POSIX grep, so a single flag works
-            # for the fallback path too.
             flags = (flags + f" -C {int(ctx)}").strip()
-        rg_cmd = f"rg {flags} -- {shlex.quote(pattern)} {paths_str}"
-        grep_cmd = f"grep -rn {flags} -- {shlex.quote(pattern)} {paths_str}"
-        sh = f"if command -v rg >/dev/null 2>&1; then {rg_cmd}; else {grep_cmd}; fi"
-        exit_code, output = _exec(["bash", "-lc", sh])
-        # grep returns 1 on "no matches"; treat that as not-an-error
-        is_err = (exit_code not in (0, 1))
+
+        def _do_search(p) -> tuple[int, str, int]:
+            """Run rg|grep on path p. Returns (exit_code, output, n_match_lines)."""
+            if isinstance(p, list):
+                p_str = " ".join(shlex.quote(str(x)) for x in p)
+            else:
+                p_str = shlex.quote(str(p))
+            rg_cmd = f"rg {flags} -- {shlex.quote(pattern)} {p_str}"
+            grep_cmd = f"grep -rn {flags} -- {shlex.quote(pattern)} {p_str}"
+            sh = f"if command -v rg >/dev/null 2>&1; then {rg_cmd}; else {grep_cmd}; fi"
+            code, out = _exec(["bash", "-lc", sh])
+            n = 0
+            for ln in (out or "").splitlines():
+                if not ln.strip() or ln.startswith("--"):
+                    continue
+                # rough match-line heuristic
+                if ":" in ln and not ln.startswith("grep:") and not ln.lower().startswith("warning"):
+                    n += 1
+            return code, out, n
+
+        code1, out1, n1 = _do_search(paths)
+        # Determine if requested path is "narrow" (single file / sub-tree)
+        # so a fallback to /testbed is meaningful (avoid fallback when user
+        # already searched the whole tree).
+        def _is_narrow(p) -> bool:
+            if isinstance(p, list):
+                return all(_is_narrow(x) for x in p) if p else False
+            s = str(p)
+            return s.endswith(".py") or s.endswith(".pyi") or ("/testbed/" in s and s != "/testbed")
+
+        broader_path = "/testbed"
+        do_fallback = (
+            n1 == 0
+            and _is_narrow(paths)
+            and (str(paths) != broader_path)
+        )
+        if do_fallback:
+            _, out2, n2 = _do_search(broader_path)
+            output = (
+                f"=== rg result for pattern {pattern!r} ===\n"
+                f"PRIMARY:  0 matches in {paths!r}\n"
+                f"FALLBACK: {n2} matches in {broader_path!r}\n\n"
+                f"--- fallback excerpts (truncated) ---\n"
+                f"{(out2 or '').strip()[:4000]}\n\n"
+                f"CONCLUSION: pattern {pattern!r} is NOT in the requested "
+                f"location {paths!r}; "
+                f"{'found ' + str(n2) + ' match(es) in broader scope (see above)' if n2 else 'not found anywhere in ' + broader_path}.\n"
+            )
+            is_err = False
+        elif n1 == 0:
+            output = (
+                f"=== rg result for pattern {pattern!r} ===\n"
+                f"PRIMARY: 0 matches in {paths!r}\n\n"
+                f"CONCLUSION: pattern {pattern!r} not found in the searched location.\n"
+            )
+            is_err = (code1 not in (0, 1))
+        else:
+            output = (
+                f"=== rg result for pattern {pattern!r} ===\n"
+                f"PRIMARY: {n1} match(es) in {paths!r}\n\n"
+                f"{(out1 or '').strip()}\n"
+            )
+            is_err = (code1 not in (0, 1))
+
         return ToolResult(
             tool="rg",
             is_error=is_err,
             output=_truncate(output, OUTPUT_CAP_BYTES),
-            detail={"returncode": exit_code, "pattern": pattern, "paths": paths},
+            detail={
+                "returncode": code1, "pattern": pattern, "paths": paths,
+                "n_primary_matches": n1, "fallback_used": do_fallback,
+            },
         )
 
     def _apply_patch(args: dict, state: State) -> ToolResult:
@@ -1117,24 +1171,71 @@ def build_docker_registry(container: "object", default_workdir: str = "/testbed"
             return ToolResult(tool="fd", is_error=True, output="missing 'pattern'")
         # Accept both "paths" (canonical) and "path" (singular by analogy).
         paths = args.get("paths") or args.get("path") or "."
-        if isinstance(paths, list):
-            paths_str = " ".join(shlex.quote(str(p)) for p in paths)
-        else:
-            paths_str = shlex.quote(str(paths))
         flags = str(args.get("flags") or "")
-        fd_cmd = f"fd {flags} -- {shlex.quote(pattern)} {paths_str}"
-        # find's syntax differs; use -iname for a sensible default mapping
-        find_cmd = (
-            f"find {paths_str} -iname {shlex.quote(pattern if any(c in pattern for c in '*?[') else '*' + pattern + '*')}"
-            + (f" {flags}" if flags else "")
-        )
-        sh = f"if command -v fd >/dev/null 2>&1; then {fd_cmd}; else {find_cmd}; fi"
-        exit_code, output = _exec(["bash", "-lc", sh])
+
+        def _do_find(p) -> tuple[int, str, int]:
+            if isinstance(p, list):
+                p_str = " ".join(shlex.quote(str(x)) for x in p)
+            else:
+                p_str = shlex.quote(str(p))
+            fd_cmd = f"fd {flags} -- {shlex.quote(pattern)} {p_str}"
+            find_pat = pattern if any(c in pattern for c in '*?[') else '*' + pattern + '*'
+            find_cmd = (
+                f"find {p_str} -iname {shlex.quote(find_pat)}"
+                + (f" {flags}" if flags else "")
+            )
+            sh = f"if command -v fd >/dev/null 2>&1; then {fd_cmd}; else {find_cmd}; fi"
+            code, out = _exec(["bash", "-lc", sh])
+            n = sum(1 for ln in (out or "").splitlines() if ln.strip())
+            return code, out, n
+
+        code1, out1, n1 = _do_find(paths)
+
+        # Auto-fallback to /testbed if 0 results in a narrower scope.
+        def _is_narrow(p) -> bool:
+            if isinstance(p, list):
+                return all(_is_narrow(x) for x in p) if p else False
+            s = str(p)
+            return s.endswith("/") is False and ("/testbed/" in s) and s != "/testbed"
+
+        broader_path = "/testbed"
+        do_fallback = n1 == 0 and _is_narrow(paths) and str(paths) != broader_path
+
+        if do_fallback:
+            _, out2, n2 = _do_find(broader_path)
+            output = (
+                f"=== fd result for pattern {pattern!r} ===\n"
+                f"PRIMARY:  0 matches in {paths!r}\n"
+                f"FALLBACK: {n2} matches in {broader_path!r}\n\n"
+                f"--- fallback paths ---\n"
+                f"{(out2 or '').strip()[:4000]}\n\n"
+                f"CONCLUSION: no file matching {pattern!r} in the requested location {paths!r}; "
+                f"{'found ' + str(n2) + ' in broader scope (see above)' if n2 else 'not found anywhere in ' + broader_path}.\n"
+            )
+            is_err = False
+        elif n1 == 0:
+            output = (
+                f"=== fd result for pattern {pattern!r} ===\n"
+                f"PRIMARY: 0 matches in {paths!r}\n\n"
+                f"CONCLUSION: no file matching {pattern!r} in the searched location.\n"
+            )
+            is_err = (code1 != 0)
+        else:
+            output = (
+                f"=== fd result for pattern {pattern!r} ===\n"
+                f"PRIMARY: {n1} match(es) in {paths!r}\n\n"
+                f"{(out1 or '').strip()}\n"
+            )
+            is_err = (code1 != 0)
+
         return ToolResult(
             tool="fd",
-            is_error=(exit_code != 0),
+            is_error=is_err,
             output=_truncate(output, OUTPUT_CAP_BYTES),
-            detail={"returncode": exit_code, "pattern": pattern, "paths": paths},
+            detail={
+                "returncode": code1, "pattern": pattern, "paths": paths,
+                "n_primary_matches": n1, "fallback_used": do_fallback,
+            },
         )
 
     reg = CapabilityRegistry()
