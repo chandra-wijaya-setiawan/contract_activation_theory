@@ -165,6 +165,18 @@ fi
 export DOCKER_HOST
 echo "  docker:       $DOCKER_HOST"
 
+# ── Pre-flight: prune orphan docker networks ──────────────────────────────
+# Each terminal-bench task creates a compose network. Without periodic pruning,
+# Docker's default IP pool (~30 subnets) is exhausted, causing all subsequent
+# `docker compose up` calls to fail with "all predefined address pools have
+# been fully subnetted". `docker network prune` only removes networks NOT
+# attached to a running container, so this is safe.
+
+if command -v docker >/dev/null 2>&1; then
+  echo "── Pruning orphan docker networks (avoids IP-pool exhaustion)"
+  docker network prune -f 2>&1 | tail -5 || true
+fi
+
 # ── Build & run tb runs create ──────────────────────────────────────────────
 
 TB_ARGS=(
