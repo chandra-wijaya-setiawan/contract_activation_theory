@@ -181,6 +181,123 @@ re-stipulates.
 
 ---
 
+## 4b. Two-layer architecture — components by role
+
+This is the canonical map of *what lives where*. Update this whenever a
+new component is added or a role changes.
+
+```
+╔════════════════════════════════════════════════════════════════════════╗
+║ OUTER LOOP — CAT 8-step contract lifecycle  (governs the contract)     ║
+║                                                                        ║
+║   1. INGEST     ← caller                                               ║
+║   2. REPRESENT  ← Representer (deterministic; probes via tools)        ║
+║   3. STIPULATE  ← Stipulator (LLM, cold-start)                         ║
+║                   Produces initial PlanTree per §6.1                   ║
+║   4. ACTIVATE   ← Admission gate (deterministic)                       ║
+║                   Budget / capacity / boundary / capability checks     ║
+║                                                                        ║
+║       ┌──────────────────────────────────────────────────────────┐     ║
+║       │                                                          │     ║
+║       │  5+6. PERFORM = INNER LOOP (one iter per pass)           │     ║
+║       │  ┌──────────────────────────────────────────────────┐    │     ║
+║       │  │ PLAN phase                                       │    │     ║
+║       │  │   - compute state_class (deterministic)          │    │     ║
+║       │  │   - read attention from PlanTree (no LLM)        │    │     ║
+║       │  │   - lookahead (no LLM)                           │    │     ║
+║       │  │   - simulate from step.expects + Librarian       │    │     ║
+║       │  │     (deterministic lookup)                       │    │     ║
+║       │  │   - inject attention hint into Performer context │    │     ║
+║       │  │                                                  │    │     ║
+║       │  │ ACTION phase                                     │    │     ║
+║       │  │   - Performer (LLM) picks ONE tool call          │    │     ║
+║       │  │   - tool registry runs the tool                  │    │     ║
+║       │  │   - tool result appended to messages             │    │     ║
+║       │  │                                                  │    │     ║
+║       │  │ OBSERVE phase                                    │    │     ║
+║       │  │   - compute state_class (deterministic)          │    │     ║
+║       │  │   - compute SURPRISE VECTOR (7 dimensions):      │    │     ║
+║       │  │       6 mechanical  + 1 Attestor (LLM)           │    │     ║
+║       │  │   - step_done := all dims consistent             │    │     ║
+║       │  │     surprise   := any dim diverges               │    │     ║
+║       │  │   - if surprise → Stipulator-in-loop (LLM)       │    │     ║
+║       │  │     emits tree-edit op diff                      │    │     ║
+║       │  │   - if not     → COMMIT current + advance        │    │     ║
+║       │  │     attention                                    │    │     ║
+║       │  │   - record edge in Librarian (no LLM)            │    │     ║
+║       │  │   - record tree-edit events in trace             │    │     ║
+║       │  │   - prune message history (no LLM)               │    │     ║
+║       │  └──────────────────────────────────────────────────┘    │     ║
+║       │                                                          │     ║
+║       └──────────────────────────────────────────────────────────┘     ║
+║                                                                        ║
+║   7. VERIFY    ← Criterion check (DETERMINISTIC oracle test command)   ║
+║                  "Is the WHOLE CONTRACT done?" — runs the actual test  ║
+║                  This is the canonical pass/fail signal. Independent   ║
+║                  of any LLM. Fires at the configured interval or when  ║
+║                  plan_tree.all_complete().                             ║
+║   8. CLOSE     ← finalize trace + persist PlanTree to Librarian        ║
+║                                                                        ║
+╚════════════════════════════════════════════════════════════════════════╝
+```
+
+### Role table — every LLM and deterministic component
+
+| Component | Type | Layer / call sites | Question it answers |
+|---|---|---|---|
+| **Stipulator** | LLM | OUTER step 3 (cold) + INNER OBSERVE (on surprise) | What's the plan tree? (cold) / What tree-edit ops fix the surprise? (in-loop) |
+| **Performer** | LLM | INNER ACTION (1× per iter) | What tool call to make next? |
+| **Attestor** | LLM | INNER OBSERVE (1× per iter, 1 dim of surprise vector) | Did the agent's last action address the attention step? (prose-vs-state) |
+| **Criterion check** | deterministic (test runner) | OUTER step 7 (interval or on plan-complete) | Is the WHOLE CONTRACT done? |
+| **Representer** | deterministic (tools) | OUTER step 2 (cold-start, once) | What verified facts about the world? |
+| **Admission gate** | deterministic | OUTER step 4 (cold-start, once) | Boundary / environment / capacity OK? Grant which capabilities? |
+| **Librarian** | deterministic (SQLite R/W) | INNER OBSERVE (write edge) + OUTER step 8 (write plan tree) + OUTER step 3 (read templates) | What past edges & plan trees match this state/obligation_class? |
+| **compute_surprise** | deterministic | INNER OBSERVE | 6-dim mechanical comparison of predicted vs actual |
+| **compute_state_class** | deterministic (hash) | INNER PLAN + OBSERVE | What progress shape are we in? |
+| **compute_obligation_class** | deterministic (hash) | OUTER step 3 | What plan-tree templates apply? |
+| **PlanTree + tree-edit ops** | deterministic (data structure) | INNER (read in PLAN, write in OBSERVE) | Where is attention? What's pending? |
+
+### Surprise vector — 7 dimensions, by source
+
+| Dimension | Source of prediction | Source of actual | Source type |
+|---|---|---|---|
+| `cost_z` | librarian.predict_det.cost_mean / std | tokens used this iter | deterministic |
+| `state_match` | librarian.predict_det.next_state_dist | recomputed state_class | deterministic |
+| `outcome_match` | librarian.predict_det.outcome_dist | tool_result.is_error | deterministic |
+| `durable_match` | attention_node.expects.durable_change | `git diff --quiet` result | deterministic |
+| `files_match` | attention_node.expects.files_modified | last tool_call's path arg | deterministic |
+| `verifier_match` | attention_node.expects.verifier_outcome | criterion check result this iter | deterministic |
+| `reasoning_match` | attention_node.description (prose) | call_attestor(description, recent_state_summary) | LLM (Attestor) |
+
+`step_done` and `surprise` are computed from **all 7 dimensions together**:
+- `step_done = TRUE` iff all dimensions are consistent
+- `surprise  = TRUE` iff any dimension diverges (any flag flips)
+
+The Attestor is **one signal among seven**, not the gatekeeper.
+
+### What's NOT in the inner loop (don't confuse)
+
+- **Criterion check** (oracle test) — outer loop, contract-level, not per-iter
+- **Admission gate** — outer loop, one-shot at start
+- **Representer probes** — outer loop, one-shot at start
+- **Stipulator cold-start** — outer loop, one-shot at start (re-stipulate IN the loop produces ops, not a fresh tree)
+
+### Quick mental model
+
+> The OUTER loop owns the **contract** (start to PASS/FAIL).
+>
+> The INNER loop owns one **attention step** of the plan tree (read state →
+> act → observe → decide).
+>
+> The **Attestor** is the LLM that judges one dimension of the surprise
+> vector (the prose-vs-state dimension). It is NOT the verifier and NOT
+> the step-done gatekeeper.
+>
+> The **Criterion check** is the deterministic oracle test that decides
+> contract fulfillment. It lives in the outer loop, not the inner.
+
+---
+
 ## 5. The redesigned loop (end-to-end)
 
 Three phases: **pre-loop setup**, **iter N**, **post-loop persistence**.
