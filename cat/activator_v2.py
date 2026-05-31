@@ -345,12 +345,24 @@ class ActivatorV2(Activator):
             f"  - [{n.id}] ({n.intent}) {n.description[:100]}" for n in lookahead[1:]
         ) or "  (none)"
 
+        # R6+ next_instruction from Resolver (if any) — injected once
+        resolver_directive = getattr(run, "resolver_next_instruction", "") or ""
+        resolver_block = ""
+        if resolver_directive:
+            resolver_block = (
+                f"\nRESOLVER NEXT INSTRUCTION (apply to this turn):\n"
+                f"  {resolver_directive}\n"
+            )
+            # Clear after consuming so it only fires once
+            run.resolver_next_instruction = ""  # type: ignore[attr-defined]
+
         hint = (
             f"{marker}\n"
             f"  [{attention.id}] ({attention.phase_name}/{attention.intent}) {attention.description}\n"
             f"  expects: durable_change={attention.expects.get('durable_change', False)}, "
             f"files={attention.expects.get('files_modified', [])}, "
             f"verifier={attention.expects.get('verifier_outcome', 'N/A')}\n"
+            f"{resolver_block}"
             f"\nUPCOMING (informational, not for this turn):\n{lookahead_str}\n"
             f"\nAct on the current step. Reply with one tool call."
         )
@@ -512,11 +524,11 @@ class ActivatorV2(Activator):
             return
 
         # Stall threshold hit — ESCALATE to Resolver
-        decision = self._invoke_resolver(
+        output = self._invoke_resolver(
             contract, run, plan_tree, attention_node, sv, state_now_class,
         )
         self._apply_resolver_decision(
-            contract, run, plan_tree, attention_node, decision, sv, state_now_class,
+            contract, run, plan_tree, attention_node, output.decision, sv, state_now_class,
         )
 
     def _invoke_resolver(
@@ -528,43 +540,113 @@ class ActivatorV2(Activator):
         sv: SurpriseVector,
         state_now_class: str,
     ):
-        """Build a StallContext and invoke the configured Resolver."""
-        from cat.resolver import StallContext
+        """Build a StallContext, invoke the Resolver, apply safety guards."""
+        from cat.resolver import StallContext, ResolverOutput, enforce_guards
 
+        # Build recent tool calls list from message history (pair assistant tool_calls with tool result)
         recent: list[dict[str, Any]] = []
-        # Pull last few assistant→tool pairs from message history
-        for i in range(len(run.messages) - 1, -1, -1):
+        intent_counts: dict[str, int] = {"investigate": 0, "mutate": 0, "verify": 0, "other": 0}
+        files_actually_modified: list[str] = []
+        write_tools = {"str_replace", "multi_edit", "apply_patch", "write"}
+        # Walk forward to count tools by intent over this whole run
+        for i in range(len(run.messages)):
             m = run.messages[i]
-            if m.get("role") == "tool" and len(recent) < 5:
-                content = m.get("content", "") or ""
+            if m.get("role") != "assistant":
+                continue
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function", {}) or {}
+                tool_name = fn.get("name", "?")
+                # Classify intent of tool
+                if tool_name in write_tools:
+                    intent_counts["mutate"] += 1
+                    try:
+                        args = json.loads(fn.get("arguments", "{}") or "{}")
+                        path = args.get("path") or args.get("file") or ""
+                        if path:
+                            files_actually_modified.append(path)
+                    except Exception:
+                        pass
+                elif tool_name in ("read", "outline", "rg", "fd", "find_refs", "goto_def", "list"):
+                    intent_counts["investigate"] += 1
+                elif tool_name == "bash":
+                    # bash is ambiguous; classify by command verbs
+                    try:
+                        args = json.loads(fn.get("arguments", "{}") or "{}")
+                        cmd = (args.get("command") or "").lower()
+                        if "pytest" in cmd or "django test" in cmd or "python -m test" in cmd:
+                            intent_counts["verify"] += 1
+                        elif "grep " in cmd or "find " in cmd or "ls " in cmd:
+                            intent_counts["investigate"] += 1
+                        else:
+                            intent_counts["other"] += 1
+                    except Exception:
+                        intent_counts["other"] += 1
+                else:
+                    intent_counts["other"] += 1
+
+                # Pair with the matching tool result
+                output_summary = ""
+                for j in range(i + 1, min(i + 5, len(run.messages))):
+                    if run.messages[j].get("tool_call_id") == tc.get("id"):
+                        c = run.messages[j].get("content", "")
+                        output_summary = c[:120] if isinstance(c, str) else ""
+                        break
                 recent.append({
-                    "tool": "?",
-                    "args": "",
-                    "output_summary": content[:120] if isinstance(content, str) else "",
+                    "tool": tool_name,
+                    "args": fn.get("arguments", "")[:120],
+                    "output_summary": output_summary,
                 })
-        recent.reverse()
+
+        # Collect recent attestor reasons from trace events (last few)
+        attestor_reasons: list[str] = []
+        try:
+            for e in reversed(self.recorder.traj.events[-30:]):
+                if e.kind == "surprise":
+                    p = e.payload or {}
+                    details = p.get("details", {}) or {}
+                    ar = details.get("attestor_reason")
+                    if ar:
+                        attestor_reasons.append(str(ar)[:200])
+                if len(attestor_reasons) >= 3:
+                    break
+            attestor_reasons.reverse()
+        except Exception:
+            pass
+
+        expects = attention_node.expects if isinstance(attention_node.expects, dict) else {}
+        files_expected = list(expects.get("files_modified") or [])
 
         ctx = StallContext(
             attention_node_id=attention_node.id,
             attention_description=attention_node.description,
             attention_intent=attention_node.intent,
             attention_phase=attention_node.phase_name,
-            expects=attention_node.expects if isinstance(attention_node.expects, dict) else {},
+            expects=expects,
             surprise_dims=sv.to_dict(),
             stall_count=run._stall_count.get(attention_node.id, 0),  # type: ignore[attr-defined]
             restip_count=getattr(run, "restip_count", 0),
             plan_tree_outline=plan_tree.render_outline(),
-            recent_tool_calls=recent,
+            recent_tool_calls=recent[-6:],
             obligation_brief=(contract.obligation or "")[:500],
             state_now_class=state_now_class,
+            attestor_reasons=attestor_reasons,
+            files_expected=files_expected,
+            files_actually_modified=files_actually_modified[-5:],
+            intent_tool_counts=intent_counts,
         )
 
         try:
-            decision = self.resolver.resolve(ctx)
+            output = self.resolver.resolve(ctx)
         except Exception:
-            decision = "forward"  # safest fallback
+            output = ResolverOutput(decision="forward", reason="resolver crashed; safest")
 
-        # Trace event for the escalation
+        # Apply deterministic guards (the floor)
+        output = enforce_guards(output, ctx)
+
+        # Stash next_instruction so the next iter's attention hint can inject it
+        run.resolver_next_instruction = output.next_instruction  # type: ignore[attr-defined]
+
+        # Trace event for the escalation — now includes reflection fields
         self.recorder.append(TraceEvent(
             event_id=f"res-{uuid.uuid4().hex[:6]}",
             parent_id=run.last_perform_event_id or run.last_iter_anchor,
@@ -575,10 +657,10 @@ class ActivatorV2(Activator):
                 "resolver_escalation": True,
                 "attention_id": attention_node.id,
                 "stall_count": run._stall_count.get(attention_node.id, 0),  # type: ignore[attr-defined]
-                "decision": decision,
+                **output.to_dict(),
             },
         ))
-        return decision
+        return output
 
     def _apply_resolver_decision(
         self,

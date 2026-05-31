@@ -71,7 +71,8 @@ def test_resolver_forward_decision_advances_attention():
     sv = SurpriseVector()
     contract = MagicMock(obligation="test obligation", id="task-1")
 
-    decision = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    output = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    decision = output.decision
     activator._apply_resolver_decision(contract, run, tree, attention, decision, sv, "state123")
 
     assert decision == "forward"
@@ -97,7 +98,8 @@ def test_resolver_backward_decision_drops_and_restores():
     sv = SurpriseVector()
     contract = MagicMock(obligation="test obligation", id="task-1")
 
-    decision = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    output = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    decision = output.decision
     activator._apply_resolver_decision(contract, run, tree, attention, decision, sv, "state123")
 
     assert decision == "backward"
@@ -121,7 +123,8 @@ def test_resolver_give_up_marks_contract_failed():
     sv = SurpriseVector()
     contract = MagicMock(obligation="test obligation", id="task-1")
 
-    decision = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    output = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    decision = output.decision
     activator._apply_resolver_decision(contract, run, tree, attention, decision, sv, "state123")
 
     assert decision == "give_up"
@@ -147,7 +150,8 @@ def test_resolver_backward_cap_falls_back_to_forward():
     sv = SurpriseVector()
     contract = MagicMock(obligation="test obligation", id="task-1")
 
-    decision = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    output = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    decision = output.decision
     activator._apply_resolver_decision(contract, run, tree, attention, decision, sv, "state123")
     # backward decision returned, but fallback should make C1 complete (not pruned)
     assert tree.nodes["C1"].status == "complete"  # forward, not pruned
@@ -165,7 +169,8 @@ def test_resolver_restipulate_cap_falls_back_to_forward():
     sv = SurpriseVector()
     contract = MagicMock(obligation="test obligation", id="task-1")
 
-    decision = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    output = activator._invoke_resolver(contract, run, tree, attention, sv, "state123")
+    decision = output.decision
     activator._apply_resolver_decision(contract, run, tree, attention, decision, sv, "state123")
     # forward fallback
     assert tree.nodes["A1"].status == "complete"
