@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from cat.runner import AGENTS, run_one
+from cat._legacy.runner import AGENTS, run_one
 from cat.tasks import Outcome, all_task_ids
 
 

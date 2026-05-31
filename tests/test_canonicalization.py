@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 
 from cat.obligation_class import compute_obligation_class, compute_obligation_class_features
-from cat.state_class_v2 import compute_state_class, RunCounts, _bucket
+from cat.state_class import compute_state_class, RunCounts, _bucket
 
 
 @dataclass

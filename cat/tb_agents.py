@@ -268,55 +268,42 @@ class TbCatAgent(BaseAgent):
             if pre_reps:
                 contract.representations = pre_reps
 
-            # 1.7 Phase A.1 — optional LIBRARIAN attached when CAT_CORPUS_DB
-            # env var points to a SQLite corpus. Cold-start safe: if path
-            # doesn't exist OR corpus is empty, recommend() returns None and
-            # the activator falls through to standard behavior.
+            # Legacy "election" advisor — CAT_CORPUS_DB enables the v1-style
+            # sample-based recommender (cat/_legacy/librarian.py). Cold-start
+            # safe: if path doesn't exist OR corpus is empty, recommend()
+            # returns None and the activator falls through to standard behavior.
             librarian = None
             corpus_db = os.environ.get("CAT_CORPUS_DB", "").strip()
             if corpus_db:
                 try:
-                    from cat.librarian import Librarian
+                    from cat._legacy.librarian import Librarian
                     librarian = Librarian(corpus_db)
                     librarian.refresh()
                 except Exception as exc:  # noqa: BLE001 — never fail task on librarian
                     print(f"warning: librarian init failed ({exc}); continuing without advisor")
                     librarian = None
 
-            # v2 (iteration_loop_redesign): use ActivatorV2 when CAT_V2=1
-            use_v2 = os.environ.get("CAT_V2", "0") == "1"
-            if use_v2:
-                from cat.activator_v2 import ActivatorV2
-                # v2 librarian: persistent plan trees + edges across tasks
-                librarian_v2 = None
-                v2_db = os.environ.get("CAT_LIBRARIAN_V2_DB", "").strip()
-                if v2_db:
-                    try:
-                        from cat.librarian_v2 import LibrarianV2
-                        librarian_v2 = LibrarianV2(v2_db)
-                    except Exception as exc:
-                        print(f"warning: librarian_v2 init failed ({exc}); continuing without it")
-                        librarian_v2 = None
-                activator = ActivatorV2(
-                    llm=llm,
-                    registry=registry,
-                    recorder=recorder,
-                    max_iterations=self._max_iterations,
-                    criterion_check_interval=self._criterion_check_interval,
-                    window_size=self._window_size,
-                    librarian=librarian,
-                    librarian_writer=librarian_v2,
-                )
-            else:
-                activator = Activator(
-                    llm=llm,
-                    registry=registry,
-                    recorder=recorder,
-                    max_iterations=self._max_iterations,
-                    criterion_check_interval=self._criterion_check_interval,
-                    window_size=self._window_size,
-                    librarian=librarian,
-                )
+            # Plan-tree library — persistent plan trees + edges across tasks
+            # (cat/librarian.py LibrarianV2 class; env var name kept for back-compat).
+            librarian_writer = None
+            plan_db = os.environ.get("CAT_LIBRARIAN_V2_DB", "").strip()
+            if plan_db:
+                try:
+                    from cat.librarian import LibrarianV2
+                    librarian_writer = LibrarianV2(plan_db)
+                except Exception as exc:
+                    print(f"warning: plan-tree librarian init failed ({exc}); continuing without it")
+                    librarian_writer = None
+            activator = Activator(
+                llm=llm,
+                registry=registry,
+                recorder=recorder,
+                max_iterations=self._max_iterations,
+                criterion_check_interval=self._criterion_check_interval,
+                window_size=self._window_size,
+                librarian=librarian,
+                librarian_writer=librarian_writer,
+            )
             activator.run(contract, state)
 
         if isinstance(recorder, Recorder):

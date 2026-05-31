@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
 
-from cat.activator import Activator
+from cat._legacy.activator import Activator
 from cat.capabilities import CapabilityRegistry, build_default_registry
 from cat.contracts import (
     Constraints,

@@ -550,7 +550,7 @@ Output shape:
 }
 """
 
-# Legacy alias (do not remove until v1.7+; activator_v2 still references old name in trace events)
+# Legacy alias kept for back-compat with older trace events.
 STIPULATOR_INLOOP_SYSTEM_PROMPT = REVISOR_SYSTEM_PROMPT
 
 

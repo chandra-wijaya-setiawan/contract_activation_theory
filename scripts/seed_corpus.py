@@ -13,7 +13,7 @@ import json
 import sys
 from pathlib import Path
 
-from cat.corpus import Corpus
+from cat._legacy.corpus import Corpus
 
 
 def seed_one_run(corpus: Corpus, run_dir: Path) -> dict:

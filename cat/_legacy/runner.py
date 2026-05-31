@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Type
 
-from cat.agents import Agent, AgentResult, CatAgent, ReactAgent
+from cat._legacy.agents import Agent, AgentResult, CatAgent, ReactAgent
 from cat.tasks import Outcome, TaskSpec, all_task_ids, grade as synthetic_grade, resolve_task
 from cat.trace import Recorder
 

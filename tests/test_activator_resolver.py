@@ -1,4 +1,4 @@
-"""Integration tests for ActivatorV2 + Resolver wiring.
+"""Integration tests for Activator + Resolver wiring.
 
 Mocks the LLM and just exercises the resolver escalation path with a
 StubResolver to verify each decision lands the right tree-op + state.
@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from cat.activator_v2 import ActivatorV2
+from cat.activator import Activator
 from cat.contracts import Contract, ContractState
 from cat.plan_tree import PlanTree, TreeEditOp
 from cat.resolver import StubResolver, StallContext
@@ -31,9 +31,9 @@ SAMPLE_PHASED_PLAN = {
 
 
 def _mk_activator(resolver, stall_threshold=3):
-    """Build an ActivatorV2 with a mocked LLM + the given resolver."""
+    """Build an Activator with a mocked LLM + the given resolver."""
     llm = MagicMock()
-    activator = ActivatorV2.__new__(ActivatorV2)
+    activator = Activator.__new__(Activator)
     activator.llm = llm
     activator.recorder = MagicMock()
     activator.recorder.traj = MagicMock()
@@ -177,14 +177,14 @@ def test_resolver_restipulate_cap_falls_back_to_forward():
 
 
 def test_default_resolver_is_llm_resolver():
-    """If resolver=None passed to ActivatorV2 constructor, defaults to LLMResolver."""
-    # We can't fully construct ActivatorV2 without a registry etc. but we can
+    """If resolver=None passed to Activator constructor, defaults to LLMResolver."""
+    # We can't fully construct Activator without a registry etc. but we can
     # verify the constructor logic by instantiating just enough.
     from cat.resolver import LLMResolver
     llm = MagicMock()
 
     # Use __new__ + manual init partial to avoid the full Activator deps
-    a = ActivatorV2.__new__(ActivatorV2)
+    a = Activator.__new__(Activator)
     a.llm = llm
     # Manually invoke the resolver-init branch
     resolver = None

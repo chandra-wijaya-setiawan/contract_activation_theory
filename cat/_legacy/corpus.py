@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-from cat.state_class import (
+from cat._legacy.state_class import (
     Sample, action_class, action_intent_of, bash_command_class,
     canonical_action_args, is_state_changing, short_hash,
 )
@@ -118,7 +118,7 @@ class Corpus:
     ) -> Optional[int]:
         """Walk a trace JSONL → samples → DB. Returns trajectory_id or None
         if the trace was already ingested (uniqueness on trace_id)."""
-        from cat.state_class import _FeatureState, _lookup_tool_call
+        from cat._legacy.state_class import _FeatureState, _lookup_tool_call
 
         jsonl_path = Path(jsonl_path)
         events = [json.loads(l) for l in jsonl_path.read_text().splitlines() if l.strip()]

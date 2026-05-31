@@ -1,222 +1,170 @@
-"""Activator — the 8-step CAT loop (contract-vocabulary names per PRD 1.6.2.9).
+"""Contract-disciplined agent loop (docs/iteration.md).
 
-The eight steps:
+Subclasses the legacy base Activator (cat/_legacy/activator.py) to reuse
+the unchanged scaffolding: _admit, _perform_once, _verify_criteria,
+_charge_llm, _transition, _finalize, _record_state, _check_budget,
+_init_executor_messages, _build_user_prompt, _prune_to_window.
 
-    1. INGEST      receive contract (LATENT)
-    2. REPRESENT   bounded probes establish verified facts (no LLM)
-    3. STIPULATE   stipulator emits ordered performance terms (1 LLM call)
-    4. ACTIVATE    admission gate (one-shot):
-                     boundary check
-                     environment fit
-                     capacity check
-                     capability grant
-                   → LATENT → ACTIVE on pass
-                   → consult contract.policy on fail (FAIL / SUSPEND / ESCALATE / ASK_USER)
-    5. SELECT      pick capability from grant (v1: fixed performer LLM)
-    6. PERFORM     one LLM call → one tool call → one tool result
-                   (performer LLM deliberates + carries out the performance act)
-    7. VERIFY      run criterion; per-step attestor advises
-    8. DISCHARGE   FULFILLED / SUSPENDED / FAILED / re-enter at 5
-
-Steps 1-4 are activation. Steps 5-8 are discharge, looped under the grant
-from Step 4 until terminal.
-
-The loop is not a `while True`. It is bounded by every Constraint and by
-the admission gate; criterion-unreachable transitions to SUSPENDED with a
-reason, not to a streak-counted escape ladder.
+run() implements the v2 flow:
+    pre-loop:  REPRESENT → obligation_class → STIPULATE-phased → ACTIVATE
+    iter:      PLAN (state_class, attention) → ACTION (_perform_once)
+               → OBSERVE (surprise) → tree-edit (in-loop Revisor on
+               surprise) OR COMMIT + advance attention
+    post-loop: FINALIZE plan tree (write to librarian if available)
 """
 from __future__ import annotations
+
 import json
-import time
 import uuid
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from cat.capabilities import CapabilityRegistry, ToolResult, workdir_snapshot
-from cat.contracts import (
-    AdmissionDecision,
-    Contract,
-    ContractState,
-    Cost,
-    Criterion,
-    State,
+from cat._legacy.activator import (
+    Activator as _BaseActivator,
+    ActivatorRun,
+    _PlanStep,
+    PERFORMER_SYSTEM_PROMPT,
 )
-from cat.llm import LLM, LLMResult, call_attestor, call_stipulator
+from cat.contracts import Contract, ContractState, State
+from cat.llm import (
+    call_stipulator_phased,
+    call_revisor,
+    call_attestor,
+)
+from cat.obligation_class import compute_obligation_class
+from cat.plan_tree import PlanTree, TreeEditOp
 from cat.representer import Representer
-from cat.trace import Recorder, TraceEvent, utcnow_iso
+from cat.state_class import RunCounts, compute_state_class
+from cat.surprise import compute_surprise, SurpriseVector
+from cat.trace import TraceEvent, utcnow_iso
 
 
-PERFORMER_SYSTEM_PROMPT = """\
-You are the PERFORMER role in a contract-disciplined agent.
-
-You will be given:
-- the OBLIGATION you must fulfill
-- an ordered PLAN of verifiable steps (the contract's stipulations)
-- a CHECKLIST showing which plan steps are already attested complete
-- the LAST TOOL RESULT (if any)
-- a list of available TOOLS (use them by emitting tool_calls)
-- the BUDGET STATUS
-
-Rules:
-1. Take exactly ONE concrete performance act per turn (one tool call) OR emit \
-a brief text "DONE" only when every plan step is checked complete.
-2. Address the FIRST un-checked step. Do not skip ahead.
-3. Be terse. Do not narrate. Do not re-state the plan. Just act.
-4. If a tool returns an error, diagnose and try a corrected action; do NOT repeat \
-the same failing call.
-5. NEVER claim a step is complete on your own — only the deterministic criterion \
-and the attestor close steps.
-6. DO NOT edit files under tests/ directories or matching test_*.py / *_test.py \
-patterns. Those files are the verification harness — your job is to change the \
-SOURCE CODE so tests pass. Modifying test files breaks the oracle's view of \
-your fix and is almost never the correct intervention.
-
-Tool-selection guidance (prefer the SPECIFIC tool over `bash`; one call is \
-cheaper than ten):
-- `goto_def(name)` to locate a Python class/function/variable definition — \
-  follows imports, respects scoping. NOT `rg("def foo|class foo")`.
-- `find_refs(name)` to find all references to a symbol — filters strings/\
-  comments and respects scoping. NOT `rg(name)`.
-- `outline(path)` to see a file's top-level classes/functions WITHOUT reading \
-  the whole file. NOT `read(path)` when you only want structure.
-- `rg(pattern, context=N)` for textual code search with N lines of context — \
-  NOT `bash("grep ...")`.
-- `fd(pattern)` to locate files by name — NOT `bash("find ...")`.
-- `multi_edit(path, edits=[...])` when fixing several hunks in one file in a \
-  single call (atomic against the original; order-independent). For a single \
-  hunk, `str_replace` is fine.
-- `apply_patch(patch=<unified diff>)` to apply a multi-file diff in one call. \
-  Hunks that don't match end up in .rej files (partial apply); the tool \
-  result lists them.
-- `git_status` / `git_diff` to inspect your accumulated changes between \
-  iterations — first-class tools, not `bash("git ...")`.
-- `bash` remains available for everything else (pytest, package install, \
-  one-off shell ops).
+PERFORMER_ATTENTION_SUFFIX = """
+ATTENTION/LOOKAHEAD: a working plan tree is being maintained for you.
+Each turn you see the current ATTENTION step (what to do now) and a short
+LOOKAHEAD (what's coming next). Stay focused on the ATTENTION step.
+Do not skip ahead. The activator will advance attention or revise the
+plan based on observation.
 """
 
-# Backward-compat alias (do not remove until v1.7+)
-EXECUTOR_SYSTEM_PROMPT = PERFORMER_SYSTEM_PROMPT
 
-
-@dataclass
-class _PlanStep:
-    id: str
-    description: str
-    complete: bool = False
-    last_reason: str = ""
-
-
-@dataclass
-class ActivatorRun:
-    contract: Contract
-    state: State
-    plan: list[_PlanStep] = field(default_factory=list)
-    messages: list[dict] = field(default_factory=list)
-    iterations: int = 0
-    final_text: Optional[str] = None
-    failure_reason: Optional[str] = None
-    suspend_reason: Optional[str] = None
-    prior_attempts: list[str] = field(default_factory=list)            # P1: compressed log of dropped turns
-    _recent_turns: list[list[dict]] = field(default_factory=list)       # P1: raw recent turn snapshots
-    grant: set[str] = field(default_factory=set)                        # capabilities granted at admission
-    # 1.6.1: event-id landmarks — track causal parents for DAG discipline
-    last_state_event_id: str = ""                                       # most recent contract_state event
-    last_perform_event_id: str = ""                                      # most recent capability_perform event
-    last_stipulate_event_id: str = ""                                   # contract_stipulate event (admission's parent)
-    last_admit_event_id: str = ""                                       # contract_admit event
-    last_iter_anchor: str = ""                                          # last event in the current iteration chain
-
-
-def _extract_turn_summary(msgs: list[dict], turn_num: int) -> str:
-    """Compress one turn's messages to a single line for the prior-attempts log.
-
-    Format: 't01 bash("pip install pandas") → ERR: pip not found'
-    Returns "" if the turn has no tool call.
-    """
-    tool_name = arg_preview = outcome = ""
-    for msg in msgs:
-        role = msg.get("role", "")
-        if role == "assistant" and not tool_name:
-            for tc in (msg.get("tool_calls") or []):
-                fn = tc.get("function", {})
-                tool_name = fn.get("name", "?")
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except Exception:
-                    args = {}
-                if "command" in args:
-                    arg_preview = str(args["command"])[:55]
-                elif "path" in args:
-                    arg_preview = str(args["path"])[:40]
-                else:
-                    first_val = next(iter(args.values()), "")
-                    arg_preview = str(first_val)[:40]
-                break
-        elif role == "tool" and not outcome:
-            content = str(msg.get("content", ""))
-            if content.startswith("[ERROR]"):
-                outcome = "ERR: " + content[7:].strip().split("\n")[0][:75]
-            else:
-                first_line = content.strip().split("\n")[0][:75]
-                outcome = "OK: " + first_line
-    if not tool_name:
-        return ""
-    return f"t{turn_num:02d} {tool_name}({repr(arg_preview)[:45]}) → {outcome}"
-
-
-class Activator:
-    """Drives a Contract through its lifecycle using one LLM and one CapabilityRegistry."""
+class Activator(_BaseActivator):
+    """Contract-disciplined agent loop: phased plan tree, surprise vector,
+    in-loop revisor. Inherits stipulate/admit/perform/verify utilities from
+    cat/_legacy/activator.py (folded in once we no longer need the legacy
+    flat-plan Activator for reference)."""
 
     def __init__(
         self,
-        llm: LLM,
-        registry: CapabilityRegistry,
-        recorder: Recorder,
-        max_iterations: int = 40,
-        criterion_check_interval: int = 1,
-        window_size: int = 4,
-        librarian: Optional["Librarian"] = None,
+        *args,
+        max_restip_per_task: int = 5,
+        stall_threshold: int = 3,
+        max_backwards_per_task: int = 2,
+        resolver: "Optional[Any]" = None,
+        librarian_writer=None,  # optional: object with .record_edge / .record_plan_tree
+        **kwargs,
     ):
-        self.llm = llm
-        self.registry = registry
-        self.recorder = recorder
-        self.max_iterations = max_iterations
-        self.criterion_check_interval = criterion_check_interval
-        self.window_size = window_size
-        # 1.7 Phase A.1 — optional advisory librarian. If set, the activator
-        # injects a "[CORPUS HINT]" system message into the performer context
-        # before each Step-5 SELECT LLM call. The LLM still picks; the hint
-        # carries prior runs' shortest-path-to-GOAL recommendation.
-        self.librarian = librarian
-
-    # ── Public entry ────────────────────────────────────────────────────────
+        super().__init__(*args, **kwargs)
+        self.max_restip_per_task = max_restip_per_task
+        self.stall_threshold = stall_threshold
+        self.max_backwards_per_task = max_backwards_per_task
+        self.librarian_writer = librarian_writer
+        # Default resolver is LLMResolver if not provided
+        if resolver is None:
+            from cat.resolver import LLMResolver
+            resolver = LLMResolver(self.llm)
+        self.resolver = resolver
 
     def run(self, contract: Contract, state: State) -> ActivatorRun:
-        """Run the 8-step loop on `contract` until terminal state."""
+        """v2 discharge loop."""
         run = ActivatorRun(contract=contract, state=state)
         self._record_state(contract, ContractState.LATENT, run)
 
-        # Step 1: INGEST — done by caller passing in `contract`.
-
-        # Step 2: REPRESENT — verified facts before any planning.
-        # Probes chain from the LATENT state event for proper DAG causality.
+        # Step 2: REPRESENT
         representer = Representer(registry=self.registry, recorder=self.recorder)
         pre_reps = list(contract.representations or [])
         contract.representations = pre_reps + representer.represent(
             contract, state, parent_event_id=run.last_state_event_id,
         )
         represent_event_id = representer.represent_event_id(contract)
-
-        # Post-REPRESENT: if a test oracle was discovered, inject it as the primary criterion.
         self._maybe_inject_oracle_criterion(contract)
 
-        # Step 3: STIPULATE — planner sees obligation + representations.
-        # Chains from contract_represent.
-        self._stipulate(contract, run, parent_event_id=represent_event_id)
+        # obligation_class
+        oc = compute_obligation_class(
+            contract.obligation,
+            representations=contract.representations,
+            task_id=contract.id,
+        )
+        run.obligation_class = oc  # type: ignore[attr-defined]
+        run.run_counts = RunCounts()  # type: ignore[attr-defined]
+        run.restip_count = 0  # type: ignore[attr-defined]
 
-        # Step 4: ACTIVATE — one-shot admission gate.
-        # Chains from contract_stipulate.
+        # Retrieve PASS/FAIL templates from the librarian (if any)
+        plan_templates = []
+        anti_templates = []
+        if self.librarian_writer is not None:
+            try:
+                plan_templates = self.librarian_writer.get_plan_templates(oc, k=3)
+                anti_templates = self.librarian_writer.get_anti_templates(oc, k=3)
+            except Exception:
+                plan_templates = []
+                anti_templates = []
+
+        # Step 3: STIPULATE — phased; fall back to flat on failure
+        phased_plan, planner_result = call_stipulator_phased(
+            self.llm,
+            contract.obligation,
+            representations=contract.representations or None,
+            plan_templates=plan_templates or None,
+            anti_templates=anti_templates or None,
+            parent_event_id=represent_event_id,
+        )
+        self._charge_llm(contract, planner_result)
+
+        plan_tree: Optional[PlanTree] = None
+        if phased_plan and phased_plan.get("phases"):
+            plan_tree = PlanTree.from_phased_plan(phased_plan, obligation_class=oc)
+            run.plan_tree = plan_tree  # type: ignore[attr-defined]
+            # Mirror the flat list for v1 admission gate compat
+            flat_steps: list[_PlanStep] = []
+            for phase_id in plan_tree.phase_order:
+                phase = plan_tree.nodes[phase_id]
+                for step_id in phase.children:
+                    n = plan_tree.nodes[step_id]
+                    flat_steps.append(_PlanStep(id=step_id, description=n.description))
+            run.plan = flat_steps
+        else:
+            # R12 follow-up: phased stipulator exhausted its retry budget.
+            # Do NOT fall back to v1 flat plan — that disables every piece of
+            # v2 machinery (no surprise, no plan_commit, no Revisor) and burns
+            # tokens running "naked". Fail the contract cleanly instead.
+            run.plan = []
+            run.plan_tree = None  # type: ignore[attr-defined]
+            self._transition(
+                contract, ContractState.FAILED,
+                "stipulator failed to emit a valid PhasedPlan after retries", run,
+            )
+            run.failure_reason = "stipulator_schema_failure"
+            self._finalize(contract, run)
+            return run
+
+        # Emit contract_stipulate (chains from planner llm_usage)
+        event_id = f"dec-{uuid.uuid4().hex[:6]}"
+        dec_parent = self.recorder.traj.events[-1].event_id if self.recorder.traj.events else represent_event_id
+        self.recorder.append(TraceEvent(
+            event_id=event_id,
+            parent_id=dec_parent,
+            ts=utcnow_iso(),
+            kind="contract_stipulate",
+            payload={
+                "contract_id": contract.id,
+                "steps": [{"id": s.id, "description": s.description} for s in run.plan],
+                "v2_phased": plan_tree is not None,
+                "obligation_class": oc,
+            },
+        ))
+        run.last_stipulate_event_id = event_id
+
+        # Step 4: ACTIVATE
         decision = self._admit(contract, state, run)
         self._record_admission(contract, decision, run)
         if not decision.ok:
@@ -228,20 +176,15 @@ class Activator:
         contract.grant = decision.grant
         self._transition(contract, ContractState.ELIGIBLE, "admission gate passed", run)
         self._transition(contract, ContractState.ACTIVE, "discharge begins", run)
-        run.last_iter_anchor = run.last_state_event_id   # iter 1 chains from ACTIVE state
+        run.last_iter_anchor = run.last_state_event_id
 
         self._init_executor_messages(contract, run)
 
-        # Discharge loop — Steps 5-8 repeat until terminal.
+        # Discharge loop — v2 shape
         while contract.state == ContractState.ACTIVE:
-            # Per-iter budget enforcement (separate from admission's capacity check)
             if not self._check_budget(contract, state, run):
                 break
-
             if run.iterations >= self.max_iterations:
-                # Step 8 CLOSE — criterion unreachable within iteration envelope.
-                # Transition to SUSPENDED (not FAILED): the world could change
-                # and a re-admission attempt could yet succeed.
                 self._transition(
                     contract, ContractState.SUSPENDED,
                     f"max_iterations {self.max_iterations} reached without criterion satisfaction",
@@ -252,11 +195,62 @@ class Activator:
                 contract.re_entry_condition = "fresh representations or extended envelope"
                 break
 
-            # Step 5 SELECT (v1: fixed executor) + Step 6 INVOKE
+            # PLAN phase
+            attention_node = plan_tree.get_attention() if plan_tree else None
+            if plan_tree and attention_node is None:
+                # All plan steps done — final verify
+                if self._verify_criteria(contract, state, run):
+                    self._transition(contract, ContractState.FULFILLED,
+                                     "plan tree exhausted, criteria satisfied", run)
+                else:
+                    self._transition(contract, ContractState.FAILED,
+                                     "plan tree exhausted before criteria satisfied", run)
+                    run.failure_reason = "plan_tree_exhausted"
+                break
+
+            state_now_class = ""
+            if plan_tree and attention_node:
+                state_now_class = compute_state_class(
+                    oc, attention_node.phase_name, attention_node.intent, run.run_counts  # type: ignore[attr-defined]
+                )
+                self._inject_plan_attention(run, plan_tree)
+
+            cost_before = contract.cost.tokens_in + contract.cost.tokens_out
             iter_start_len = len(run.messages)
+
+            # ACTION (Step 5+6: SELECT + PERFORM)
             keep_going = self._perform_once(contract, state, run)
+            cost_after = contract.cost.tokens_in + contract.cost.tokens_out
+            actual_cost = cost_after - cost_before
+
             if not keep_going:
-                # Executor signaled DONE or emitted no tool call.
+                # Defensive: distinguish a REAL "DONE" signal from a degenerate
+                # LLM response (zero tokens, no text, no tool calls). The former
+                # is the LLM saying it's finished; the latter is a transient
+                # API error (rate limit, content filter, etc.) and should NOT
+                # terminate the contract.
+                degenerate = (actual_cost == 0) and not (run.final_text or "").strip()
+                if degenerate:
+                    # Treat as transient — emit a trace event, force-advance
+                    # attention (so we don't loop here forever), and continue
+                    self.recorder.append(TraceEvent(
+                        event_id=f"err-{uuid.uuid4().hex[:6]}",
+                        parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                        ts=utcnow_iso(),
+                        kind="surprise",
+                        payload={
+                            "iter": run.iterations,
+                            "error": "degenerate_llm_response",
+                            "note": "performer returned 0 tokens / no text / no tools; treating as transient",
+                        },
+                    ))
+                    if plan_tree and attention_node:
+                        self._default_advance(plan_tree, attention_node, run)
+                    # Reset run.final_text so v1 doesn't think we exited
+                    run.final_text = None
+                    # Don't break — continue the loop
+                    continue
+                # Real DONE: check criteria + terminate
                 if self._verify_criteria(contract, state, run):
                     self._transition(contract, ContractState.FULFILLED,
                                      "executor stopped and criteria satisfied", run)
@@ -266,814 +260,887 @@ class Activator:
                     run.failure_reason = "executor_quit_early"
                 break
 
-            # Step 7 VERIFY — criterion on interval OR when all plan steps done.
+            # OBSERVE phase — wrapped to guarantee loop continues even if helpers fail
+            try:
+                self._observe_phase(
+                    contract, run, plan_tree, attention_node, actual_cost,
+                    state_now_class, oc,
+                )
+            except Exception as e:
+                # Log + force-advance to prevent infinite loop on crash
+                import traceback
+                self.recorder.append(TraceEvent(
+                    event_id=f"err-{uuid.uuid4().hex[:6]}",
+                    parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                    ts=utcnow_iso(),
+                    kind="surprise",
+                    payload={"error": str(e), "trace": traceback.format_exc()[:500]},
+                ))
+                if attention_node:
+                    self._default_advance(plan_tree, attention_node, run)
+
+
+            # Step 7: VERIFY criterion on interval
             all_steps_done = bool(run.plan) and all(s.complete for s in run.plan)
-            should_check = (run.iterations % self.criterion_check_interval == 0) or all_steps_done
+            should_check = (
+                run.iterations % self.criterion_check_interval == 0
+                or all_steps_done
+                or (plan_tree is not None and plan_tree.all_complete())
+            )
             if should_check:
                 if self._verify_criteria(contract, state, run):
-                    self._transition(contract, ContractState.FULFILLED, "all criteria satisfied", run)
+                    self._transition(contract, ContractState.FULFILLED,
+                                     "all criteria satisfied", run)
                     break
 
-            # Step 7 (judge) — advisory per-step completion
-            self._update_plan_checklist(contract, run)
+            # NOTE: We deliberately do NOT call _update_plan_checklist here.
+            # The attestor already ran once in _observe_phase on the current
+            # attention node — that's the authoritative signal. Running it
+            # again over the full flat plan would cost +N attestor calls per
+            # iter for no extra signal.
 
-            # P1 sliding window: drop the oldest raw turn → compressed prior_attempts entry
+            # P1 sliding window — drop oldest raw turn → compressed prior_attempts.
+            # Same as v1.7 to prevent message history bloat (pytest-6202 burned
+            # 218K performer-input tokens because of unbounded growth).
             turn_msgs = run.messages[iter_start_len:]
             self._prune_to_window(contract, run, turn_msgs)
+
+        # Post-loop persistence
+        if plan_tree and self.librarian_writer is not None:
+            try:
+                outcome = contract.state.value if hasattr(contract.state, "value") else str(contract.state)
+                self.librarian_writer.record_plan_tree(plan_tree, outcome)
+            except Exception:
+                pass
 
         self._finalize(contract, run)
         return run
 
-    # ── Cost charging ────────────────────────────────────────────────────────
-    # Every LLM call goes through _charge_llm; every tool invocation goes through
-    # _charge_tool. These are the SINGLE SOURCE OF TRUTH for cost accumulation.
-    # Direct increments to contract.cost.* outside these helpers create budget
-    # escapes (see PLAN.md 1.5.15 for the audit that led to this).
+    # ── helpers ──────────────────────────────────────────────────────────
+    _ATTENTION_HINT_MARKER = "PLAN ATTENTION (focus on this one step):"
 
-    def _charge_llm(self, contract: Contract, result: LLMResult) -> None:
-        contract.cost.tokens_in  += result.tokens_in
-        contract.cost.tokens_out += result.tokens_out
-        contract.cost.usd        += result.usd
-        contract.cost.llm_calls  += 1
-        contract.cost.wall_s     += float(result.raw.get("wall_s", 0.0))
+    def _inject_plan_attention(self, run: ActivatorRun, plan_tree: PlanTree) -> None:
+        """Inject the attention hint as a USER message.
 
-    def _charge_tool(self, contract: Contract, result: ToolResult) -> None:
-        contract.cost.tool_calls += 1
-        contract.cost.wall_s     += float(result.wall_s)
+        R5 v2: changed role from 'system' to 'user'.
 
-    # ── Step 3: DECOMPOSE ───────────────────────────────────────────────────
+        The hint MUST be the last message in the array so the LLM
+        responds to it. A trailing 'system' message at the END (after
+        assistant + tool messages) was empirically rejected by the
+        deepseek/openrouter endpoint with degenerate 0/0 token
+        responses. Using 'user' role keeps it a valid conversation
+        turn the model knows to answer.
 
-    def _stipulate(
-        self, contract: Contract, run: ActivatorRun, parent_event_id: Optional[str] = None,
-    ) -> None:
-        # Planner LLM call chains from contract_represent (parent_event_id).
-        # contract_stipulate then chains from the planner llm_usage event.
-        # We don't know the llm_usage event_id pre-call, so use the most-recent-
-        # event approximation: contract_stipulate chains from parent_event_id
-        # (contract_represent) since the planner llm_usage is itself a sibling.
-        steps, planner_result = call_stipulator(
-            self.llm,
-            contract.obligation,
-            representations=contract.representations or None,
-            parent_event_id=parent_event_id,
-        )
-        self._charge_llm(contract, planner_result)
-        if not steps:
-            steps = [{"id": "s1", "description": contract.obligation.strip().splitlines()[0][:200]}]
-        run.plan = [_PlanStep(id=s["id"], description=s["description"]) for s in steps]
-        event_id = f"dec-{uuid.uuid4().hex[:6]}"
-        # Parent = the most-recent llm_usage (planner) which produced this plan.
-        # The recorder's last event was the planner llm_usage event.
-        dec_parent = self.recorder.traj.events[-1].event_id if self.recorder.traj.events else parent_event_id
-        self.recorder.append(TraceEvent(
-            event_id=event_id,
-            parent_id=dec_parent,
-            ts=utcnow_iso(),
-            kind="contract_stipulate",
-            payload={
-                "contract_id": contract.id,
-                "steps": [{"id": s.id, "description": s.description} for s in run.plan],
-            },
-        ))
-        run.last_stipulate_event_id = event_id
-
-    # ── Step 4: ACTIVATE — admission gate ───────────────────────────────────
-
-    def _admit(self, contract: Contract, state: State, run: ActivatorRun) -> AdmissionDecision:
-        """One-shot admission validation. Three checks → grant.
-
-        (a) Boundary — is the contract well-formed?
-        (b) Environment — does the world match the contract's assumptions?
-        (c) Capacity — is there room to run?
-        (d) Grant — derive granted capability set (v1: full registry).
+        Strip-and-replace: remove any prior attention hint (system OR
+        user role with the marker) before appending the new one.
+        Exactly one attention hint in messages at any time.
         """
-        # (a) Boundary
-        if not (contract.obligation or "").strip():
-            return AdmissionDecision.reject("boundary", "empty obligation")
-        if not contract.criteria:
-            return AdmissionDecision.reject("boundary", "no criteria declared")
-        if not run.plan:
-            return AdmissionDecision.reject("boundary", "empty plan from DECOMPOSE")
-        cons = contract.constraints
-        if cons.max_tokens_total <= 0 or cons.max_tool_calls <= 0 or cons.max_llm_calls <= 0:
-            return AdmissionDecision.reject("boundary", "non-positive constraint bounds")
-        now = time.time()
-        if cons.deadline_ts is not None and now > cons.deadline_ts:
-            return AdmissionDecision.reject("boundary", "deadline already passed")
+        attention = plan_tree.get_attention()
+        if not attention:
+            return
 
-        # (b) Environment
-        if not contract.conditions_met(state):
-            return AdmissionDecision.reject("environment", "declared conditions not met")
-        # Capability availability: every capability mentioned in `contract.capabilities`
-        # must exist in the registry. (Plan-step-derived capability requirements are
-        # v2 work; v1 only validates the declared set.)
-        for cap_name in contract.capabilities or []:
-            if self.registry.get(cap_name) is None:
-                return AdmissionDecision.reject(
-                    "environment", f"capability '{cap_name}' not in registry",
-                )
-
-        # (c) Capacity
-        violation = cons.check(contract.cost, contract.depth, now)
-        if violation:
-            return AdmissionDecision.reject("capacity", violation)
-
-        # (d) Grant — v1: full registry. v2 will derive a subset from plan steps.
-        grant = set(self.registry.names())
-
-        # (e) Lock the deadline: absolute wall-clock time by which the contract
-        # must close. Per-iteration _check_budget enforces it via
-        # Constraints.check() — the contract owns its envelope, not the harness.
-        if contract.constraints.deadline_ts is None and contract.constraints.max_wall_s > 0:
-            contract.constraints.deadline_ts = time.time() + contract.constraints.max_wall_s
-
-        return AdmissionDecision.admit(grant)
-
-    def _apply_admission_failure(
-        self, contract: Contract, run: ActivatorRun, decision: AdmissionDecision,
-    ) -> None:
-        """Consult contract.policy for the response to an admission failure."""
-        response = contract.policy.response_for(decision.failure_type)  # type: ignore[arg-type]
-        reason = f"admission_{decision.failure_type}: {decision.reason}"
-
-        if response == "FAIL":
-            self._transition(contract, ContractState.FAILED, reason, run)
-            run.failure_reason = reason
-        elif response == "SUSPEND":
-            self._transition(contract, ContractState.SUSPENDED, reason, run)
-            run.suspend_reason = reason
-            contract.suspend_reason = reason
-            contract.re_entry_condition = decision.reason
-        elif response == "ESCALATE":
-            # v1: ESCALATE has no parent contract to receive it; treat as FAIL with tag.
-            self._transition(contract, ContractState.FAILED, f"escalate: {reason}", run)
-            run.failure_reason = f"escalate: {reason}"
-        elif response == "ASK_USER":
-            # v1: no user-input capability yet; treat as SUSPEND tagged as awaiting user.
-            self._transition(contract, ContractState.SUSPENDED, f"ask_user: {reason}", run)
-            run.suspend_reason = f"ask_user: {reason}"
-            contract.suspend_reason = run.suspend_reason
-            contract.re_entry_condition = "user input"
-
-    def _record_admission(
-        self, contract: Contract, decision: AdmissionDecision, run: ActivatorRun,
-    ) -> None:
-        event_id = f"admit-{uuid.uuid4().hex[:6]}"
-        self.recorder.append(TraceEvent(
-            event_id=event_id,
-            parent_id=run.last_stipulate_event_id or None,
-            ts=utcnow_iso(),
-            kind="contract_admit",
-            payload={
-                "contract_id": contract.id,
-                "ok": decision.ok,
-                "failure_type": decision.failure_type,
-                "reason": decision.reason,
-                "grant": sorted(decision.grant) if decision.ok else [],
-            },
-        ))
-        run.last_admit_event_id = event_id
-
-    # ── Per-iteration budget enforcement ────────────────────────────────────
-
-    def _check_budget(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
-        """Return True if still within envelope; transition + return False otherwise."""
-        now = time.time()
-        violation = contract.constraints.check(contract.cost, contract.depth, now)
-        if violation:
-            self._transition(contract, ContractState.FAILED, f"budget violation: {violation}")
-            run.failure_reason = violation
-            return False
-        return True
-
-    # ── Step 6: INVOKE one capability ───────────────────────────────────────
-
-    def _init_executor_messages(self, contract: Contract, run: ActivatorRun) -> None:
-        run.messages = [
-            {"role": "system", "content": PERFORMER_SYSTEM_PROMPT},
-            {"role": "user", "content": self._build_user_prompt(contract, run)},
+        marker = self._ATTENTION_HINT_MARKER
+        run.messages[:] = [
+            m for m in run.messages
+            if not (
+                isinstance(m.get("content", ""), str)
+                and marker in m["content"]
+            )
         ]
 
-    def _build_user_prompt(self, contract: Contract, run: ActivatorRun) -> str:
-        checklist = self._format_checklist(run)
-        budget = self._format_budget(contract)
-        return (
-            f"OBLIGATION:\n{contract.obligation}\n\n"
-            f"PLAN (checklist — mark via judge, not yourself):\n{checklist}\n\n"
-            f"BUDGET:\n{budget}\n\n"
-            f"Begin. Take ONE action toward the first un-checked step."
+        lookahead = plan_tree.lookahead(max_steps=4)
+        lookahead_str = "\n".join(
+            f"  - [{n.id}] ({n.intent}) {n.description[:100]}" for n in lookahead[1:]
+        ) or "  (none)"
+
+        # R6+ next_instruction from Resolver (if any) — injected once
+        resolver_directive = getattr(run, "resolver_next_instruction", "") or ""
+        resolver_block = ""
+        if resolver_directive:
+            resolver_block = (
+                f"\nRESOLVER NEXT INSTRUCTION (apply to this turn):\n"
+                f"  {resolver_directive}\n"
+            )
+            # Clear after consuming so it only fires once
+            run.resolver_next_instruction = ""  # type: ignore[attr-defined]
+
+        # R10b: surface Stipulator's tool suggestion (when present)
+        sugg_tool = getattr(attention, "suggested_tool", None) or ""
+        sugg_args = getattr(attention, "suggested_args", None) or {}
+        if isinstance(sugg_args, dict) and sugg_tool:
+            try:
+                args_json = json.dumps(sugg_args, ensure_ascii=False)
+            except Exception:
+                args_json = str(sugg_args)
+            suggestion_block = (
+                f"\nSTIPULATOR SUGGESTS for this step:\n"
+                f"  tool: {sugg_tool}\n"
+                f"  args: {args_json[:400]}\n"
+                f"  (follow if applicable; adapt if you see something better)\n"
+            )
+        else:
+            suggestion_block = ""
+
+        hint = (
+            f"{marker}\n"
+            f"  [{attention.id}] ({attention.phase_name}/{attention.intent}) {attention.description}\n"
+            f"  expects: durable_change={attention.expects.get('durable_change', False)}, "
+            f"files={attention.expects.get('files_modified', [])}, "
+            f"verifier={attention.expects.get('verifier_outcome', 'N/A')}\n"
+            f"{suggestion_block}"
+            f"{resolver_block}"
+            f"\nUPCOMING (informational, not for this turn):\n{lookahead_str}\n"
+            f"\nAct on the current step. Reply with one tool call."
         )
+        run.messages.append({"role": "user", "content": hint})
 
-    def _format_checklist(self, run: ActivatorRun) -> str:
-        if not run.plan:
-            return "(empty)"
-        lines = []
-        for s in run.plan:
-            mark = "[x]" if s.complete else "[ ]"
-            reason = f"   ({s.last_reason})" if s.last_reason else ""
-            lines.append(f"  {mark} {s.id}: {s.description}{reason}")
-        return "\n".join(lines)
+    def _infer_durable_change(self, run: ActivatorRun) -> tuple[bool, list[str]]:
+        """Approximate: was the last tool call a write-tool that succeeded?
 
-    def _format_budget(self, contract: Contract) -> str:
-        c = contract.cost
-        b = contract.constraints
-        return (
-            f"  tokens: {c.tokens_total}/{b.max_tokens_total}  "
-            f"tool_calls: {c.tool_calls}/{b.max_tool_calls}  "
-            f"llm_calls: {c.llm_calls}/{b.max_llm_calls}  "
-            f"usd: ${c.usd:.4f}/${b.max_usd:.2f}"
+        Returns (durable_change_observed, list_of_files_modified).
+        """
+        if not run.messages:
+            return False, []
+        # Walk back from the end looking for the last tool message + the
+        # assistant tool_call that preceded it
+        last_tool_msg_idx = None
+        for i in range(len(run.messages) - 1, -1, -1):
+            if run.messages[i].get("role") == "tool":
+                last_tool_msg_idx = i
+                break
+        if last_tool_msg_idx is None:
+            return False, []
+        # Look for the assistant that emitted this tool call
+        for j in range(last_tool_msg_idx - 1, -1, -1):
+            m = run.messages[j]
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                tc = m["tool_calls"][0]
+                tool_name = tc.get("function", {}).get("name", "")
+                args_raw = tc.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except Exception:
+                    args = {}
+                # Check if tool result was an error
+                tool_content = run.messages[last_tool_msg_idx].get("content", "") or ""
+                if isinstance(tool_content, str) and tool_content.startswith("[ERROR]"):
+                    return False, []
+                # Write-tools
+                if tool_name in ("str_replace", "multi_edit", "apply_patch", "write"):
+                    path = args.get("path", "") or args.get("file", "") or ""
+                    files = [path] if path else []
+                    if tool_name == "apply_patch":
+                        # Try to extract file paths from the patch
+                        patch = args.get("patch", "") or args.get("diff", "") or ""
+                        for line in patch.splitlines():
+                            if line.startswith("+++ b/") or line.startswith("--- a/"):
+                                p = line[6:].strip()
+                                if p and p not in files:
+                                    files.append(p)
+                    return True, files
+                return False, []
+        return False, []
+
+    def _infer_verifier_outcome(self, run: ActivatorRun) -> Optional[str]:
+        """R12 Bug B: parse last test-running tool output for PASS/FAIL.
+
+        Without this, surprise.verifier_match defaults vacuously True and a
+        failing pytest can silently advance a verify step. Returns "PASS",
+        "FAIL", or None when the last tool call wasn't a recognizable test
+        invocation (so we don't false-positive on unrelated bash output).
+        """
+        if not run.messages:
+            return None
+        last_tool_msg_idx = None
+        for i in range(len(run.messages) - 1, -1, -1):
+            if run.messages[i].get("role") == "tool":
+                last_tool_msg_idx = i
+                break
+        if last_tool_msg_idx is None:
+            return None
+        # Find the assistant tool_call that produced this result
+        tool_name = ""
+        cmd = ""
+        for j in range(last_tool_msg_idx - 1, -1, -1):
+            m = run.messages[j]
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                tc = m["tool_calls"][0]
+                tool_name = tc.get("function", {}).get("name", "")
+                args_raw = tc.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except Exception:
+                    args = {}
+                cmd = (args.get("command", "") or "").lower()
+                break
+
+        # Only infer on test-runner commands: pytest, runtests.py, tox, unittest
+        # (bash invocations of test runners) — or our dedicated oracle capability.
+        is_test_invocation = (
+            tool_name in ("oracle", "runtests") or
+            (tool_name == "bash" and any(p in cmd for p in (
+                "pytest", "runtests", "tox", "unittest", "django-admin test",
+            )))
         )
+        if not is_test_invocation:
+            return None
 
-    def _run_election(
+        content = run.messages[last_tool_msg_idx].get("content", "") or ""
+        if not isinstance(content, str):
+            return None
+        if content.startswith("[ERROR]"):
+            return "FAIL"
+        lc = content.lower()
+        # Clear failure signatures first
+        fail_markers = (
+            " failed", "failed,", "failed]", "= fail", "errored",
+            "traceback (most recent call last)", "internalerror",
+            "no module named",
+        )
+        if any(m in lc for m in fail_markers):
+            return "FAIL"
+        # FAILED in caps (pytest summary)
+        if "FAILED" in content or "ERROR" in content[-2000:]:
+            return "FAIL"
+        # Pass signatures
+        if "passed" in lc and "failed" not in lc:
+            return "PASS"
+        # "no tests ran" — vacuously OK but the verify step is meaningless;
+        # treat as None so we don't false-advance.
+        if "no tests ran" in lc:
+            return None
+        return None
+
+    def _observe_phase(
         self,
         contract: Contract,
         run: ActivatorRun,
-        candidates: list[dict],
-        parent_event_id: str,
-    ) -> int:
-        """Score `candidates` via the librarian; emit an `election` trace
-        event; return the winning index.
+        plan_tree: PlanTree,
+        attention_node,
+        actual_cost: float,
+        state_now_class: str,
+        oc: str,
+    ) -> None:
+        """End-of-iter OBSERVE phase. Computes surprise, applies tree edits.
 
-        Winner = lowest total_score among non-defer candidates; if all
-        defer, returns 0 (LLM's preferred). Never raises — election is
-        best-effort optimization, not a correctness path.
+        Authority for "is this step done?" is the attestor (LLM judge), NOT
+        the heuristic. This replaces the v1.7 _update_plan_checklist's
+        attestor-over-every-step with one focused attestor call per iter.
+        """
+        # R12 Bug A: when the cold-start stipulator failed to emit a phased
+        # plan, we fell through to the v1 flat-plan path with plan_tree=None
+        # and attention_node=None. Dereferencing attention_node.intent below
+        # would crash; the try/except wrapping the caller would then spin
+        # without ever advancing. Skip observation entirely in that case.
+        if attention_node is None or plan_tree is None:
+            return
+
+        # Approximate: did the last tool call modify the filesystem?
+        actual_durable_change, actual_files = self._infer_durable_change(run)
+        actual_verifier_outcome = self._infer_verifier_outcome(run)
+
+        # Update counts
+        run.run_counts.bump(attention_node.intent)  # type: ignore[attr-defined]
+        if actual_durable_change:
+            run.run_counts.mark_durable_change()  # type: ignore[attr-defined]
+        else:
+            run.run_counts.tick_no_change()  # type: ignore[attr-defined]
+
+        state_next_class = compute_state_class(
+            oc, attention_node.phase_name, attention_node.intent, run.run_counts  # type: ignore[attr-defined]
+        )
+
+        # Surprise vector (mechanical signals only)
+        sv = compute_surprise(
+            expects=attention_node.expects,
+            actual_cost=float(actual_cost),
+            actual_durable_change=actual_durable_change,
+            actual_files_modified=actual_files,
+            actual_verifier_outcome=actual_verifier_outcome,
+        )
+
+        # R7: step_done requires CONSISTENCY across all 7 dimensions
+        # (per docs/iteration.md §4b). Attestor is ONE dimension, not the
+        # gatekeeper. A mutate step cannot be 'done' when durable_match or
+        # files_match is False — even if the attestor said YES.
+        attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
+        sv.details["attestor_reason"] = attestor_reason
+        sv.details["attestor_done"] = "yes" if attestor_done else "no"
+
+        # step_done = attestor_done AND no mechanical dimension diverges on
+        # the dims that matter for this intent.
+        # For mutate intent: durable_match AND files_match must hold.
+        # For verify intent: verifier_match must hold (when expected != N/A).
+        # For investigate / design / other: mechanical dims rarely diverge
+        # (expects.durable_change=False, etc.) so attestor effectively rules.
+        critical_dim_violated = False
+        if attention_node.intent == "mutate":
+            if not (sv.durable_match and sv.files_match):
+                critical_dim_violated = True
+                sv.details["block_step_done"] = (
+                    "mutate intent requires durable_match AND files_match"
+                )
+        elif attention_node.intent == "verify":
+            ev = attention_node.expects.get("verifier_outcome", "N/A") if isinstance(attention_node.expects, dict) else "N/A"
+            if ev in ("PASS", "FAIL") and not sv.verifier_match:
+                critical_dim_violated = True
+                sv.details["block_step_done"] = (
+                    "verify intent requires verifier_match"
+                )
+
+        if critical_dim_violated:
+            step_done = False
+        elif attestor_done:
+            step_done = True
+        elif self._mechanical_evidence_strong(attention_node, sv):
+            step_done = True
+            sv.details["override"] = "mechanical evidence overrode attestor=NO"
+        else:
+            step_done = False
+
+        # Record surprise event (now includes attestor verdict)
+        self.recorder.append(TraceEvent(
+            event_id=f"sup-{uuid.uuid4().hex[:6]}",
+            parent_id=run.last_perform_event_id or run.last_iter_anchor,
+            ts=utcnow_iso(),
+            kind="surprise",
+            payload={
+                "iter": run.iterations,
+                "attention_id": attention_node.id,
+                "state_now": state_now_class,
+                "state_next": state_next_class,
+                "step_done": step_done,
+                **sv.to_dict(),
+            },
+        ))
+
+        # Record edge in librarian (if configured) for cross-task transfer
+        if self.librarian_writer is not None:
+            try:
+                action_class = self._compute_action_class(run, attention_node)
+                outcome_label = "PASS" if not sv.any_surprised else "SURPRISE"
+                self.librarian_writer.record_edge(
+                    state_now_class,
+                    action_class,
+                    state_next_class,
+                    int(actual_cost),
+                    outcome_label,
+                    task_id=contract.id,
+                )
+            except Exception:
+                pass
+
+        # Track stall count per attention node (resets when attention moves)
+        att_id = attention_node.id
+        run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
+        run.backward_count = getattr(run, "backward_count", 0)  # type: ignore[attr-defined]
+
+        if step_done:
+            # Natural progress — COMMIT + advance
+            self._default_advance(plan_tree, attention_node, run)
+            run._stall_count[att_id] = 0
+            return
+
+        # Step is NOT done. Increment stall counter for this node.
+        run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
+        below_stall_threshold = run._stall_count[att_id] < self.stall_threshold
+
+        if below_stall_threshold:
+            # Below threshold → let the LLM (Performer) take another shot
+            # at the same attention next iter. No Resolver call yet.
+            return
+
+        # Stall threshold hit — ESCALATE to Resolver
+        output = self._invoke_resolver(
+            contract, run, plan_tree, attention_node, sv, state_now_class,
+        )
+        self._apply_resolver_decision(
+            contract, run, plan_tree, attention_node, output.decision, sv, state_now_class,
+        )
+
+    def _invoke_resolver(
+        self,
+        contract: Contract,
+        run: ActivatorRun,
+        plan_tree: PlanTree,
+        attention_node,
+        sv: SurpriseVector,
+        state_now_class: str,
+    ):
+        """Build a StallContext, invoke the Resolver, apply safety guards."""
+        from cat.resolver import StallContext, ResolverOutput, enforce_guards
+
+        # Build recent tool calls list from message history (pair assistant tool_calls with tool result)
+        recent: list[dict[str, Any]] = []
+        intent_counts: dict[str, int] = {"investigate": 0, "mutate": 0, "verify": 0, "other": 0}
+        files_actually_modified: list[str] = []
+        write_tools = {"str_replace", "multi_edit", "apply_patch", "write"}
+        # Walk forward to count tools by intent over this whole run
+        for i in range(len(run.messages)):
+            m = run.messages[i]
+            if m.get("role") != "assistant":
+                continue
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function", {}) or {}
+                tool_name = fn.get("name", "?")
+                # Classify intent of tool
+                if tool_name in write_tools:
+                    intent_counts["mutate"] += 1
+                    try:
+                        args = json.loads(fn.get("arguments", "{}") or "{}")
+                        path = args.get("path") or args.get("file") or ""
+                        if path:
+                            files_actually_modified.append(path)
+                    except Exception:
+                        pass
+                elif tool_name in ("read", "outline", "rg", "fd", "find_refs", "goto_def", "list"):
+                    intent_counts["investigate"] += 1
+                elif tool_name == "bash":
+                    # bash is ambiguous; classify by command verbs
+                    try:
+                        args = json.loads(fn.get("arguments", "{}") or "{}")
+                        cmd = (args.get("command") or "").lower()
+                        if "pytest" in cmd or "django test" in cmd or "python -m test" in cmd:
+                            intent_counts["verify"] += 1
+                        elif "grep " in cmd or "find " in cmd or "ls " in cmd:
+                            intent_counts["investigate"] += 1
+                        else:
+                            intent_counts["other"] += 1
+                    except Exception:
+                        intent_counts["other"] += 1
+                else:
+                    intent_counts["other"] += 1
+
+                # Pair with the matching tool result
+                output_summary = ""
+                for j in range(i + 1, min(i + 5, len(run.messages))):
+                    if run.messages[j].get("tool_call_id") == tc.get("id"):
+                        c = run.messages[j].get("content", "")
+                        output_summary = c[:120] if isinstance(c, str) else ""
+                        break
+                recent.append({
+                    "tool": tool_name,
+                    "args": fn.get("arguments", "")[:120],
+                    "output_summary": output_summary,
+                })
+
+        # Collect recent attestor reasons from trace events (last few)
+        attestor_reasons: list[str] = []
+        try:
+            for e in reversed(self.recorder.traj.events[-30:]):
+                if e.kind == "surprise":
+                    p = e.payload or {}
+                    details = p.get("details", {}) or {}
+                    ar = details.get("attestor_reason")
+                    if ar:
+                        attestor_reasons.append(str(ar)[:200])
+                if len(attestor_reasons) >= 3:
+                    break
+            attestor_reasons.reverse()
+        except Exception:
+            pass
+
+        expects = attention_node.expects if isinstance(attention_node.expects, dict) else {}
+        files_expected = list(expects.get("files_modified") or [])
+
+        ctx = StallContext(
+            attention_node_id=attention_node.id,
+            attention_description=attention_node.description,
+            attention_intent=attention_node.intent,
+            attention_phase=attention_node.phase_name,
+            expects=expects,
+            surprise_dims=sv.to_dict(),
+            stall_count=run._stall_count.get(attention_node.id, 0),  # type: ignore[attr-defined]
+            restip_count=getattr(run, "restip_count", 0),
+            plan_tree_outline=plan_tree.render_outline(),
+            recent_tool_calls=recent[-6:],
+            obligation_brief=(contract.obligation or "")[:500],
+            state_now_class=state_now_class,
+            attestor_reasons=attestor_reasons,
+            files_expected=files_expected,
+            files_actually_modified=files_actually_modified[-5:],
+            intent_tool_counts=intent_counts,
+        )
+
+        try:
+            output = self.resolver.resolve(ctx)
+        except Exception:
+            output = ResolverOutput(decision="forward", reason="resolver crashed; safest")
+
+        # Apply deterministic guards (the floor)
+        output = enforce_guards(output, ctx)
+
+        # Stash next_instruction so the next iter's attention hint can inject it
+        run.resolver_next_instruction = output.next_instruction  # type: ignore[attr-defined]
+
+        # Trace event for the escalation — now includes reflection fields
+        self.recorder.append(TraceEvent(
+            event_id=f"res-{uuid.uuid4().hex[:6]}",
+            parent_id=run.last_perform_event_id or run.last_iter_anchor,
+            ts=utcnow_iso(),
+            kind="surprise",
+            payload={
+                "iter": run.iterations,
+                "resolver_escalation": True,
+                "attention_id": attention_node.id,
+                "stall_count": run._stall_count.get(attention_node.id, 0),  # type: ignore[attr-defined]
+                **output.to_dict(),
+            },
+        ))
+        return output
+
+    def _apply_resolver_decision(
+        self,
+        contract: Contract,
+        run: ActivatorRun,
+        plan_tree: PlanTree,
+        attention_node,
+        decision: str,
+        sv: SurpriseVector,
+        state_now_class: str,
+    ) -> None:
+        """Translate the Resolver's decision into concrete actions."""
+        att_id = attention_node.id
+
+        if decision == "forward":
+            # Force COMMIT + advance, same as if step was done
+            self._default_advance(plan_tree, attention_node, run)
+            run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+
+        elif decision == "restipulate":
+            if getattr(run, "restip_count", 0) >= self.max_restip_per_task:
+                # Cap hit — fall back to forward
+                self._default_advance(plan_tree, attention_node, run)
+                run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+                return
+            ops_applied = self._run_revisor(contract, run, plan_tree, sv, state_now_class)
+            run.restip_count = getattr(run, "restip_count", 0) + 1  # type: ignore[attr-defined]
+            if ops_applied == 0:
+                # Re-stipulate returned nothing — force forward
+                self._default_advance(plan_tree, attention_node, run)
+                run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+            else:
+                # Successfully applied ops — reset stall counter for current attention
+                if plan_tree.attention_id and plan_tree.attention_id in plan_tree.nodes:
+                    run._stall_count[plan_tree.attention_id] = 0  # type: ignore[attr-defined]
+
+        elif decision == "backward":
+            if getattr(run, "backward_count", 0) >= self.max_backwards_per_task:
+                # Backward cap hit — fall back to forward
+                self._default_advance(plan_tree, attention_node, run)
+                run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+                return
+            self._apply_backward(plan_tree, attention_node, run)
+            run.backward_count = getattr(run, "backward_count", 0) + 1  # type: ignore[attr-defined]
+            run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+
+        elif decision == "give_up":
+            # Mark contract FAILED with explicit reason
+            self._transition(
+                contract, ContractState.FAILED,
+                f"resolver gave up at {att_id} after {run._stall_count[att_id]} iters",  # type: ignore[attr-defined]
+                run,
+            )
+            run.failure_reason = f"resolver_gave_up_at_{att_id}"
+
+        else:
+            # Unknown decision — treat as forward to keep loop progressing
+            self._default_advance(plan_tree, attention_node, run)
+            run._stall_count[att_id] = 0  # type: ignore[attr-defined]
+
+    def _apply_backward(self, plan_tree: PlanTree, attention_node, run: ActivatorRun) -> None:
+        """Backward op: DROP the current subtree, restore attention to the
+        last completed mutate ancestor (or root if none)."""
+        # Find last completed mutate node before current attention
+        target_id: Optional[str] = None
+        order: list[str] = []
+        for phase_id in plan_tree.phase_order:
+            for child_id in plan_tree.nodes[phase_id].children:
+                order.append(child_id)
+        try:
+            cur_idx = order.index(attention_node.id) if attention_node.id in order else len(order)
+        except ValueError:
+            cur_idx = len(order)
+        for nid in order[:cur_idx][::-1]:
+            n = plan_tree.nodes[nid]
+            if n.status == "complete" and n.intent == "mutate":
+                target_id = nid
+                break
+        # DROP current
+        plan_tree.apply_op(
+            TreeEditOp(
+                op="DROP",
+                payload={"node_id": attention_node.id, "reason": "resolver: backward"},
+                reflection="resolver: backward — current subtree abandoned",
+            ),
+            iter_n=run.iterations,
+        )
+        self.recorder.append(TraceEvent(
+            event_id=f"pl-{uuid.uuid4().hex[:6]}",
+            parent_id=run.last_perform_event_id or run.last_iter_anchor,
+            ts=utcnow_iso(),
+            kind="plan_drop",
+            payload={"node_id": attention_node.id, "reason": "resolver: backward",
+                     "reflection": "resolver: backward — current subtree abandoned"},
+        ))
+        # If we found a mutate ancestor, advance to next pending leaf after it
+        if target_id:
+            # Reset attention by advancing from target_id's position
+            nxt = plan_tree._next_pending_leaf_after(target_id)
+            if nxt and nxt in plan_tree.nodes:
+                plan_tree.nodes[nxt].status = "active"
+                plan_tree.attention_id = nxt
+                self.recorder.append(TraceEvent(
+                    event_id=f"pl-{uuid.uuid4().hex[:6]}",
+                    parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                    ts=utcnow_iso(),
+                    kind="plan_checkout",
+                    payload={"node_id": nxt, "reflection": "resolver: backward — restored attention"},
+                ))
+                return
+        # No mutate ancestor — advance to next pending leaf overall
+        plan_tree.advance_attention()
+
+    def _mechanical_evidence_strong(self, attention_node, sv: SurpriseVector) -> bool:
+        """Override-attestor-NO when mechanical signals are unambiguously positive.
+
+        - mutate intent: durable_match AND files_match AND expected_durable=True
+        - verify intent: verifier_match AND expects.verifier_outcome in {"PASS","FAIL"}
+        For investigate / design / other intents, attestor remains authoritative.
+        """
+        intent = getattr(attention_node, "intent", "other")
+        expects = attention_node.expects or {}
+        if intent == "mutate":
+            return (
+                bool(expects.get("durable_change", False))
+                and sv.durable_match
+                and sv.files_match
+            )
+        if intent == "verify":
+            expected_v = expects.get("verifier_outcome", "N/A")
+            return expected_v in ("PASS", "FAIL") and sv.verifier_match
+        return False
+
+    def _attestor_verdict(
+        self, contract: Contract, run: ActivatorRun, attention_node,
+    ) -> tuple[bool, str]:
+        """Call the attestor on the current attention node + recent evidence.
+
+        Authority for step-done. Returns (complete: bool, reason: str).
+        Errors / degenerate responses fall back to False (step not done)
+        so the loop continues safely rather than crashing or false-committing.
         """
         try:
-            from cat.state_class import extract_raw_features_from_events
-            events_dicts = [
-                {"kind": e.kind, "payload": e.payload or {}}
-                for e in self.recorder.traj.events
-            ]
-            # CRITICAL: do NOT strip — the corpus stores obligation text as-is
-            # from the contract_state event payload, and stripping here would
-            # produce a different hash than what's in the corpus, breaking
-            # every state_class lookup. (Bug found 2026-05-30.)
-            obligation_text = contract.obligation or ""
-            raw = extract_raw_features_from_events(events_dicts, obligation_text)
-            # Normalize candidates to {tool, args} dicts for librarian
-            cand_inputs = [
-                {"tool": c.get("name", ""), "args": c.get("arguments", {}) or {}}
-                for c in candidates
-            ]
-            scored = self.librarian.score_candidates(cand_inputs, raw)
-        except Exception as exc:  # noqa: BLE001 — never crash for an optimization
-            print(f"warning: election scoring failed: {exc}")
+            # State summary: last few tool outputs + assistant text
+            recent_tool_msgs: list[str] = []
+            for m in reversed(run.messages):
+                role = m.get("role", "")
+                if role == "tool":
+                    content = m.get("content", "")
+                    if isinstance(content, str):
+                        recent_tool_msgs.append(content[:800])
+                if len(recent_tool_msgs) >= 2:
+                    break
+            state_summary = "\n---\n".join(reversed(recent_tool_msgs)) or "(no tool output yet)"
+            # R9: build attestor input with the expects.result done-criterion as
+            # the explicit contract the attestor judges against.
+            expects = attention_node.expects if isinstance(attention_node.expects, dict) else {}
+            # Backward-compat: read expects.result first; fall back to old name
+            # 'knowledge_gained' so legacy plans still attest sensibly.
+            expected_result = (
+                str(expects.get("result", "")
+                    or expects.get("knowledge_gained", "")).strip()
+            )
+            extended_desc = (
+                f"description: {attention_node.description}\n"
+                f"intent: {attention_node.intent}\n"
+                f"expected_result: {expected_result or '(none specified)'}\n"
+                f"mechanical_predictions: durable_change={expects.get('durable_change', False)}, "
+                f"files_modified={expects.get('files_modified', [])}, "
+                f"verifier_outcome={expects.get('verifier_outcome', 'N/A')}"
+            )
+            complete, reason, llm_result = call_attestor(
+                self.llm,
+                step_description=extended_desc,
+                state_summary=state_summary,
+                parent_event_id=run.last_perform_event_id or run.last_iter_anchor,
+            )
+            self._charge_llm(contract, llm_result)
+            # Degenerate attestor response (no tokens) → conservative False
+            if llm_result is None or (
+                getattr(llm_result, "tokens_in", 0) == 0
+                and getattr(llm_result, "tokens_out", 0) == 0
+            ):
+                return False, "attestor returned empty response (fallback)"
+            return bool(complete), (reason or "")[:300]
+        except Exception as e:
+            return False, f"attestor error: {e}"[:300]
+
+    def _compute_action_class(self, run: ActivatorRun, attention_node) -> str:
+        """Cheap action class hash: tool_name + intent + phase_name."""
+        import hashlib
+        last_tool = "?"
+        for m in reversed(run.messages):
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                last_tool = m["tool_calls"][0].get("function", {}).get("name", "?")
+                break
+        key = f"{last_tool}|{attention_node.intent}|{attention_node.phase_name}"
+        return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+    def _step_appears_done(self, run: ActivatorRun, attention_node, sv: SurpriseVector) -> bool:
+        """Per-intent heuristic for whether the current attention node looks complete.
+
+        investigate: needs a non-empty, non-error tool result
+        mutate:      needs sv.durable_match AND sv.files_match (no surprise on those)
+        verify:      needs sv.verifier_match (when expects.verifier_outcome != "N/A")
+        design/other: needs a non-empty assistant response (we accept by default)
+        """
+        intent = attention_node.intent
+        # Any mechanical surprise → not done
+        if sv.cost_surprised:
+            return False
+        last_result = self._last_tool_result_text(run)
+        if intent == "investigate":
+            if not last_result:
+                return False
+            if last_result.startswith("[ERROR]"):
+                return False
+            # Crude "did this produce useful output?" heuristic
+            stripped = last_result.strip()
+            if len(stripped) < 30:
+                return False
+            return True
+        if intent == "mutate":
+            # mutate requires the durable + files dimensions to match
+            return sv.durable_match and sv.files_match and not last_result.startswith("[ERROR]")
+        if intent == "verify":
+            # verify requires verifier_match (only relevant when expects.verifier_outcome != "N/A")
+            if attention_node.expects.get("verifier_outcome", "N/A") == "N/A":
+                # ran a verify-intent step without a specific predicted outcome — accept if no error
+                return not last_result.startswith("[ERROR]")
+            return sv.verifier_match
+        # other / design
+        return not last_result.startswith("[ERROR]")
+
+    def _last_tool_result_text(self, run: ActivatorRun) -> str:
+        for m in reversed(run.messages):
+            if m.get("role") == "tool":
+                content = m.get("content", "")
+                return content if isinstance(content, str) else str(content)
+        return ""
+
+    def _default_advance(
+        self, plan_tree: PlanTree, attention_node, run: ActivatorRun,
+    ) -> None:
+        """COMMIT the attention node and advance to the next pending leaf."""
+        op = TreeEditOp(
+            op="COMMIT",
+            payload={"node_id": attention_node.id, "reason": "no surprise"},
+            reflection="step appeared to advance without surprise",
+        )
+        ok, _ = plan_tree.apply_op(op, iter_n=run.iterations)
+        if ok:
+            self.recorder.append(TraceEvent(
+                event_id=f"pl-{uuid.uuid4().hex[:6]}",
+                parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                ts=utcnow_iso(),
+                kind="plan_commit",
+                payload={
+                    "node_id": attention_node.id,
+                    "reason": "no surprise",
+                    "reflection": "step appeared to advance without surprise",
+                },
+            ))
+        plan_tree.advance_attention()
+
+    def _run_revisor(
+        self,
+        contract: Contract,
+        run: ActivatorRun,
+        plan_tree: PlanTree,
+        surprise: SurpriseVector,
+        state_now_class: str,
+    ) -> int:
+        """Call in-loop Stipulator; apply returned ops; return # applied."""
+        outline = plan_tree.render_outline()
+        attention_id = plan_tree.attention_id
+        state_summary = f"state_class={state_now_class[:8]}"
+        recent_trace = self._recent_trace_text(run, n_iters=3)
+
+        try:
+            ops, llm_result = call_revisor(
+                self.llm,
+                contract.obligation,
+                plan_tree_outline=outline,
+                attention_id=attention_id,
+                state_class_summary=state_summary,
+                recent_trace=recent_trace,
+                surprise_dims=surprise.to_dict(),
+                parent_event_id=run.last_perform_event_id or run.last_iter_anchor,
+            )
+        except Exception as e:
+            # Fallback: don't crash on LLM failure
+            return 0
+        if llm_result is not None:
+            self._charge_llm(contract, llm_result)
+        ops = ops or []  # ensure never None downstream
+
+        # Emit a trace event for the in-loop call
+        self.recorder.append(TraceEvent(
+            event_id=f"sip-{uuid.uuid4().hex[:6]}",
+            parent_id=self.recorder.traj.events[-1].event_id if self.recorder.traj.events else None,
+            ts=utcnow_iso(),
+            kind="revise",
+            payload={
+                "iter": run.iterations,
+                "surprise": surprise.to_dict(),
+                "n_ops": len(ops or []),
+            },
+        ))
+
+        if not ops:
             return 0
 
-        # Pick winner: lowest total_score among non-defer; else 0
-        eligible = [s for s in scored if not s.defer and s.total_score is not None]
-        if eligible:
-            winner = min(eligible, key=lambda s: s.total_score)
-            elected_index = winner.index
-            decision_reason = "math"
-        else:
-            elected_index = 0
-            decision_reason = "defer"
-
-        # Record election event
-        election_id = f"elect-{uuid.uuid4().hex[:6]}"
-        self.recorder.append(TraceEvent(
-            event_id=election_id,
-            parent_id=parent_event_id,
-            ts=utcnow_iso(),
-            kind="election",
-            payload={
-                "contract_id": contract.id,
-                "iteration": run.iterations,
-                "winner_index": elected_index,
-                "winner_tool": candidates[elected_index].get("name", ""),
-                "decision": decision_reason,
-                "candidates": [
-                    {
-                        "index": s.index,
-                        "tool": s.tool,
-                        "action_klass": s.action_klass,
-                        "state_class": s.state_class,
-                        "expected_cost": s.expected_cost,
-                        "next_state_d_star": s.next_state_d_star,
-                        "total_score": s.total_score,
-                        "confidence_n": s.confidence_n,
-                        "defer": s.defer,
-                    }
-                    for s in scored
-                ],
-            },
-        ))
-        return elected_index
-
-    def _librarian_hint(self, contract: Contract, run: ActivatorRun) -> Optional[str]:
-        """Build a CORPUS HINT message from the LIBRARIAN's recommendation,
-        if any. Returns None when the librarian is unavailable, the state is
-        cold, or no path-to-goal candidate exists.
-
-        When a hint IS produced, also emits a `librarian_hint` trace event
-        so we can count emissions and attribute behavior changes (post-A.2
-        refinement (1) — telemetry).
-
-        Lightweight: just walks the current trace events to compute the
-        runtime raw_features snapshot.
-        """
-        if self.librarian is None or not self.librarian.is_ready():
-            return None
-        try:
-            from cat.state_class import extract_raw_features_from_events
-            events_dicts = [
-                {"kind": e.kind, "payload": e.payload or {}}
-                for e in self.recorder.traj.events
-            ]
-            # CRITICAL: do NOT strip — the corpus stores obligation text as-is
-            # from the contract_state event payload, and stripping here would
-            # produce a different hash than what's in the corpus, breaking
-            # every state_class lookup. (Bug found 2026-05-30.)
-            obligation_text = contract.obligation or ""
-            raw = extract_raw_features_from_events(events_dicts, obligation_text)
-            rec = self.librarian.recommend(raw)
-        except Exception as exc:  # noqa: BLE001 — never crash the run for a hint
-            print(f"warning: librarian hint failed: {exc}")
-            return None
-        if rec is None:
-            return None
-
-        # Telemetry: record that a hint was emitted on this turn.
-        # Chains from the iteration anchor — sibling to the upcoming
-        # performer llm_usage event the hint will influence.
-        try:
-            parent = (
-                run.last_iter_anchor
-                or run.last_perform_event_id
-                or run.last_admit_event_id
-                or run.last_state_event_id
-                or None
+        applied = 0
+        for op_dict in ops:
+            kind = op_dict.get("op", "")
+            tree_op = TreeEditOp(
+                op=kind,
+                payload=op_dict,
+                reflection=op_dict.get("reflection", ""),
             )
-            self.recorder.append(TraceEvent(
-                event_id=f"hint-{uuid.uuid4().hex[:6]}",
-                parent_id=parent,
-                ts=utcnow_iso(),
-                kind="librarian_hint",
-                payload={
-                    "contract_id": contract.id,
-                    "iteration": run.iterations + 1,  # this hint is for the NEXT iter
-                    "state_class": rec.state_class,
-                    "action_klass": rec.action_klass,
-                    "tool": rec.tool,
-                    "canonical_args": rec.canonical_args,
-                    "expected_cost": rec.expected_cost,
-                    "next_state_d_star": rec.next_state_d_star,
-                    "total_score": rec.total_score,
-                    "confidence_n": rec.confidence_n,
-                    "n_alternatives": rec.n_alternatives,
-                },
-            ))
-        except Exception as exc:  # noqa: BLE001
-            print(f"warning: librarian_hint trace failed: {exc}")
+            ok, err = plan_tree.apply_op(tree_op, iter_n=run.iterations)
+            if ok:
+                applied += 1
+                self.recorder.append(TraceEvent(
+                    event_id=f"pl-{uuid.uuid4().hex[:6]}",
+                    parent_id=self.recorder.traj.events[-1].event_id if self.recorder.traj.events else None,
+                    ts=utcnow_iso(),
+                    kind=f"plan_{kind.lower()}",
+                    payload={
+                        "iter": run.iterations,
+                        **{k: v for k, v in op_dict.items() if k in
+                           ("node_id", "parent_id", "branch_id", "target_id",
+                            "reason", "reflection")},
+                    },
+                ))
+        return applied
 
-        return (
-            "[CORPUS HINT] "
-            + rec.format_hint()
-            + " — this is advisory only; use your judgment if the situation differs."
-        )
-
-    def _perform_once(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
-        """One executor turn: ask LLM for next action, run the tool call (if any).
-
-        Increments run.iterations. Returns True if the loop should continue
-        (a tool was called); False if the executor signaled DONE or emitted no
-        tool call.
-
-        v1: the tool schema exposed to the LLM is the full registry. v2 will
-        restrict the schema to the grant computed at admission time.
-        """
-        run.iterations += 1
-        tools = self.registry.tool_schemas(only=run.grant or None)
-        # Iteration N chains from iteration N-1 (or ACTIVE state for iter 1).
-        # last_iter_anchor: the event that this iteration's executor LLM call
-        # logically follows. Updated after VERIFY so iter N+1 chains from the
-        # last verify event if one ran.
-        iter_parent = (
-            run.last_iter_anchor
-            or run.last_perform_event_id
-            or run.last_admit_event_id
-            or run.last_state_event_id
-            or None
-        )
-
-        # 1.7 Phase A.1 — inject LIBRARIAN advisory hint if available.
-        # The hint goes in as a transient SYSTEM message that the LLM sees on
-        # THIS turn only; it doesn't get permanently added to run.messages so
-        # later turns won't carry stale advice. The hint is purely advisory;
-        # the LLM still picks the tool call.
-        messages_with_hint = run.messages
-        hint_text = self._librarian_hint(contract, run) if self.librarian is not None else None
-        if hint_text:
-            messages_with_hint = run.messages + [
-                {"role": "system", "content": hint_text}
-            ]
-
-        result = self.llm.chat(
-            messages=messages_with_hint,
-            tools=tools,
-            tool_choice="auto",
-            role_tag="performer",
-            temperature=0.2,
-            parent_event_id=iter_parent,
-        )
-        # The executor llm_usage event was just appended (last event in trace).
-        executor_llm_event_id = self.recorder.traj.events[-1].event_id
-        self._charge_llm(contract, result)
-
-        # 1.7 Phase A.2 — ELECTION: when the LLM emits ≥2 candidate tool
-        # calls in one turn and we have a librarian, the math arbitrates.
-        # Scoring is `expected_cost + d*(next_state)`. Lowest wins. If all
-        # candidates DEFER (no corpus signal), fall through to the first
-        # candidate (LLM's preferred — preserves cold-state behavior).
-        # The losing candidate is recorded in an `election` trace event for
-        # retrospective analysis and trimmed from the message history so
-        # the OpenAI tool_call ↔ tool_result correspondence stays valid.
-        elected_index = 0
-        if (
-            len(result.tool_calls) >= 2
-            and self.librarian is not None
-            and self.librarian.is_ready()
-        ):
-            elected_index = self._run_election(
-                contract, run, result.tool_calls, executor_llm_event_id,
-            )
-        # Keep only the winning tool_call in result.tool_calls for downstream
-        # processing. Other candidates are recorded in the election event.
-        if len(result.tool_calls) >= 2 and elected_index != 0:
-            winner = result.tool_calls[elected_index]
-            result.tool_calls = [winner]
-        elif len(result.tool_calls) >= 2:
-            result.tool_calls = [result.tool_calls[0]]
-
-        if result.tool_calls:
-            run.messages.append({
-                "role": "assistant",
-                "content": result.text or "",
-                "tool_calls": [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"]),
-                        },
-                    }
-                    for tc in result.tool_calls
-                ],
-            })
-        else:
-            run.messages.append({"role": "assistant", "content": result.text or ""})
-
-        if not result.tool_calls:
-            run.final_text = result.text
-            return False
-
-        # Discipline: only execute the FIRST tool call (post-ELECTION, this is
-        # the winning candidate; pre-ELECTION it was the LLM's first emission).
-        first = result.tool_calls[0]
-        invoke_event_id = f"inv-{uuid.uuid4().hex[:6]}"
-        # capability_perform chains from the executor llm_usage that produced this tool call
-        self.recorder.append(TraceEvent(
-            event_id=invoke_event_id,
-            parent_id=executor_llm_event_id,
-            ts=utcnow_iso(),
-            kind="capability_perform",
-            payload={
-                "contract_id": contract.id,
-                "tool": first["name"],
-                "arguments": first["arguments"],
-                "tool_call_id": first["id"],
-                "iteration": run.iterations,
-            },
-        ))
-        run.last_perform_event_id = invoke_event_id
-        run.last_iter_anchor = invoke_event_id   # next iter chains from here (may be overridden by VERIFY)
-
-        tool_result: ToolResult = self.registry.invoke(
-            name=first["name"],
-            args=first["arguments"],
-            state=state,
-            recorder=self.recorder,
-            contract_id=contract.id,
-            tool_call_id=first["id"],
-            parent_event_id=invoke_event_id,
-        )
-        self._charge_tool(contract, tool_result)
-
-        run.messages.append({
-            "role": "tool",
-            "tool_call_id": first["id"],
-            "content": tool_result.output if not tool_result.is_error
-            else f"[ERROR] {tool_result.output}",
-        })
-
-        # OpenAI requires a matching tool message for any extra parallel tool_calls
-        # emitted by the assistant; reply with a stub for ignored ones.
-        for skipped in result.tool_calls[1:]:
-            run.messages.append({
-                "role": "tool",
-                "tool_call_id": skipped["id"],
-                "content": "[skipped — discipline: one action per turn]",
-            })
-
-        return True
-
-    # ── Oracle criterion injection ───────────────────────────────────────────
-
-    def _maybe_inject_oracle_criterion(self, contract: Contract) -> None:
-        """If REPRESENT found a test oracle and no oracle criterion exists, inject one."""
-        if any(c.is_oracle for c in contract.criteria):
-            return
-
-        strategy_rep = next(
-            (r for r in (contract.representations or []) if r.key == "judge_strategy"),
-            None,
-        )
-        if strategy_rep is None or not strategy_rep.value.startswith("oracle:"):
-            return
-
-        oracle_cmd = strategy_rep.value[len("oracle:"):].strip()
-        if not oracle_cmd:
-            return
-
-        contract.criteria.insert(0, self._build_oracle_criterion(contract, oracle_cmd))
-
-    def _build_oracle_criterion(self, contract: Contract, command: str) -> "Criterion":
-        from cat.contracts import Criterion, Evidence
-        registry = self.registry
-        recorder = self.recorder
-        charge_tool = self._charge_tool   # capture; contract is closed-over
-
-        def _predicate(state: State) -> tuple[bool, Evidence]:
-            # Parent of oracle's bash tool_call is the last event in the trace.
-            # When called from _verify_criteria mid-loop, that's the last invoke;
-            # when called from TbSweAgent._initial_representations, that's the
-            # latent state event. Either is the correct causal parent.
-            parent = recorder.traj.events[-1].event_id if recorder.traj.events else None
-            result = registry.invoke(
-                name="bash",
-                args={"command": command, "timeout_s": 120},
-                state=state,
-                recorder=recorder,
-                contract_id="oracle-check",
-                tool_call_id=f"oracle-{uuid.uuid4().hex[:6]}",
-                parent_event_id=parent,
-            )
-            # Oracle bash runs every criterion check — charge it to the contract
-            # so its tool_calls + wall_s do not silently escape the envelope.
-            charge_tool(contract, result)
-            passed = not result.is_error
-            summary = ("PASS" if passed else "FAIL") + f": oracle ({command[:60]})"
-            return passed, Evidence(
-                summary=summary,
-                detail={"command": command, "output": result.output[:800]},
-            )
-
-        return Criterion(
-            id=f"oracle_{uuid.uuid4().hex[:8]}",
-            description=f"oracle test passes: {command[:100]}",
-            predicate=_predicate,
-            is_oracle=True,
-        )
-
-    # ── Step 7: VERIFY ──────────────────────────────────────────────────────
-
-    def _verify_criteria(self, contract: Contract, state: State, run: ActivatorRun) -> bool:
-        """Run criteria. Oracle criteria are authoritative; LLM criteria are fallback.
-
-        When any criterion has is_oracle=True, ONLY oracle criteria run; LLM-judge
-        criteria are skipped — the contract closes on real test results, not on
-        model opinion.
-        """
-        if not contract.criteria:
-            return False
-
-        oracle_crits = [c for c in contract.criteria if c.is_oracle]
-        crits_to_run = oracle_crits if oracle_crits else contract.criteria
-
-        all_ok = True
-        for crit in crits_to_run:
-            ok = crit.check(state)
-            # criterion_check chains from the oracle bash tool_result (last appended
-            # event during crit.check), which itself chains from the invoke.
-            crit_parent = (
-                self.recorder.traj.events[-1].event_id
-                if self.recorder.traj.events
-                else run.last_perform_event_id
-            )
-            event_id = f"crit-{crit.id}-{uuid.uuid4().hex[:4]}"
-            self.recorder.append(TraceEvent(
-                event_id=event_id,
-                parent_id=crit_parent,
-                ts=utcnow_iso(),
-                kind="criterion_check",
-                payload={
-                    "contract_id": contract.id,
-                    "criterion_id": crit.id,
-                    "description": crit.description,
-                    "satisfied": ok,
-                    "evidence": crit.last_evidence.summary if crit.last_evidence else None,
-                    "iteration": run.iterations,
-                    "is_oracle": crit.is_oracle,
-                },
-            ))
-            run.last_iter_anchor = event_id   # next iter chains from this verify event
-            if not ok:
-                all_ok = False
-        return all_ok
-
-    def _update_plan_checklist(self, contract: Contract, run: ActivatorRun) -> None:
-        """Ask the judge per un-checked step; persist verdicts on the plan."""
-        if not run.plan:
-            return
-        summary = self._state_summary_for_judge(run)
-        for step in run.plan:
-            if step.complete:
-                continue
-            # Judge LLM call chains from the current invoke (it's evaluating
-            # that invoke's effect on the plan step).
-            complete, reason, judge_result = call_attestor(
-                self.llm, step.description, summary,
-                parent_event_id=run.last_perform_event_id or None,
-            )
-            judge_llm_event_id = self.recorder.traj.events[-1].event_id
-            self._charge_llm(contract, judge_result)
-            step.complete = complete
-            step.last_reason = reason[:140]
-            judge_event_id = f"judge-{step.id}-{uuid.uuid4().hex[:4]}"
-            self.recorder.append(TraceEvent(
-                event_id=judge_event_id,
-                parent_id=judge_llm_event_id,
-                ts=utcnow_iso(),
-                kind="criterion_check",
-                payload={
-                    "contract_id": contract.id,
-                    "step_id": step.id,
-                    "description": step.description,
-                    "complete": complete,
-                    "reason": reason,
-                    "judge": True,
-                    "iteration": run.iterations,
-                },
-            ))
-            run.last_iter_anchor = judge_event_id
-            # Only judge first un-checked step per turn (token budget discipline).
-            break
-
-        # Refresh executor's user prompt with the updated checklist for the next turn.
-        run.messages.append({
-            "role": "user",
-            "content": (
-                "CHECKLIST UPDATE:\n"
-                f"{self._format_checklist(run)}\n\n"
-                f"BUDGET:\n{self._format_budget(contract)}\n\n"
-                "Take ONE action toward the first un-checked step, "
-                "or reply DONE only if all are checked."
-            ),
-        })
-
-    def _prune_to_window(
-        self, contract: Contract, run: ActivatorRun, turn_msgs: list[dict]
-    ) -> None:
-        """P1: sliding window. Drop oldest raw turn → compressed prior_attempts entry.
-
-        After each iteration, snapshot the turn's messages. When window overflows,
-        drop the oldest snapshot and append a one-liner to prior_attempts. Rebuild
-        run.messages from [system, fresh user prompt, prior_attempts log, last N turns].
-        """
-        if self.window_size <= 0 or not turn_msgs:
-            return
-
-        run._recent_turns.append(list(turn_msgs))
-
-        if len(run._recent_turns) <= self.window_size:
-            return
-
-        dropped = run._recent_turns.pop(0)
-        summary = _extract_turn_summary(dropped, len(run.prior_attempts) + 1)
-        if summary:
-            run.prior_attempts.append(summary)
-
-        new_msgs: list[dict] = [
-            {"role": "system", "content": PERFORMER_SYSTEM_PROMPT},
-            {"role": "user", "content": self._build_user_prompt(contract, run)},
-        ]
-        if run.prior_attempts:
-            log = "\n".join(f"  {line}" for line in run.prior_attempts[-20:])
-            new_msgs.append({
-                "role": "user",
-                "content": "PRIOR ATTEMPTS (do not repeat these approaches):\n" + log,
-            })
-        for turn in run._recent_turns:
-            new_msgs.extend(turn)
-        run.messages = new_msgs
-
-    def _state_summary_for_judge(self, run: ActivatorRun) -> str:
-        last = run.state.last_tool_result or {}
-        last_str = ""
-        if last:
-            last_str = (
-                f"LAST_TOOL: {last.get('tool')}\n"
-                f"LAST_ARGS: {json.dumps(last.get('args', {}))[:400]}\n"
-                f"LAST_IS_ERROR: {last.get('is_error')}\n"
-                f"LAST_OUTPUT (truncated):\n{(last.get('output') or '')[:1500]}\n"
-            )
-        terminal_output = run.state.kv.get("terminal_output")
-        if terminal_output:
-            snapshot = f"TERMINAL PANE (last capture):\n{terminal_output[:3000]}"
-        else:
-            snapshot = workdir_snapshot(run.state.workdir)
-        return (
-            f"{last_str}\n"
-            f"WORKDIR SNAPSHOT:\n{snapshot}\n"
-        )
-
-    # ── State machinery ─────────────────────────────────────────────────────
-
-    def _transition(
-        self, contract: Contract, to: ContractState, reason: str,
-        run: Optional[ActivatorRun] = None,
-    ) -> None:
-        # Causal-parent semantics: a state transition is caused by the event
-        # that just preceded it (admission decision, criterion check, budget
-        # violation, etc.). Default to "last appended event" which is naturally
-        # the cause by virtue of sequential execution order.
-        last_ev = self.recorder.traj.events[-1].event_id if self.recorder.traj.events else None
-        if not contract.can_transition(to):
-            # Rejected transition; chain from the cause but don't update cursor
-            self.recorder.append(TraceEvent(
-                event_id=f"state-{uuid.uuid4().hex[:6]}",
-                parent_id=last_ev,
-                ts=utcnow_iso(),
-                kind="contract_state",
-                payload={
-                    "contract_id": contract.id,
-                    "from": contract.state.value,
-                    "to": to.value,
-                    "rejected": True,
-                    "reason": f"transition forbidden: {reason}",
-                },
-            ))
-            return
-        prev = contract.state
-        contract.state = to
-        contract.state_reason = reason
-        event_id = f"state-{uuid.uuid4().hex[:6]}"
-        self.recorder.append(TraceEvent(
-            event_id=event_id,
-            parent_id=last_ev,
-            ts=utcnow_iso(),
-            kind="contract_state",
-            payload={
-                "contract_id": contract.id,
-                "from": prev.value,
-                "to": to.value,
-                "reason": reason,
-            },
-        ))
-        if run is not None:
-            run.last_state_event_id = event_id
-
-    def _record_state(self, contract: Contract, state: ContractState, run: ActivatorRun) -> None:
-        event_id = f"state-init-{contract.id}"
-        self.recorder.append(TraceEvent(
-            event_id=event_id,
-            parent_id=None,    # ROOT of the DAG
-            ts=utcnow_iso(),
-            kind="contract_state",
-            payload={
-                "contract_id": contract.id,
-                "from": None,
-                "to": state.value,
-                "reason": "ingested",
-                "obligation": contract.obligation,
-            },
-        ))
-        run.last_state_event_id = event_id
-
-    def _finalize(self, contract: Contract, run: ActivatorRun) -> None:
-        # step_end chains from the terminal state transition (last state event)
-        self.recorder.append(TraceEvent(
-            event_id=f"step-{uuid.uuid4().hex[:6]}",
-            parent_id=run.last_state_event_id or None,
-            ts=utcnow_iso(),
-            kind="step_end",
-            payload={
-                "iterations": run.iterations,
-                "final_state": contract.state.value,
-                "cost": _cost_dict(contract.cost),
-            },
-        ))
-
-
-def _cost_dict(cost: Cost) -> dict:
-    return {
-        "tokens_in": cost.tokens_in,
-        "tokens_out": cost.tokens_out,
-        "tokens_total": cost.tokens_total,
-        "tool_calls": cost.tool_calls,
-        "llm_calls": cost.llm_calls,
-        "usd": round(cost.usd, 5),
-        "wall_s": round(cost.wall_s, 2),
-    }
+    def _recent_trace_text(self, run: ActivatorRun, n_iters: int = 3) -> str:
+        """Short text summary of the last N iters for the in-loop prompt."""
+        # Take the last ~6 messages (3 turns worth)
+        msgs = run.messages[-(n_iters * 2):]
+        lines: list[str] = []
+        for m in msgs:
+            role = m.get("role", "")
+            if role == "assistant" and m.get("tool_calls"):
+                tc = m["tool_calls"][0]
+                fn = tc.get("function", {})
+                lines.append(f"  assistant→tool {fn.get('name', '?')}({fn.get('arguments', '{}')[:80]})")
+            elif role == "tool":
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    lines.append(f"  tool_result: {content[:200]}")
+            elif role == "system":
+                continue  # skip system noise
+        return "\n".join(lines)
