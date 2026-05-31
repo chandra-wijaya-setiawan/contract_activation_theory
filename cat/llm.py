@@ -360,15 +360,13 @@ def call_attestor(
     )
     if not result.text:
         return False, "attestor returned no text", result
+    from cat.plan_schema import AttestorVerdict
+    from pydantic import ValidationError
     try:
-        data = json.loads(result.text)
-        return (
-            bool(data.get("complete", False)),
-            str(data.get("reason", ""))[:300],
-            result,
-        )
-    except json.JSONDecodeError:
-        return False, "attestor JSON parse error", result
+        verdict = AttestorVerdict.model_validate_json(result.text)
+    except ValidationError:
+        return False, "attestor schema validation failed", result
+    return verdict.complete, verdict.reason[:300], result
 
 
 # Backward-compat aliases (read-only — DO NOT remove until v1.7+)
@@ -735,41 +733,24 @@ def call_revisor(
 
 
 def _parse_inloop_ops(text: str) -> Optional[list[dict[str, Any]]]:
-    """Validate per docs/iteration.md §6.4. Returns clean ops list or None."""
+    """Validate Revisor ops via the Pydantic RevisorOps schema (§6.4).
+
+    Returns a clean list of op-dicts (each with `op` discriminator, required
+    fields, and `reflection`) or None on validation failure. The Pydantic
+    discriminated union handles per-op required-field enforcement; before
+    this, ~30 lines of manual key checks did the same thing more loosely.
+    """
+    from cat.plan_schema import RevisorOps
+    from pydantic import ValidationError
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+        parsed = RevisorOps.model_validate_json(text)
+    except ValidationError:
         return None
-    if not isinstance(data, dict):
+    if not parsed.ops:
         return None
-    ops = data.get("ops")
-    if not isinstance(ops, list):
-        return None
-    valid_ops = {"COMMIT", "CHECKOUT", "DROP", "COMMIT_NEW", "REFINE", "BRANCH", "MERGE"}
-    required_fields = {
-        "COMMIT": {"node_id", "reason"},
-        "CHECKOUT": {"node_id"},
-        "DROP": {"node_id", "reason"},
-        "COMMIT_NEW": {"parent_id", "new_step"},
-        "REFINE": {"node_id", "substeps"},
-        "BRANCH": {"node_id", "alt_steps"},
-        "MERGE": {"branch_id", "target_id"},
-    }
-    out: list[dict[str, Any]] = []
-    for o in ops:
-        if not isinstance(o, dict):
-            continue
-        kind = o.get("op")
-        if kind not in valid_ops:
-            continue
-        req = required_fields[kind]
-        if not all(k in o for k in req):
-            continue
-        if not o.get("reflection"):
-            # require reflection per §6.3
-            continue
-        out.append(o)
-    return out or None
+    # Re-serialize back to plain dicts so the activator's existing
+    # tree-edit applier keeps its current interface.
+    return [op.model_dump() for op in parsed.ops]
 
 PLANNER_SYSTEM_PROMPT = STIPULATOR_SYSTEM_PROMPT
 JUDGE_SYSTEM_PROMPT = ATTESTOR_SYSTEM_PROMPT

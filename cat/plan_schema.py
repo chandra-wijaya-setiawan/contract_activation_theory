@@ -78,12 +78,16 @@ class PlanStep(BaseModel):
             "verify (run tests), or other."
         )
     )
-    suggested_tool: str | None = Field(
+    suggested_tool: Literal[
+        "bash", "read", "write", "list",
+        "str_replace", "multi_edit", "apply_patch",
+        "rg", "fd", "outline", "goto_def", "find_refs",
+        "git_diff", "git_status",
+    ] | None = Field(
         None,
         description=(
             "The tool you (Stipulator) recommend the Performer use for this step. "
-            "Pick from: bash, read, write, list, str_replace, multi_edit, apply_patch, "
-            "rg, fd, outline, goto_def, find_refs, git_diff, git_status. "
+            "Pick from the allowed set (enforced by validator). "
             "Leave null only if no clear tool exists (e.g., pure design steps)."
         ),
     )
@@ -129,3 +133,147 @@ class PhasedPlan(BaseModel):
     """Top-level container for the Stipulator's cold-start output."""
 
     phases: list[Phase] = Field(default_factory=list)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Attestor — per-step "is this step done?" verdict
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class AttestorVerdict(BaseModel):
+    """Attestor's verdict on whether the current step is done.
+
+    The Activator only consumes `complete` (bool) and `reason` (free-text);
+    additional fields can be added without breaking callers.
+    """
+
+    complete: bool = Field(description="True iff the step appears done.")
+    reason: str = Field(
+        default="",
+        description="Short justification (≤300 chars). Truncated by caller.",
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Revisor — tree-edit ops emitted on stall
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class _RevisorOpBase(BaseModel):
+    """Common fields for all Revisor ops; reflection is mandatory per §6.3."""
+
+    reflection: str = Field(
+        min_length=1,
+        description="Why this op (required — drives the librarian's edge log).",
+    )
+
+
+class CommitOp(_RevisorOpBase):
+    op: Literal["COMMIT"]
+    node_id: str
+    reason: str
+
+
+class CheckoutOp(_RevisorOpBase):
+    op: Literal["CHECKOUT"]
+    node_id: str
+
+
+class DropOp(_RevisorOpBase):
+    op: Literal["DROP"]
+    node_id: str
+    reason: str
+
+
+class CommitNewOp(_RevisorOpBase):
+    op: Literal["COMMIT_NEW"]
+    parent_id: str
+    new_step: dict = Field(description="A PlanStep-shape dict (validated downstream).")
+
+
+class RefineOp(_RevisorOpBase):
+    op: Literal["REFINE"]
+    node_id: str
+    substeps: list[dict] = Field(min_length=1)
+
+
+class BranchOp(_RevisorOpBase):
+    op: Literal["BRANCH"]
+    node_id: str
+    alt_steps: list[dict] = Field(min_length=1)
+
+
+class MergeOp(_RevisorOpBase):
+    op: Literal["MERGE"]
+    branch_id: str
+    target_id: str
+
+
+# Discriminated union — Pydantic picks the right model by `op` field.
+RevisorOp = CommitOp | CheckoutOp | DropOp | CommitNewOp | RefineOp | BranchOp | MergeOp
+
+
+class RevisorOps(BaseModel):
+    """Top-level container for the Revisor's ops list."""
+
+    ops: list[RevisorOp] = Field(
+        default_factory=list,
+        description="Tree-edit ops; the Activator applies them in order.",
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Resolver — stall-escalation decision
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class ResolverVerdict(BaseModel):
+    """LLMResolver's decision when the loop stalls.
+
+    Mirrors the existing ResolverOutput dataclass in cat/resolver.py but
+    enforced at the schema boundary so malformed LLM responses fall back
+    to _safe_fallback() via ValidationError instead of silently returning
+    forward/restipulate on best-effort string matching.
+    """
+
+    decision: Literal["forward", "restipulate", "backward", "give_up"]
+    reason: str = Field(default="", description="Truncated to 300 by caller.")
+    diagnosis: str = Field(default="", description="Truncated to 500 by caller.")
+    next_instruction: str = Field(default="", description="Truncated to 500 by caller.")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Attribution auditor — per-layer pass/fail verdicts (offline analysis)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+# Enum constants kept in sync with cat/attribution.py.
+AttributionStatus = Literal["OK", "DEGRADED", "FAILED", "NA"]
+AttributionLayer = Literal["represent", "stipulate", "perform", "verify"]
+
+
+class LayerStatus(BaseModel):
+    status: AttributionStatus = "NA"
+    evidence: str = Field(default="", description="Short justification.")
+
+
+class AttributionVerdict(BaseModel):
+    """LLM-driven post-task attribution: which CAT layer was the limiter?
+
+    Mirrors the four-layer CAT spec (`represent / stipulate / perform / verify`)
+    plus a diagnostic header. Diagnostic fields (`limitation_kind`,
+    `improvement_vector`, `confidence`) stay free-form strings here — they
+    have their own enum constants in cat/attribution.py and the auditor
+    post-processes them with explicit validation; lifting those into Pydantic
+    would duplicate the constants without much new safety.
+    """
+
+    represent: LayerStatus = Field(default_factory=LayerStatus)
+    stipulate: LayerStatus = Field(default_factory=LayerStatus)
+    perform: LayerStatus = Field(default_factory=LayerStatus)
+    verify: LayerStatus = Field(default_factory=LayerStatus)
+    primary: AttributionLayer = "perform"
+    limitation_kind: str = ""
+    limitation_secondary: str = ""
+    improvement_vector: str = ""
+    confidence: str = ""

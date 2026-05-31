@@ -243,33 +243,38 @@ def attribute_task_llm(
     if not result.text:
         raise ValueError("auditor returned no text")
 
-    data = json.loads(result.text)  # may raise; caller handles
+    # Pydantic-validate the structural shape (per-layer status enum + primary
+    # enum). Diagnostic fields stay strings; their enum-membership check
+    # happens below since the allowed values are auditor-specific constants.
+    from cat.plan_schema import AttributionVerdict
+    from pydantic import ValidationError
+    try:
+        v = AttributionVerdict.model_validate_json(result.text)
+    except ValidationError as e:
+        raise ValueError(f"auditor schema validation failed: {e}") from e
+
     layers: list[LayerVerdict] = []
     for layer in LAYERS:
-        v = data.get(layer, {}) or {}
-        status = v.get("status", "NA")
-        if status not in STATUSES:
-            status = "NA"
+        layer_v = getattr(v, layer)
         layers.append(LayerVerdict(
             layer=layer,
-            status=status,
-            evidence=str(v.get("evidence", ""))[:300],
+            status=layer_v.status,
+            evidence=layer_v.evidence[:300],
         ))
-    primary = data.get("primary", "")
-    if primary not in LAYERS:
-        primary = "perform"   # safe default after PRD 1.6.2.9
+    primary = v.primary  # Pydantic already constrained to LAYERS enum
 
-    # 1.6.5.1 diagnostic fields (with validation)
-    lim_kind = data.get("limitation_kind", "")
+    # 1.6.5.1 diagnostic fields — these have their own enum constants in this
+    # module that don't belong in the schema (auditor-internal). Validate here.
+    lim_kind = v.limitation_kind
     if lim_kind not in LIMITATION_KINDS:
         lim_kind = "none" if outcome == "PASS" else ""
-    lim_sec = data.get("limitation_secondary", "") or ""
+    lim_sec = v.limitation_secondary or ""
     if lim_sec and lim_sec not in LIMITATION_KINDS:
         lim_sec = ""
-    imp_vec = data.get("improvement_vector", "")
+    imp_vec = v.improvement_vector
     if imp_vec not in IMPROVEMENT_VECTORS:
         imp_vec = "none" if outcome == "PASS" else ""
-    conf = data.get("confidence", "")
+    conf = v.confidence
     if conf not in CONFIDENCE:
         conf = "low"
 

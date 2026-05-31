@@ -100,16 +100,17 @@ def test_parse_inloop_ops_drops_missing_required():
     assert _parse_inloop_ops(text) is None
 
 
-def test_parse_inloop_ops_drops_unknown_op():
+def test_parse_inloop_ops_rejects_unknown_op():
+    """Pydantic discriminated-union strict-rejects unknown ops; the whole
+    batch fails so the Revisor retry path (or _safe_fallback) handles it,
+    rather than silently dropping novel-named ops and applying partial work."""
     text = json.dumps({
         "ops": [
             {"op": "WHIMSY", "node_id": "X", "reflection": "x"},
             {"op": "COMMIT", "node_id": "A1", "reason": "done", "reflection": "ok"},
         ]
     })
-    ops = _parse_inloop_ops(text)
-    assert len(ops) == 1
-    assert ops[0]["op"] == "COMMIT"
+    assert _parse_inloop_ops(text) is None
 
 
 def test_parse_inloop_ops_invalid_json():

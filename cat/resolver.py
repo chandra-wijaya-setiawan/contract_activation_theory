@@ -323,18 +323,17 @@ class LLMResolver(Resolver):
             )
             if not getattr(result, "text", None):
                 return _safe_fallback(ctx)
+            from cat.plan_schema import ResolverVerdict
+            from pydantic import ValidationError
             try:
-                data = json.loads(result.text)
-            except json.JSONDecodeError:
-                return _safe_fallback(ctx)
-            d = data.get("decision", "")
-            if d not in ("forward", "restipulate", "backward", "give_up"):
+                verdict = ResolverVerdict.model_validate_json(result.text)
+            except ValidationError:
                 return _safe_fallback(ctx)
             return ResolverOutput(
-                decision=d,
-                reason=str(data.get("reason", ""))[:300],
-                diagnosis=str(data.get("diagnosis", ""))[:500],
-                next_instruction=str(data.get("next_instruction", ""))[:500],
+                decision=verdict.decision,
+                reason=verdict.reason[:300],
+                diagnosis=verdict.diagnosis[:500],
+                next_instruction=verdict.next_instruction[:500],
             )
         except Exception:
             return _safe_fallback(ctx)
