@@ -309,38 +309,48 @@ class ActivatorV2(Activator):
         return run
 
     # ── helpers ──────────────────────────────────────────────────────────
+    _ATTENTION_HINT_MARKER = "PLAN ATTENTION (focus on this one step):"
+
     def _inject_plan_attention(self, run: ActivatorRun, plan_tree: PlanTree) -> None:
-        """Append a transient SYSTEM message showing attention + lookahead.
+        """Inject a SYSTEM message showing attention + lookahead.
 
-        Like the librarian_hint mechanism in v1.7 A.1: ephemeral hint for
-        this turn only.
-
-        Intent-specific forceful guidance: the agent has a habit of staying
-        in investigate mode on mutate/verify steps. The hint now demands
-        the right tool family for each intent.
+        R5: must be a single hint at any time. Previously appended
+        permanently every iter, which caused N SYSTEM messages to
+        accumulate; OpenAI-compatible APIs returned degenerate 0/0
+        responses in this configuration. Now: strip any prior PLAN
+        ATTENTION SYSTEM message from run.messages BEFORE appending
+        the new one. Exactly one attention hint in messages at any
+        time, always positioned at the end.
         """
         attention = plan_tree.get_attention()
         if not attention:
             return
+
+        # R5 strip-and-replace: remove any prior PLAN ATTENTION SYSTEM hints
+        # so we never accumulate them across iters.
+        marker = self._ATTENTION_HINT_MARKER
+        run.messages[:] = [
+            m for m in run.messages
+            if not (
+                m.get("role") == "system"
+                and isinstance(m.get("content", ""), str)
+                and marker in m["content"]
+            )
+        ]
+
         lookahead = plan_tree.lookahead(max_steps=4)
         lookahead_str = "\n".join(
             f"  - [{n.id}] ({n.intent}) {n.description[:100]}" for n in lookahead[1:]
         ) or "  (none)"
 
-        # R3 intent-directive was rolled back — empirically the R4-validate
-        # run showed it caused 3-of-4 tasks to crash with degenerate LLM
-        # responses. Reverting to the original concise attention hint that
-        # the swe10 v2 baseline run (8/10 pass) used. Intent steering is
-        # already implicit in the description + expects fields.
         hint = (
-            f"PLAN ATTENTION (focus on this one step):\n"
+            f"{marker}\n"
             f"  [{attention.id}] ({attention.phase_name}/{attention.intent}) {attention.description}\n"
             f"  expects: durable_change={attention.expects.get('durable_change', False)}, "
             f"files={attention.expects.get('files_modified', [])}, "
             f"verifier={attention.expects.get('verifier_outcome', 'N/A')}\n"
             f"\nUPCOMING (informational, not for this turn):\n{lookahead_str}\n"
         )
-        # Append transient SYSTEM (will be present for THIS turn only; pruned next iter)
         run.messages.append({"role": "system", "content": hint})
 
     def _infer_durable_change(self, run: ActivatorRun) -> tuple[bool, list[str]]:
