@@ -312,28 +312,30 @@ class ActivatorV2(Activator):
     _ATTENTION_HINT_MARKER = "PLAN ATTENTION (focus on this one step):"
 
     def _inject_plan_attention(self, run: ActivatorRun, plan_tree: PlanTree) -> None:
-        """Inject a SYSTEM message showing attention + lookahead.
+        """Inject the attention hint as a USER message.
 
-        R5: must be a single hint at any time. Previously appended
-        permanently every iter, which caused N SYSTEM messages to
-        accumulate; OpenAI-compatible APIs returned degenerate 0/0
-        responses in this configuration. Now: strip any prior PLAN
-        ATTENTION SYSTEM message from run.messages BEFORE appending
-        the new one. Exactly one attention hint in messages at any
-        time, always positioned at the end.
+        R5 v2: changed role from 'system' to 'user'.
+
+        The hint MUST be the last message in the array so the LLM
+        responds to it. A trailing 'system' message at the END (after
+        assistant + tool messages) was empirically rejected by the
+        deepseek/openrouter endpoint with degenerate 0/0 token
+        responses. Using 'user' role keeps it a valid conversation
+        turn the model knows to answer.
+
+        Strip-and-replace: remove any prior attention hint (system OR
+        user role with the marker) before appending the new one.
+        Exactly one attention hint in messages at any time.
         """
         attention = plan_tree.get_attention()
         if not attention:
             return
 
-        # R5 strip-and-replace: remove any prior PLAN ATTENTION SYSTEM hints
-        # so we never accumulate them across iters.
         marker = self._ATTENTION_HINT_MARKER
         run.messages[:] = [
             m for m in run.messages
             if not (
-                m.get("role") == "system"
-                and isinstance(m.get("content", ""), str)
+                isinstance(m.get("content", ""), str)
                 and marker in m["content"]
             )
         ]
@@ -350,8 +352,9 @@ class ActivatorV2(Activator):
             f"files={attention.expects.get('files_modified', [])}, "
             f"verifier={attention.expects.get('verifier_outcome', 'N/A')}\n"
             f"\nUPCOMING (informational, not for this turn):\n{lookahead_str}\n"
+            f"\nAct on the current step. Reply with one tool call."
         )
-        run.messages.append({"role": "system", "content": hint})
+        run.messages.append({"role": "user", "content": hint})
 
     def _infer_durable_change(self, run: ActivatorRun) -> tuple[bool, list[str]]:
         """Approximate: was the last tool call a write-tool that succeeded?
