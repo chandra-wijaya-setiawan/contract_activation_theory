@@ -453,17 +453,38 @@ class ActivatorV2(Activator):
             actual_files_modified=actual_files,
         )
 
-        # AUTHORITY: attestor on the current attention node decides "step done?"
-        # This MUST run before the trace event so attestor_reason is captured.
+        # R7: step_done requires CONSISTENCY across all 7 dimensions
+        # (per docs/iteration.md §4b). Attestor is ONE dimension, not the
+        # gatekeeper. A mutate step cannot be 'done' when durable_match or
+        # files_match is False — even if the attestor said YES.
         attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
         sv.details["attestor_reason"] = attestor_reason
         sv.details["attestor_done"] = "yes" if attestor_done else "no"
 
-        # Combine attestor + mechanical:
-        # - attestor=YES is sufficient
-        # - attestor=NO but strong mechanical evidence (mutate hit expected files,
-        #   or verify saw expected outcome) can override
-        if attestor_done:
+        # step_done = attestor_done AND no mechanical dimension diverges on
+        # the dims that matter for this intent.
+        # For mutate intent: durable_match AND files_match must hold.
+        # For verify intent: verifier_match must hold (when expected != N/A).
+        # For investigate / design / other: mechanical dims rarely diverge
+        # (expects.durable_change=False, etc.) so attestor effectively rules.
+        critical_dim_violated = False
+        if attention_node.intent == "mutate":
+            if not (sv.durable_match and sv.files_match):
+                critical_dim_violated = True
+                sv.details["block_step_done"] = (
+                    "mutate intent requires durable_match AND files_match"
+                )
+        elif attention_node.intent == "verify":
+            ev = attention_node.expects.get("verifier_outcome", "N/A") if isinstance(attention_node.expects, dict) else "N/A"
+            if ev in ("PASS", "FAIL") and not sv.verifier_match:
+                critical_dim_violated = True
+                sv.details["block_step_done"] = (
+                    "verify intent requires verifier_match"
+                )
+
+        if critical_dim_violated:
+            step_done = False
+        elif attestor_done:
             step_done = True
         elif self._mechanical_evidence_strong(attention_node, sv):
             step_done = True
