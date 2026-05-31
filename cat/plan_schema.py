@@ -78,6 +78,26 @@ class PlanStep(BaseModel):
             "verify (run tests), or other."
         )
     )
+    suggested_tool: str | None = Field(
+        None,
+        description=(
+            "The tool you (Stipulator) recommend the Performer use for this step. "
+            "Pick from: bash, read, write, list, str_replace, multi_edit, apply_patch, "
+            "rg, fd, outline, goto_def, find_refs, git_diff, git_status. "
+            "Leave null only if no clear tool exists (e.g., pure design steps)."
+        ),
+    )
+    suggested_args: dict = Field(
+        default_factory=dict,
+        description=(
+            "The tool arguments you recommend. The Performer sees this as a hint "
+            "and may follow or adapt. Examples: {'path': '/testbed/foo.py'} for read, "
+            "{'pattern': 'def is_zero', 'paths': '/testbed/sympy/core/expr.py'} for rg, "
+            "{'path': '/testbed/foo.py', 'old_str': 'return False', 'new_str': 'return None'} "
+            "for str_replace. For mutate steps, BE SPECIFIC: include the exact target file, "
+            "the exact old_str pattern, the exact new_str replacement."
+        ),
+    )
     expects: StepExpects = Field(
         default_factory=StepExpects,
         description="Predicted result of this step; used by the attestor.",

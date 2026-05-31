@@ -21,7 +21,7 @@ from cat.activator import Activator, ActivatorRun, _PlanStep, PERFORMER_SYSTEM_P
 from cat.contracts import Contract, ContractState, State
 from cat.llm import (
     call_stipulator_phased,
-    call_stipulator_inloop,
+    call_revisor,
     call_stipulator,  # fallback
     call_attestor,
 )
@@ -356,12 +356,30 @@ class ActivatorV2(Activator):
             # Clear after consuming so it only fires once
             run.resolver_next_instruction = ""  # type: ignore[attr-defined]
 
+        # R10b: surface Stipulator's tool suggestion (when present)
+        sugg_tool = getattr(attention, "suggested_tool", None) or ""
+        sugg_args = getattr(attention, "suggested_args", None) or {}
+        if isinstance(sugg_args, dict) and sugg_tool:
+            try:
+                args_json = json.dumps(sugg_args, ensure_ascii=False)
+            except Exception:
+                args_json = str(sugg_args)
+            suggestion_block = (
+                f"\nSTIPULATOR SUGGESTS for this step:\n"
+                f"  tool: {sugg_tool}\n"
+                f"  args: {args_json[:400]}\n"
+                f"  (follow if applicable; adapt if you see something better)\n"
+            )
+        else:
+            suggestion_block = ""
+
         hint = (
             f"{marker}\n"
             f"  [{attention.id}] ({attention.phase_name}/{attention.intent}) {attention.description}\n"
             f"  expects: durable_change={attention.expects.get('durable_change', False)}, "
             f"files={attention.expects.get('files_modified', [])}, "
             f"verifier={attention.expects.get('verifier_outcome', 'N/A')}\n"
+            f"{suggestion_block}"
             f"{resolver_block}"
             f"\nUPCOMING (informational, not for this turn):\n{lookahead_str}\n"
             f"\nAct on the current step. Reply with one tool call."
@@ -707,7 +725,7 @@ class ActivatorV2(Activator):
                 self._default_advance(plan_tree, attention_node, run)
                 run._stall_count[att_id] = 0  # type: ignore[attr-defined]
                 return
-            ops_applied = self._run_inloop_stipulate(contract, run, plan_tree, sv, state_now_class)
+            ops_applied = self._run_revisor(contract, run, plan_tree, sv, state_now_class)
             run.restip_count = getattr(run, "restip_count", 0) + 1  # type: ignore[attr-defined]
             if ops_applied == 0:
                 # Re-stipulate returned nothing — force forward
@@ -947,7 +965,7 @@ class ActivatorV2(Activator):
             ))
         plan_tree.advance_attention()
 
-    def _run_inloop_stipulate(
+    def _run_revisor(
         self,
         contract: Contract,
         run: ActivatorRun,
@@ -962,7 +980,7 @@ class ActivatorV2(Activator):
         recent_trace = self._recent_trace_text(run, n_iters=3)
 
         try:
-            ops, llm_result = call_stipulator_inloop(
+            ops, llm_result = call_revisor(
                 self.llm,
                 contract.obligation,
                 plan_tree_outline=outline,
@@ -984,7 +1002,7 @@ class ActivatorV2(Activator):
             event_id=f"sip-{uuid.uuid4().hex[:6]}",
             parent_id=self.recorder.traj.events[-1].event_id if self.recorder.traj.events else None,
             ts=utcnow_iso(),
-            kind="stipulate_inloop",
+            kind="revise",
             payload={
                 "iter": run.iterations,
                 "surprise": surprise.to_dict(),

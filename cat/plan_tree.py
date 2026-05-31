@@ -26,6 +26,10 @@ class PlanNode:
     description: str
     intent: Intent
     expects: dict[str, Any] = field(default_factory=dict)
+    # R10b: Stipulator's recommended tool + args. Performer sees them as a
+    # hint and may follow or adapt.
+    suggested_tool: Optional[str] = None
+    suggested_args: dict[str, Any] = field(default_factory=dict)
     status: Status = "pending"
     children: list[str] = field(default_factory=list)
     created_at_iter: int = 0
@@ -101,6 +105,8 @@ class PlanTree:
                 intent = step.get("intent", "other")
                 if intent not in ("investigate", "design", "mutate", "verify"):
                     intent = "other"
+                sugg_tool = step.get("suggested_tool")
+                sugg_args = step.get("suggested_args") if isinstance(step.get("suggested_args"), dict) else {}
                 step_node = PlanNode(
                     id=step_id,
                     parent_id=phase_id,
@@ -108,6 +114,8 @@ class PlanTree:
                     description=desc,
                     intent=intent,
                     expects=(step.get("expects") if isinstance(step.get("expects"), dict) else {}) or {},
+                    suggested_tool=sugg_tool if isinstance(sugg_tool, str) else None,
+                    suggested_args=sugg_args or {},
                 )
                 tree.nodes[step_id] = step_node
                 phase_node.children.append(step_id)

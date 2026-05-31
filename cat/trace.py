@@ -44,7 +44,8 @@ EventKind = Literal[
     "plan_branch",
     "plan_merge",
     "surprise",                # surprise vector at end-of-iter
-    "stipulate_inloop",        # in-loop re-stipulate fired
+    "revise",                  # Revisor emitted tree-edit ops (was: stipulate_inloop)
+    "stipulate_inloop",        # legacy alias for "revise" — pre-rename traces
     # Legacy aliases (kept readable for pre-rename traces):
     "contract_decompose",      # legacy alias for contract_stipulate
     "capability_invoke",       # legacy alias for capability_perform

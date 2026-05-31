@@ -153,3 +153,64 @@ def test_step_expects_model_dump_roundtrip():
     assert e2.durable_change is True
     assert e2.files_modified == ["a.py"]
     assert e2.result == "check x"
+
+
+def test_plan_step_with_suggested_tool_and_args():
+    """R10b: PlanStep can carry suggested_tool + suggested_args."""
+    step = PlanStep(
+        description="edit foo.py",
+        intent="mutate",
+        suggested_tool="str_replace",
+        suggested_args={
+            "path": "/testbed/foo.py",
+            "old_str": "return False",
+            "new_str": "return None",
+        },
+        expects=StepExpects(durable_change=True, files_modified=["foo.py"]),
+    )
+    assert step.suggested_tool == "str_replace"
+    assert step.suggested_args["path"] == "/testbed/foo.py"
+
+
+def test_plan_step_without_suggestion_defaults_to_none():
+    step = PlanStep(description="x", intent="design")
+    assert step.suggested_tool is None
+    assert step.suggested_args == {}
+
+
+def test_phased_plan_with_suggestion_round_trips():
+    """JSON with suggested_tool/args parses correctly via _parse_phased_plan."""
+    text = json.dumps({
+        "phases": [
+            {"name": "MAP", "steps": [
+                {"description": "read x", "intent": "investigate",
+                 "suggested_tool": "read",
+                 "suggested_args": {"path": "/testbed/x.py"},
+                 "expects": {"result": "x is read"}}
+            ]}
+        ]
+    })
+    plan = _parse_phased_plan(text)
+    assert plan is not None
+    s = plan["phases"][0]["steps"][0]
+    assert s["suggested_tool"] == "read"
+    assert s["suggested_args"]["path"] == "/testbed/x.py"
+
+
+def test_plan_node_constructed_from_dict_with_suggestion():
+    """plan_tree.PlanTree.from_phased_plan picks up suggested_tool/args."""
+    from cat.plan_tree import PlanTree
+    phased = {
+        "phases": [
+            {"name": "MAP", "steps": [
+                {"description": "rg is_zero", "intent": "investigate",
+                 "suggested_tool": "rg",
+                 "suggested_args": {"pattern": "def is_zero", "paths": "/testbed"},
+                 "expects": {"result": "located"}}
+            ]}
+        ]
+    }
+    tree = PlanTree.from_phased_plan(phased)
+    node = tree.nodes["A1"]
+    assert node.suggested_tool == "rg"
+    assert node.suggested_args["pattern"] == "def is_zero"

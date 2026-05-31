@@ -352,15 +352,28 @@ Phases (use this fixed vocabulary):
   - VERIFY    — run tests / confirm criteria
 
 Each step has these fields:
-  description: imperative prose (what to do)
-  intent     : "investigate" | "design" | "mutate" | "verify" | "other"
-  expects    : the planner's predictions for when the step is done:
+  description     : imperative prose (what to do)
+  intent          : "investigate" | "design" | "mutate" | "verify" | "other"
+  suggested_tool  : ⭐ which tool the Performer should use for this step.
+                    Pick from: bash, read, write, list, str_replace, multi_edit,
+                    apply_patch, rg, fd, outline, goto_def, find_refs, git_diff,
+                    git_status. Leave null only for pure design steps.
+  suggested_args  : ⭐ exact args the Performer should pass. The Performer can
+                    adapt if the world has changed, but a high-quality suggestion
+                    SAVES iters because the Performer follows it directly.
+                    Examples:
+                      read: {"path": "/testbed/sympy/core/add.py"}
+                      rg:   {"pattern": "def is_zero", "paths": ["/testbed/sympy/core/expr.py"]}
+                      str_replace: {"path": "/testbed/foo.py",
+                                    "old_str": "return False",
+                                    "new_str": "return None"}
+                      bash: {"command": "cd /testbed && python -m pytest --tb=short -q"}
+  expects         : the planner's predictions for when the step is done:
     - durable_change   bool, true iff this step is expected to modify files
     - files_modified   list of expected modified file paths (only for mutate)
     - verifier_outcome "PASS" | "FAIL" | "N/A" (only meaningful for verify)
-    - result           ⭐ THE KEY FIELD: prose statement of what should be
-                       true when this step is done. The attestor uses
-                       'result' as the explicit done-criterion.
+    - result           ⭐ prose statement of what should be true when this step
+                       is done. The attestor uses 'result' as the done-criterion.
 
 ⭐ THE 'result' FIELD MUST INCLUDE NEGATIVE-RESULT POSSIBILITIES where they
 apply. A search that returns 0 matches is VALID evidence — write the
@@ -394,31 +407,72 @@ Output a JSON object matching this exact shape:
       "name": "MAP",
       "steps": [
         {
-          "description": "<imperative>",
+          "description": "Read settings_to_cmd_args_env in postgresql/client.py",
           "intent": "investigate",
+          "suggested_tool": "read",
+          "suggested_args": {"path": "/testbed/django/db/backends/postgresql/client.py"},
           "expects": {
             "durable_change": false,
             "files_modified": [],
             "verifier_outcome": "N/A",
-            "result": "<what should be true when done; include negative-result clause if applicable>"
+            "result": "We have read settings_to_cmd_args_env in postgresql/client.py and know its signature + body."
           }
         }
       ]
     },
-    { "name": "DESIGN", "steps": [...] },
-    { "name": "IMPLEMENT", "steps": [...] },
-    { "name": "VERIFY", "steps": [...] }
+    {
+      "name": "IMPLEMENT",
+      "steps": [
+        {
+          "description": "Add SSL env vars to settings_to_cmd_args_env",
+          "intent": "mutate",
+          "suggested_tool": "str_replace",
+          "suggested_args": {
+            "path": "/testbed/django/db/backends/postgresql/client.py",
+            "old_str": "env = {}",
+            "new_str": "env = {'PGSSLMODE': options.get('sslmode'), ...}"
+          },
+          "expects": {
+            "durable_change": true,
+            "files_modified": ["/testbed/django/db/backends/postgresql/client.py"],
+            "verifier_outcome": "N/A",
+            "result": "client.py has SSL env vars in the env dict returned by settings_to_cmd_args_env"
+          }
+        }
+      ]
+    },
+    {
+      "name": "VERIFY",
+      "steps": [
+        {
+          "description": "Run the oracle test command",
+          "intent": "verify",
+          "suggested_tool": "bash",
+          "suggested_args": {"command": "cd /testbed && python -m pytest --tb=short -q"},
+          "expects": {
+            "durable_change": false,
+            "files_modified": [],
+            "verifier_outcome": "PASS",
+            "result": "pytest exits 0; targeted regression tests pass"
+          }
+        }
+      ]
+    }
   ]
 }
 """
 
 
-STIPULATOR_INLOOP_SYSTEM_PROMPT = """\
-You are the STIPULATOR for a contract-disciplined agent (v2 design), \
-in IN-LOOP mode. The plan tree exists; you are emitting a small list of \
-TREE-EDIT OPS to react to a surprise.
+REVISOR_SYSTEM_PROMPT = """\
+You are the REVISOR for a contract-disciplined agent.
 
-DO NOT regenerate the full plan. Only emit ops that address the surprise.
+The Stipulator already wrote the full plan tree (strategic, A-to-Z). Your job \
+is NARROW: emit a small list of TREE-EDIT OPS that revise the existing tree \
+in response to a stall. You DO NOT plan A-Z; you do not invent a new plan. \
+You PATCH one region.
+
+If a step is fine, do nothing to it. If a step turned out wrong or vague, \
+emit ops to fix that step or its neighborhood.
 
 Available ops (each MUST include a `reflection: str` explaining the choice):
 
@@ -449,6 +503,9 @@ Output shape:
   ]
 }
 """
+
+# Legacy alias (do not remove until v1.7+; activator_v2 still references old name in trace events)
+STIPULATOR_INLOOP_SYSTEM_PROMPT = REVISOR_SYSTEM_PROMPT
 
 
 def call_stipulator_phased(
@@ -553,7 +610,7 @@ def _parse_phased_plan(text: str) -> Optional[dict[str, Any]]:
     return {"phases": cleaned_phases}
 
 
-def call_stipulator_inloop(
+def call_revisor(
     llm: LLM,
     obligation: str,
     plan_tree_outline: str,
@@ -563,7 +620,12 @@ def call_stipulator_inloop(
     surprise_dims: dict[str, Any],
     parent_event_id: Optional[str] = None,
 ) -> tuple[Optional[list[dict[str, Any]]], LLMResult]:
-    """In-loop Stipulate. Returns (ops_list_or_None, llm_result)."""
+    """Revisor — local tree-edit ops in response to a stall.
+
+    Distinct from Stipulator (which is strategic, runs once at start).
+    Revisor revises a region of the existing plan tree based on observed
+    surprise. Returns (ops_list_or_None, llm_result).
+    """
     user_msg = (
         f"OBLIGATION (brief):\n{obligation[:500]}\n\n"
         f"CURRENT PLAN TREE:\n{plan_tree_outline}\n\n"
@@ -574,13 +636,13 @@ def call_stipulator_inloop(
         f"Emit a minimal list of tree-edit ops to react. Include `reflection` on every op."
     )
     messages = [
-        {"role": "system", "content": STIPULATOR_INLOOP_SYSTEM_PROMPT},
+        {"role": "system", "content": REVISOR_SYSTEM_PROMPT},
         {"role": "user", "content": user_msg},
     ]
     result = llm.chat(
         messages=messages,
         response_format={"type": "json_object"},
-        role_tag="stipulator",
+        role_tag="revisor",
         temperature=0.1,
         parent_event_id=parent_event_id,
     )
@@ -629,3 +691,6 @@ def _parse_inloop_ops(text: str) -> Optional[list[dict[str, Any]]]:
 
 PLANNER_SYSTEM_PROMPT = STIPULATOR_SYSTEM_PROMPT
 JUDGE_SYSTEM_PROMPT = ATTESTOR_SYSTEM_PROMPT
+
+# Backward-compat: previous name for the Revisor role; do not remove until v1.8+
+call_stipulator_inloop = call_revisor
