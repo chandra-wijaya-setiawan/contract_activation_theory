@@ -91,18 +91,20 @@ Total est ~1000 LOC. Aggressive.
   field from in-loop LLM was passed through. Defensive isinstance() coerce
   in plan_tree.py for from_phased_plan, COMMIT_NEW, REFINE, BRANCH.
 
-### M6 — librarian writes + chronological swe10 (running)
+### M6 — librarian writes + chronological swe10 ✓
 - `cat/librarian_v2.py` 5/5 unit tests green
 - Persistent SQLite at `data/librarian_v2/v2.db`
 - Plan-tree write + edge write per iter wired
-- Cold-start Stipulate sees prior PASS+FAIL templates by obligation_class
-- swe10 launched concurrency=3, persistent librarian
+- swe10 ran chronologically, concurrency=3, persistent librarian
+- Final librarian state: 11 plan_trees, 119 edges, 6 obligation_classes
+- **swe10 result: 8/10 (matches baseline)**
 
-### M7 — comparison
-- `scripts/compare_v2_vs_baseline.py` written
-- Baseline: v1.7 A.2 fixed at 8/10
-- swe3 partial result: -7 vs proportional baseline (1/3 vs 8/10) but at
-  much lower token cost
+### M7 — comparison ✓
+- `scripts/compare_v2_vs_baseline.py` produces `docs/M7_swe10_v2_comparison.md`
+- **Pass rate: 8/10 v2 == 8/10 baseline (+0)**
+- Token total: 1.81M v2 vs 1.60M baseline (+14%)
+- Task swap: WON django-11239 (baseline failed); LOST sympy-15875
+- Honest assessment + next-iteration tuning ideas in M7 doc
 
 ## Risk log
 
