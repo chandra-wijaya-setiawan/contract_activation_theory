@@ -157,7 +157,7 @@ class TbCatAgent(BaseAgent):
 
     def __init__(
         self,
-        model_name: str = "openrouter/deepseek/deepseek-v4-flash",
+        model_name: str = os.environ.get("CAT_MODEL", "openrouter/deepseek/deepseek-v4-flash"),
         max_iterations: int = 30,
         test_cmd: "Union[str, dict[str, str]]" = "",
         criterion_check_interval: int = 3,
@@ -408,7 +408,7 @@ class TbReactAgent(BaseAgent):
 
     def __init__(
         self,
-        model_name: str = "openrouter/deepseek/deepseek-v4-flash",
+        model_name: str = os.environ.get("CAT_MODEL", "openrouter/deepseek/deepseek-v4-flash"),
         max_iterations: int = 30,
         **kwargs,
     ) -> None:

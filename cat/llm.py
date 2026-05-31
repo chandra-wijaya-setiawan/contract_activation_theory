@@ -39,6 +39,9 @@ _PRICING: dict[str, tuple[float, float]] = {
     "deepseek/deepseek-chat-v3-0324": (0.27, 1.10),
     "anthropic/claude-haiku-4-5": (1.00, 5.00),
     "openai/gpt-4o-mini": (0.15, 0.60),
+    "moonshotai/kimi-k2": (0.30, 1.20),       # rough; verify against OpenRouter
+    "moonshotai/kimi-k2-0905": (0.30, 1.20),
+    "z-ai/glm-4.5-air": (0.20, 1.00),
 }
 
 
