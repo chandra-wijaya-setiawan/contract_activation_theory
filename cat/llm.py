@@ -104,8 +104,18 @@ class LLM:
         temperature: float = 0.2,
         role_tag: str = "executor",
         parent_event_id: Optional[str] = None,
+        max_retries: int = 3,
+        retry_base_delay_s: float = 2.0,
     ) -> LLMResult:
-        """One chat completion. Records llm_usage TraceEvent on success."""
+        """One chat completion. Records llm_usage TraceEvent on success.
+
+        R11: retries with exponential backoff on:
+          - 0/0 token "degenerate" responses (provider rate-limit signal that
+            comes back as an empty completion with no usage)
+          - openai-client exceptions (RateLimitError, APIError, APITimeoutError)
+        Backoff: retry_base_delay_s * 2^attempt (so 2s, 4s, 8s by default).
+        Max attempts = max_retries + 1 (so 4 total tries by default).
+        """
         kwargs: dict[str, Any] = {
             "model": self.api_model,
             "messages": messages,
@@ -121,8 +131,41 @@ class LLM:
             kwargs["max_tokens"] = max_tokens
 
         t0 = time.time()
-        resp = self.client.chat.completions.create(**kwargs)
+        resp = None
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = self.client.chat.completions.create(**kwargs)
+            except Exception as e:  # noqa: BLE001 — catch broad to detect any API failure
+                last_exc = e
+                # If this is the last attempt, re-raise. Otherwise backoff + retry.
+                if attempt >= max_retries:
+                    raise
+                delay = retry_base_delay_s * (2 ** attempt)
+                time.sleep(delay)
+                continue
+
+            # Check for "degenerate" response: 0 prompt tokens AND no content/tool_calls.
+            usage = getattr(resp, "usage", None)
+            t_in_probe = int(getattr(usage, "prompt_tokens", 0)) if usage else 0
+            choice = resp.choices[0] if resp.choices else None
+            msg = getattr(choice, "message", None) if choice else None
+            has_content = bool(getattr(msg, "content", None))
+            has_tools = bool(getattr(msg, "tool_calls", None))
+            degenerate = (t_in_probe == 0) and not has_content and not has_tools
+
+            if degenerate and attempt < max_retries:
+                # Rate-limit / empty completion — backoff + retry
+                delay = retry_base_delay_s * (2 ** attempt)
+                time.sleep(delay)
+                continue
+
+            # Good response (or last attempt anyway) → fall through to parsing
+            break
+
         wall_s = time.time() - t0
+        if resp is None and last_exc is not None:
+            raise last_exc
 
         choice = resp.choices[0]
         msg = choice.message
