@@ -16,36 +16,37 @@ the default.
 
 **Future extension parameters** (not implemented yet — design only):
 
-### `optimize_for` — cost vs quality vs speed
-```python
-PlanComposer(llm, optimize_for="cost")     # prefer minimal persona, K=1
-PlanComposer(llm, optimize_for="quality")  # K=3, conservative + exploratory
-PlanComposer(llm, optimize_for="speed")    # K=1, minimal persona
-PlanComposer(llm, optimize_for="balanced") # current default (K=3, persona-weighted)
-```
-Each axis dials persona selection, K, and scorer weights.
+### `effort` — single bundled trade-off knob
 
-Motivation: different deployment targets (CI gating vs autonomous research vs
-hobbyist) want different cost/quality trade-offs at the same code surface.
+Instead of orthogonal `optimize_for` + `intelligence_level` + `K` (which creates
+false dilemmas and bad combinations), expose ONE dial:
 
-### `intelligence_level` — model tier per persona
 ```python
-PlanComposer(llm, intelligence_level="fast")  # all personas → flash model
-PlanComposer(llm, intelligence_level="mid")   # current default
-PlanComposer(llm, intelligence_level="deep")  # exploratory persona → claude-sonnet
+PlanComposer(llm, effort="medium")  # default
 ```
 
-Motivation: the exploratory persona benefits most from a stronger model
-(branch reasoning is hard for cheap models). The minimal persona barely
-needs intelligence at all. Mixing model tiers per persona is more cost-
-efficient than picking one model for everything.
+| effort | K | model tier | scorer | ~cost | use case |
+|---|---|---|---|---|---|
+| `minimal` | 1 | flash | heuristic | 1× | CI smoke tests, dev iteration |
+| `low` | 1 | flash | heuristic | 1× | inner-loop iteration |
+| `medium` | 3 | flash | heuristic | ~1.05× | normal swe-bench runs (R18 default) |
+| `high` | 3 | mid model on hard personas | heuristic + LLM tiebreak | 3-5× | headline runs |
+| `max` | 5 | deep model | learned + LLM | 10-15× | leaderboard submission |
 
-Open question: how to plumb model selection cleanly. Probably a
-`PersonaSpec.model: Optional[str]` field that overrides the default LLM.
+Each level pre-bundles the underlying knobs in a coherent direction. Within
+a level you never get "cheap model + expensive scoring" or other incoherent
+combinations.
 
-### `K` — number of candidates
-Today K is implicit (3 personas → 3 candidates). Future: explicit K and
-auto-selected persona subset.
+Power users can still override individual params (`personas=`, `K=`, `scorer=`)
+if they have a specific need.
+
+Same pattern as Claude Code's effort levels, Cursor's model tiers, OpenAI's
+reasoning_effort — proven user model.
+
+Motivation: different deployment targets (dev iteration vs leaderboard) want
+different cost/quality trade-offs, but they're correlated, not orthogonal.
+Higher quality fundamentally costs more (more samples, deeper models). A
+single dial reflects that physics.
 
 ### Learned scorer (`LearnedPlanScorer`)
 `HeuristicPlanScorer` is hand-coded. As the LibrarianV2 accumulates plan-
