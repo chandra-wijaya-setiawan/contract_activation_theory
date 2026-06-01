@@ -78,6 +78,14 @@ your fix and is almost never the correct intervention.
 still call a tool. Reading the file first (to learn exact strings) and then \
 mutating next turn IS the right pattern. Doing nothing is never the right \
 pattern.
+8. The planner's `suggested_tool` is your CONTRACT — that is the tool you \
+should call (with the planner's args or your refined version). Do NOT \
+silently swap to a different tool because you feel uncertain. If you \
+genuinely cannot make progress with the suggested tool — e.g., the args \
+require info you don't have AND a quick read won't get it efficiently, OR \
+the suggested tool itself doesn't match the step description — call \
+`request_revision(reason="...")` to escalate to the planner. Read-first-\
+then-mutate-next-iter is fine. Silent tool-swapping is not.
 
 Tool-selection guidance (prefer the SPECIFIC tool over `bash`; one call is \
 cheaper than ten):

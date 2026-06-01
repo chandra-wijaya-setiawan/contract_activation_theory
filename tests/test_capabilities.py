@@ -19,7 +19,37 @@ PY = sys.executable.replace("\\", "/")
 def test_registry_has_default_tools():
     reg = build_default_registry()
     names = set(reg.names())
-    assert {"bash", "write", "read", "list"}.issubset(names)
+    assert {"bash", "write", "read", "list", "str_replace", "request_revision"}.issubset(names)
+
+
+def test_request_revision_returns_marker(tmp_path: Path):
+    """R22: request_revision is a signal tool — output starts with the
+    [REQUEST_REVISION] marker so the activator can detect it."""
+    from cat.capabilities import REQUEST_REVISION_MARKER
+    reg = build_default_registry()
+    state = State(workdir=tmp_path)
+    result = reg.invoke(
+        name="request_revision",
+        args={"reason": "old_str needs exact value", "proposed_fix": "add a read step"},
+        state=state,
+        recorder=None,
+        contract_id="x",
+        tool_call_id="t1",
+    )
+    assert not result.is_error
+    assert result.output.startswith(REQUEST_REVISION_MARKER)
+    assert "old_str needs exact value" in result.output
+    assert "add a read step" in result.output
+    assert result.detail["reason"] == "old_str needs exact value"
+
+
+def test_request_revision_reason_required():
+    """The Pydantic-like JSON schema requires `reason`. Calling without it
+    should still produce a result (handler is permissive — empty reason
+    becomes empty string) — but the LLM tool-spec requires it."""
+    reg = build_default_registry()
+    cap = reg.get("request_revision")
+    assert "reason" in cap.json_schema.get("required", [])
 
 
 def test_write_then_read_roundtrip(tmp_path: Path):

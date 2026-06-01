@@ -292,6 +292,32 @@ def _h_str_replace(args: dict[str, Any], state: State) -> ToolResult:
                       output=f"replaced 1 occurrence in {resolved.relative_to(state.workdir.resolve())}")
 
 
+# R22: request_revision — a SIGNAL tool, not an action tool.
+# The Performer calls this when it cannot execute the planner's suggested
+# tool with the information available (e.g. missing exact args that read
+# won't efficiently provide, or the suggested tool itself is wrong for the
+# step). The output is a sentinel that the activator detects and routes
+# to the Resolver / PlanPatcher pipeline for plan revision.
+REQUEST_REVISION_MARKER = "[REQUEST_REVISION]"
+
+
+def _h_request_revision(args: dict[str, Any], state: State) -> ToolResult:
+    """No-op handler. The signal is in the output prefix; the activator
+    inspects this and triggers plan revision rather than treating it as
+    a normal tool result."""
+    reason = str(args.get("reason", "") or "")[:500]
+    proposed_fix = str(args.get("proposed_fix", "") or "")[:500]
+    body = f"{REQUEST_REVISION_MARKER} reason: {reason}"
+    if proposed_fix:
+        body += f"\nproposed_fix: {proposed_fix}"
+    return ToolResult(
+        tool="request_revision",
+        is_error=False,
+        output=body,
+        detail={"reason": reason, "proposed_fix": proposed_fix},
+    )
+
+
 def build_default_registry() -> CapabilityRegistry:
     reg = CapabilityRegistry()
     reg.register(Capability(
@@ -360,6 +386,41 @@ def build_default_registry() -> CapabilityRegistry:
             "required": ["path", "old_str"],
         },
         handler=_h_str_replace,
+    ))
+    reg.register(Capability(
+        name="request_revision",
+        description=(
+            "SIGNAL the planner that the current plan step cannot be executed "
+            "with the information available. Call this INSTEAD of guessing a "
+            "different tool when (a) the suggested tool's args need exact "
+            "values you don't have AND a quick read won't get them, OR "
+            "(b) the suggested tool itself doesn't match the step intent. "
+            "The Resolver / PlanPatcher will revise the plan in response. "
+            "Do NOT call this on every uncertainty — only when you genuinely "
+            "cannot make progress with the available info."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Why the current plan step cannot be executed. "
+                        "Be specific about what info is missing or what mismatch exists."
+                    ),
+                },
+                "proposed_fix": {
+                    "type": "string",
+                    "description": (
+                        "Optional: what the planner should change "
+                        "(e.g., 'add a read step first to locate the file', "
+                        "'change suggested_tool from rg to find_refs')."
+                    ),
+                },
+            },
+            "required": ["reason"],
+        },
+        handler=_h_request_revision,
     ))
     return reg
 
@@ -1500,4 +1561,36 @@ def build_docker_registry(container: "object", default_workdir: str = "/testbed"
         },
         handler=_outline,
     ))
+
+    # R22: request_revision — signal tool. Performer calls this when it
+    # cannot execute the planner's suggestion with the available info.
+    # No filesystem effect; the activator detects the [REQUEST_REVISION]
+    # marker in the output and routes to the plan-revision pipeline.
+    reg.register(Capability(
+        name="request_revision",
+        description=(
+            "SIGNAL the planner that the current plan step cannot be executed "
+            "with the information available. Call this INSTEAD of guessing a "
+            "different tool when the suggested tool's args need exact values "
+            "you cannot get efficiently, or when the suggested tool doesn't "
+            "match the step intent. The Resolver / PlanPatcher will revise "
+            "the plan."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why the current plan step cannot be executed. Be specific.",
+                },
+                "proposed_fix": {
+                    "type": "string",
+                    "description": "Optional: what the planner should change.",
+                },
+            },
+            "required": ["reason"],
+        },
+        handler=_h_request_revision,
+    ))
+
     return reg
