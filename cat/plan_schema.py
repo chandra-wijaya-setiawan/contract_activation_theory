@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 Intent = Literal["investigate", "design", "mutate", "verify", "other"]
@@ -115,6 +115,31 @@ class PlanStep(BaseModel):
         default_factory=StepExpects,
         description="Predicted result of this step; used by the attestor.",
     )
+
+    @model_validator(mode="after")
+    def _auto_fill_tool_for_action_intents(self):
+        """R19.9: suggested_tool defaults by intent when missing.
+
+        Stipulator may legitimately leave tool=null for a pure 'design' step.
+        For any other intent, the Performer needs a starting tool — leaving
+        it null causes wrong-tool selection (observed: django-13315 with
+        intent=mutate + tool=null → Performer chose read instead of
+        str_replace). Auto-fill a sensible default so the Performer always
+        has a starting contract.
+
+        Could later be tightened to ValidationError + retry-on-correction
+        once the test fixtures are migrated; for now, auto-fill keeps the
+        invariant without churn.
+        """
+        if self.intent != "design" and self.suggested_tool is None:
+            _default_by_intent = {
+                "investigate": "read",
+                "mutate": "str_replace",
+                "verify": "bash",
+                "other": "bash",
+            }
+            self.suggested_tool = _default_by_intent.get(self.intent, "bash")
+        return self
 
 
 class Phase(BaseModel):

@@ -676,6 +676,19 @@ def _parse_phased_plan(text: str) -> Optional[dict[str, Any]]:
                 # so downstream code that calls .get() on it doesn't break.
                 if s.get("suggested_args") is None:
                     s["suggested_args"] = {}
+                # R19.9 lenient path: auto-fill suggested_tool by intent
+                # heuristic for non-design steps. The strict path triggers a
+                # retry-on-correction loop in call_stipulator_phased; this
+                # path keeps legacy/test fixtures and partially-formed
+                # plans parseable without losing intent coverage.
+                if s.get("intent") != "design" and s.get("suggested_tool") in (None, ""):
+                    _default_by_intent = {
+                        "investigate": "read",
+                        "mutate": "str_replace",
+                        "verify": "bash",
+                        "other": "bash",
+                    }
+                    s["suggested_tool"] = _default_by_intent.get(s.get("intent"), "bash")
         try:
             plan = PhasedPlan.model_validate(data)
         except ValidationError:
