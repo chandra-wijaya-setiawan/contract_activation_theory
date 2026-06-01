@@ -707,9 +707,20 @@ class Activator(_BaseActivator):
         if attention_node is None or plan_tree is None:
             return
 
-        # Approximate: did the last tool call modify the filesystem?
-        actual_durable_change, actual_files = self._infer_durable_change(run)
-        actual_verifier_outcome = self._infer_verifier_outcome(run)
+        # R19d: read the actual signals off run.last_outcome (PerformerOutcome).
+        # Previously this called _infer_durable_change + _infer_verifier_outcome,
+        # each of which walked run.messages backwards re-deriving the same data.
+        # PerformerOutcome centralizes that derivation in one place per iter.
+        outcome = getattr(run, "last_outcome", None)
+        if outcome is not None:
+            actual_durable_change = outcome.any_durable_change
+            actual_files = outcome.files_modified
+            actual_verifier_outcome = outcome.verifier_outcome
+        else:
+            # Defensive fallback: shouldn't happen post-R19b but keeps the
+            # contract robust if some path bypasses _perform_once.
+            actual_durable_change, actual_files = self._infer_durable_change(run)
+            actual_verifier_outcome = self._infer_verifier_outcome(run)
 
         # Update counts
         run.run_counts.bump(attention_node.intent)  # type: ignore[attr-defined]
