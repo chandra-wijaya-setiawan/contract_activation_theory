@@ -257,6 +257,43 @@ class Activator(_BaseActivator):
                     run.final_text = None
                     # Don't break — continue the loop
                     continue
+
+                # R19c: text-only response is only a real DONE when the
+                # current attention step doesn't *require* a tool call.
+                # On mutate/verify intent steps, "I'll modify the file"
+                # without actually calling str_replace is the Performer
+                # describing the action without executing it — bump the
+                # stall counter and let the loop's Resolver/PlanPatcher
+                # machinery handle it instead of silently exiting.
+                attn_intent = getattr(attention_node, "intent", None) if attention_node else None
+                if not outcome.is_terminal(attn_intent):
+                    self.recorder.append(TraceEvent(
+                        event_id=f"err-{uuid.uuid4().hex[:6]}",
+                        parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                        ts=utcnow_iso(),
+                        kind="surprise",
+                        payload={
+                            "iter": run.iterations,
+                            "attention_id": attention_node.id if attention_node else None,
+                            "attention_intent": attn_intent,
+                            "error": "performer_text_only_on_action_step",
+                            "note": (
+                                "Performer returned text without a tool call on a "
+                                f"{attn_intent!r}-intent step. Treating as stall (not DONE) "
+                                "so the loop's stall + Resolver + PlanPatcher pipeline can engage."
+                            ),
+                        },
+                    ))
+                    # Bump the stall counter for this attention so Resolver
+                    # fires once threshold is hit. Loop continues; the next
+                    # iter will re-prompt the Performer with the same plan
+                    # attention hint.
+                    if attention_node is not None:
+                        run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
+                        run._stall_count[attention_node.id] = run._stall_count.get(attention_node.id, 0) + 1  # type: ignore[attr-defined]
+                    run.final_text = None
+                    continue
+
                 # Real DONE: check criteria + terminate
                 if self._verify_criteria(contract, state, run):
                     self._transition(contract, ContractState.FULFILLED,
