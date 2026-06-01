@@ -19,37 +19,42 @@ PY = sys.executable.replace("\\", "/")
 def test_registry_has_default_tools():
     reg = build_default_registry()
     names = set(reg.names())
-    assert {"bash", "write", "read", "list", "str_replace", "request_revision"}.issubset(names)
+    assert {"bash", "write", "read", "list", "str_replace"}.issubset(names)
+    # R27: request_revision was deleted; replaced by `reason` arg on every tool.
+    assert "request_revision" not in names
 
 
-def test_request_revision_returns_marker(tmp_path: Path):
-    """R22: request_revision is a signal tool — output starts with the
-    [REQUEST_REVISION] marker so the activator can detect it."""
-    from cat.capabilities import REQUEST_REVISION_MARKER
+def test_every_tool_schema_exposes_reason_param():
+    """R27: tool_schemas() injects an optional `reason` property into every
+    tool's JSON schema so the Performer can record execution-side metadata."""
+    reg = build_default_registry()
+    schemas = reg.tool_schemas()
+    assert len(schemas) > 0
+    for tool in schemas:
+        props = tool["function"]["parameters"]["properties"]
+        assert "reason" in props, f"tool {tool['function']['name']} missing reason"
+        assert props["reason"]["type"] == "string"
+        # `reason` must remain OPTIONAL — never in the required list.
+        required = tool["function"]["parameters"].get("required", [])
+        assert "reason" not in required, f"reason should not be required on {tool['function']['name']}"
+
+
+def test_reason_arg_is_stripped_before_handler(tmp_path: Path):
+    """R27: when the LLM passes a `reason` arg, the dispatch layer strips
+    it from args (handlers see pure tool params). state.last_tool_result.args
+    reflects what the handler actually received — `reason` must not appear."""
     reg = build_default_registry()
     state = State(workdir=tmp_path)
+    state_args = {"path": "x.txt", "content": "hi", "reason": "exploring write semantics"}
     result = reg.invoke(
-        name="request_revision",
-        args={"reason": "old_str needs exact value", "proposed_fix": "add a read step"},
-        state=state,
-        recorder=None,
-        contract_id="x",
-        tool_call_id="t1",
+        name="write", args=state_args, state=state,
+        recorder=None, contract_id="x", tool_call_id="t1",
     )
     assert not result.is_error
-    assert result.output.startswith(REQUEST_REVISION_MARKER)
-    assert "old_str needs exact value" in result.output
-    assert "add a read step" in result.output
-    assert result.detail["reason"] == "old_str needs exact value"
-
-
-def test_request_revision_reason_required():
-    """The Pydantic-like JSON schema requires `reason`. Calling without it
-    should still produce a result (handler is permissive — empty reason
-    becomes empty string) — but the LLM tool-spec requires it."""
-    reg = build_default_registry()
-    cap = reg.get("request_revision")
-    assert "reason" in cap.json_schema.get("required", [])
+    # After invoke, the handler received args without `reason`
+    assert "reason" not in state_args, "reason should be popped from args"
+    last = state.last_tool_result or {}
+    assert "reason" not in (last.get("args") or {})
 
 
 def test_write_then_read_roundtrip(tmp_path: Path):

@@ -351,9 +351,17 @@ class InvocationSchema(BaseModel):
     Carries the canonical (post-normalization) args, the success/error
     signal, and the derived facts (durable_change, files_modified) so
     downstream consumers don't re-derive them from message history.
+
+    `reason` is execution-side metadata — the Performer's one-sentence
+    explanation of why this tool was called, especially when it differs
+    from the plan's suggested_tool. It is NOT part of the tool's contract
+    args; it lives on the Invocation (actual execution) record, not on
+    the ExecutionSchema (plan side). Populated by the LLM via a top-level
+    `reason` field in tool args, stripped at dispatch.
     """
     tool_name: str
     args: dict = Field(default_factory=dict)
+    reason: str = ""
     succeeded: bool = True
     output_text: str = ""
     error: str = ""

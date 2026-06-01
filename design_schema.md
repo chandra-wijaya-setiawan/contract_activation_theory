@@ -201,15 +201,26 @@ PerformerCall → OutcomeSchema {
 
 InvocationSchema {
     tool_name, args, succeeded, output_text, error,
-    durable_change, files_modified
+    durable_change, files_modified,
+    reason: str   # R27 — execution-side metadata
 }
 ```
 
+**R27 — `reason` is plan-vs-actual metadata, not a tool arg.** Every tool's
+JSON schema exposes an optional `reason` property (injected at
+`tool_schemas()` time). The LLM uses it to record *why* a tool was called,
+especially when deviating from `ExecutionSchema.suggested_tool`. At dispatch,
+the registry pops `reason` from args before the handler runs, so handlers
+never see it — it's preserved on `InvocationSchema.reason` and surfaced in
+the `tool_call` trace event under its own key. This keeps the plan side
+(`ExecutionSchema.suggested_args`) and the actual side
+(`InvocationSchema.args` + `.reason`) cleanly separated.
+
 `OutcomeSchema` is consumed by:
 - `_observe_phase` → produces `SurpriseVector` (the typed surprise dims)
-- `_attestor_verdict` → reads `outcome.text_response` + last invocation's output (R19.8)
+- `_attestor_verdict` → reads `outcome.text_response` + last invocation's output + `reason` (R19.8/R27)
 - `_invoke_resolver` → reads accumulated outcomes for intent_counts (R19.7)
-- `performer_response` trace event → for offline diagnosis (R19.10)
+- `performer_response` trace event → for offline diagnosis (R19.10/R27)
 
 ---
 

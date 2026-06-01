@@ -306,9 +306,16 @@ class Activator(_BaseActivator):
                             {"name": inv.tool_name,
                              "args": {k: (str(v)[:200] if isinstance(v, str) else v)
                                       for k, v in (inv.args or {}).items()},
+                             "reason": inv.reason,
                              "succeeded": inv.succeeded}
                             for inv in outcome.invocations
                         ],
+                        # R27: first invocation's reason field (execution-side
+                        # metadata explaining why this tool was called, esp.
+                        # when deviating from stipulator_suggested_tool).
+                        "performer_reason": (
+                            outcome.invocations[0].reason if outcome.invocations else ""
+                        ),
                         # ── Diff ──────────────────────────────────────────
                         "suggestion_match": suggestion_match,
                         # ── Outcome flags ─────────────────────────────────
@@ -323,42 +330,6 @@ class Activator(_BaseActivator):
             except Exception:
                 # Diagnostic-only event — never let it crash the loop.
                 pass
-
-            # R22: detect the Performer's explicit "I can't execute this step"
-            # signal. If outcome.invocations includes request_revision, force
-            # the stall counter to threshold so the Resolver fires next iter
-            # (skip waiting for stall_threshold). The Performer gave us an
-            # explicit reason; act on it.
-            request_revision_inv = next(
-                (inv for inv in outcome.invocations
-                 if inv.tool_name == "request_revision"),
-                None,
-            )
-            if request_revision_inv is not None and attention_node is not None:
-                reason = (request_revision_inv.args or {}).get("reason", "")
-                proposed = (request_revision_inv.args or {}).get("proposed_fix", "")
-                self.recorder.append(TraceEvent(
-                    event_id=f"rrq-{uuid.uuid4().hex[:6]}",
-                    parent_id=run.last_perform_event_id or run.last_iter_anchor,
-                    ts=utcnow_iso(),
-                    kind="surprise",  # reuse existing kind to keep schema simple
-                    payload={
-                        "iter": run.iterations,
-                        "error": "performer_requested_revision",
-                        "attention_id": attention_node.id,
-                        "attention_intent": getattr(attention_node, "intent", None),
-                        "reason": str(reason)[:500],
-                        "proposed_fix": str(proposed)[:500],
-                    },
-                ))
-                # Force stall to threshold so the Resolver fires on this same
-                # iter's end-of-loop check. Don't continue — fall through to
-                # the rest of the iter so observe + resolver fire normally.
-                run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
-                run._stall_count[attention_node.id] = max(
-                    run._stall_count.get(attention_node.id, 0),
-                    self.stall_threshold,
-                )
 
             if not keep_going:
                 # Defensive: distinguish a REAL "DONE" signal from a degenerate
@@ -605,9 +576,21 @@ class Activator(_BaseActivator):
                             if p and p not in files:
                                 files.append(p)
 
+            # R27: extract `reason` (execution metadata) out of args before
+            # recording the invocation. `reason` is the Performer's one-line
+            # explanation for *why* this tool was called — especially when
+            # it deviates from the plan's suggested_tool. It is not part of
+            # the tool's contract args; we pop it so downstream code sees the
+            # pure tool args and the reason lives on the InvocationSchema.
+            reason_text = ""
+            if isinstance(args, dict):
+                raw_reason = args.pop("reason", "") or ""
+                reason_text = str(raw_reason)[:500] if raw_reason else ""
+
             invocations.append(ToolInvocation(
                 tool_name=name,
                 args=args if isinstance(args, dict) else {"_raw": str(args)[:200]},
+                reason=reason_text,
                 succeeded=not is_error,
                 output_text=content[:5000],
                 error=content[7:300].strip() if is_error else "",

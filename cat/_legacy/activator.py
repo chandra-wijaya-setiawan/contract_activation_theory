@@ -78,14 +78,15 @@ your fix and is almost never the correct intervention.
 still call a tool. Reading the file first (to learn exact strings) and then \
 mutating next turn IS the right pattern. Doing nothing is never the right \
 pattern.
-8. The planner's `suggested_tool` is your CONTRACT — that is the tool you \
-should call (with the planner's args or your refined version). Do NOT \
-silently swap to a different tool because you feel uncertain. If you \
-genuinely cannot make progress with the suggested tool — e.g., the args \
-require info you don't have AND a quick read won't get it efficiently, OR \
-the suggested tool itself doesn't match the step description — call \
-`request_revision(reason="...")` to escalate to the planner. Read-first-\
-then-mutate-next-iter is fine. Silent tool-swapping is not.
+8. The planner's `suggested_tool` is your strong default — call it with the \
+planner's args (or your refined version) when you can. When you deviate \
+(call a different tool, or refine args), you MUST pass a `reason` field in \
+your tool call args, e.g. `read(path="...", reason="suggested str_replace \
+old_str didn't match prior read; reading actual file to get correct \
+content")`. The `reason` is one sentence of context for the planner/\
+attestor — what info you're missing or why this tool serves the step \
+better. Silent tool-swapping without a reason is wrong. When you ARE \
+following the planner's suggestion, `reason` is optional.
 
 Tool-selection guidance (prefer the SPECIFIC tool over `bash`; one call is \
 cheaper than ten):
