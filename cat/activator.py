@@ -234,34 +234,39 @@ class Activator(_BaseActivator):
             # response + tools called. Before this, JSONL captured only token
             # counts (no content), so any "why did the LLM act this way"
             # diagnostic was inference, not observation. This event makes the
-            # LLM's reasoning visible for offline analysis.
-            attn_intent_for_trace = (
-                getattr(attention_node, "intent", None) if attention_node else None
-            )
-            self.recorder.append(TraceEvent(
-                event_id=f"perf-{uuid.uuid4().hex[:6]}",
-                parent_id=run.last_perform_event_id or run.last_iter_anchor,
-                ts=utcnow_iso(),
-                kind="performer_response",
-                payload={
-                    "iter": run.iterations,
-                    "attention_id": attention_node.id if attention_node else None,
-                    "attention_intent": attn_intent_for_trace,
-                    "text_response": (outcome.text_response or "")[:4000],
-                    "tools_called": [
-                        {"name": inv.tool_name,
-                         "args": {k: (str(v)[:200] if isinstance(v, str) else v)
-                                  for k, v in (inv.args or {}).items()},
-                         "succeeded": inv.succeeded}
-                        for inv in outcome.invocations
-                    ],
-                    "any_tool_called": outcome.any_tool_called,
-                    "any_durable_change": outcome.any_durable_change,
-                    "any_tool_errored": outcome.any_tool_errored,
-                    "is_terminal_for_intent": outcome.is_terminal(attn_intent_for_trace),
-                    "finish_reason": outcome.finish_reason,
-                },
-            ))
+            # LLM's reasoning visible for offline analysis. Wrapped in try/
+            # except so a payload-validation slip never crashes the agent.
+            try:
+                attn_intent_for_trace = (
+                    getattr(attention_node, "intent", None) if attention_node else None
+                )
+                self.recorder.append(TraceEvent(
+                    event_id=f"perf-{uuid.uuid4().hex[:6]}",
+                    parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                    ts=utcnow_iso(),
+                    kind="performer_response",
+                    payload={
+                        "iter": run.iterations,
+                        "attention_id": attention_node.id if attention_node else None,
+                        "attention_intent": attn_intent_for_trace,
+                        "text_response": (outcome.text_response or "")[:4000],
+                        "tools_called": [
+                            {"name": inv.tool_name,
+                             "args": {k: (str(v)[:200] if isinstance(v, str) else v)
+                                      for k, v in (inv.args or {}).items()},
+                             "succeeded": inv.succeeded}
+                            for inv in outcome.invocations
+                        ],
+                        "any_tool_called": outcome.any_tool_called,
+                        "any_durable_change": outcome.any_durable_change,
+                        "any_tool_errored": outcome.any_tool_errored,
+                        "is_terminal_for_intent": outcome.is_terminal(attn_intent_for_trace),
+                        "finish_reason": outcome.finish_reason,
+                    },
+                ))
+            except Exception:
+                # Diagnostic-only event — never let it crash the loop.
+                pass
 
             if not keep_going:
                 # Defensive: distinguish a REAL "DONE" signal from a degenerate

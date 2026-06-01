@@ -46,6 +46,7 @@ EventKind = Literal[
     "surprise",                # surprise vector at end-of-iter
     "plan_patch",                  # PlanPatcher emitted tree-edit ops (was: stipulate_inloop)
     "stipulate_inloop",        # legacy alias for "plan_patch" — pre-rename traces
+    "performer_response",      # full Performer text + tools called (added for LLM-reasoning visibility)
     # Legacy aliases (kept readable for pre-rename traces):
     "contract_decompose",      # legacy alias for contract_stipulate
     "capability_invoke",       # legacy alias for capability_perform
