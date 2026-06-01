@@ -224,6 +224,12 @@ class Activator(_BaseActivator):
             cost_after = contract.cost.tokens_in + contract.cost.tokens_out
             actual_cost = cost_after - cost_before
 
+            # R19b: extract the Performer's outcome from the messages this
+            # iteration appended. One centralized walk replaces the scattered
+            # _infer_durable_change + _infer_verifier_outcome + [ERROR] checks.
+            outcome = self._extract_performer_outcome(run, iter_start_len)
+            run.last_outcome = outcome  # type: ignore[attr-defined]
+
             if not keep_going:
                 # Defensive: distinguish a REAL "DONE" signal from a degenerate
                 # LLM response (zero tokens, no text, no tool calls). The former
@@ -366,6 +372,87 @@ class Activator(_BaseActivator):
             node.suggested_args = {"command": oracle_cmd, "timeout_s": 300}  # type: ignore[attr-defined]
             bound += 1
         return bound
+
+    def _extract_performer_outcome(
+        self, run: ActivatorRun, iter_start_len: int,
+    ) -> "PerformerOutcome":
+        """R19: build a typed PerformerOutcome from the messages this iter
+        appended. Centralizes interpretation of "what just happened?" so
+        downstream consumers (observe, attestor, surprise) read a typed
+        object instead of walking run.messages with their own helpers.
+
+        Walks only run.messages[iter_start_len:] (the slice this iteration
+        added), not the whole history.
+        """
+        from cat.plan_schema import PerformerOutcome, ToolInvocation
+        _WRITE_TOOLS = ("str_replace", "multi_edit", "apply_patch", "write")
+
+        new_msgs = run.messages[iter_start_len:]
+        if not new_msgs:
+            return PerformerOutcome()
+
+        # The Performer always appends exactly one assistant message per turn
+        # (possibly followed by tool result messages).
+        asst = next((m for m in new_msgs if m.get("role") == "assistant"), None)
+        if asst is None:
+            return PerformerOutcome()
+
+        text = asst.get("content", "") or ""
+        tool_calls_raw = asst.get("tool_calls") or []
+
+        invocations: list[ToolInvocation] = []
+        for tc in tool_calls_raw:
+            tc_id = tc.get("id", "")
+            fn = tc.get("function", {}) or {}
+            name = fn.get("name", "")
+            args_raw = fn.get("arguments", "{}")
+            try:
+                args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+            except Exception:
+                args = {"_raw": args_raw}
+
+            # Find the matching tool result message
+            tool_msg = next(
+                (m for m in new_msgs
+                 if m.get("role") == "tool" and m.get("tool_call_id") == tc_id),
+                None,
+            )
+            content = (tool_msg.get("content") if tool_msg else "") or ""
+            if not isinstance(content, str):
+                content = str(content)
+            is_error = content.startswith("[ERROR]") or content.startswith("[skipped")
+
+            # Derive durable_change + files_modified
+            durable = False
+            files: list[str] = []
+            if not is_error and name in _WRITE_TOOLS:
+                durable = True
+                path = args.get("path") or args.get("file") or ""
+                if path:
+                    files.append(path)
+                if name == "apply_patch":
+                    patch = args.get("patch", "") or args.get("diff", "") or ""
+                    for line in str(patch).splitlines():
+                        if line.startswith("+++ b/") or line.startswith("--- a/"):
+                            p = line[6:].strip()
+                            if p and p not in files:
+                                files.append(p)
+
+            invocations.append(ToolInvocation(
+                tool_name=name,
+                args=args if isinstance(args, dict) else {"_raw": str(args)[:200]},
+                succeeded=not is_error,
+                output_text=content[:5000],
+                error=content[7:300].strip() if is_error else "",
+                durable_change=durable,
+                files_modified=files,
+            ))
+
+        return PerformerOutcome(
+            text_response=text,
+            invocations=invocations,
+            finish_reason="tool_calls" if invocations else "stop",
+        )
 
     def _inject_plan_attention(self, run: ActivatorRun, plan_tree: PlanTree) -> None:
         """Inject the attention hint as a USER message.
