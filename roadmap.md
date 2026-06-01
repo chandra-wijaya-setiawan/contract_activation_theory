@@ -72,6 +72,36 @@ first, LLM tiebreak) is the right shape.
 
 ---
 
+## Tool metadata layer (R21 — deferred until post-swe-bench)
+
+**Status**: idea, deferred. Today we hardcode tool categorizations in several
+places: `_WRITE_TOOLS = ("str_replace", "multi_edit", ...)`, `_TEST_COMMAND_MARKERS`,
+intent_counts regex on bash commands. These work but bake "today's tool set" into
+the schema/validator code.
+
+**Shape**: each tool in `cat/capabilities.py` declares metadata once:
+
+```python
+@tool(name="str_replace", effects={"durable_change": True, "reads": True}, categories=["mutate"])
+def str_replace(...): ...
+```
+
+Then validators query the registry:
+- `intent="mutate"` requires `tool.effects.durable_change == True`
+- intent_counts uses `tool.categories[0]` instead of regex
+- verifier inference uses `tool.effects.is_test == True` instead of command-string matching
+
+**Hardcoded sites that would go away**:
+- `cat/plan_schema.py`: `_WRITE_TOOLS`, `_TEST_COMMAND_MARKERS`
+- `cat/activator.py`: duplicated `_WRITE_TOOLS` in `_extract_performer_outcome`
+- `cat/resolver.py`: bash-command regex in `intent_counts`
+- `cat/plan_tree.py`: hardcoded mutate-tool list in `_op_refine`
+
+**Why deferred**: domain-agnostic generalization adds complexity. Focus is
+SWE-bench parity right now; once that's locked, the metadata layer makes
+adding new task domains (terminal-bench non-coding tasks, web agents,
+SQL/data tasks) clean. Not before.
+
 ## Resolver: true `restipulate` decision
 
 **Status**: parked. R15a renamed the existing `restipulate` decision to

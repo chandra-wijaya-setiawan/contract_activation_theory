@@ -151,6 +151,30 @@ class Activator(_BaseActivator):
         # Emit contract_stipulate (chains from planner llm_usage)
         event_id = f"dec-{uuid.uuid4().hex[:6]}"
         dec_parent = self.recorder.traj.events[-1].event_id if self.recorder.traj.events else represent_event_id
+        # R19.10 trace-completeness: include intent + suggested_tool +
+        # suggested_args + expects per step. Without this, the trace cannot
+        # answer "what did the planner tell the performer to do for step X?"
+        # We pull from plan_tree (the typed PlanNode) when present; legacy
+        # flat plan paths keep the description-only shape.
+        steps_payload: list[dict] = []
+        if plan_tree is not None:
+            for phase_id in plan_tree.phase_order:
+                phase = plan_tree.nodes[phase_id]
+                for step_id in phase.children:
+                    node = plan_tree.nodes[step_id]
+                    expects = node.expects if isinstance(node.expects, dict) else {}
+                    steps_payload.append({
+                        "id": step_id,
+                        "phase": phase.phase_name,
+                        "intent": getattr(node, "intent", None),
+                        "description": node.description,
+                        "suggested_tool": getattr(node, "suggested_tool", None),
+                        "suggested_args": getattr(node, "suggested_args", {}) or {},
+                        "expects": expects,
+                    })
+        else:
+            steps_payload = [{"id": s.id, "description": s.description} for s in run.plan]
+
         self.recorder.append(TraceEvent(
             event_id=event_id,
             parent_id=dec_parent,
@@ -158,7 +182,7 @@ class Activator(_BaseActivator):
             kind="contract_stipulate",
             payload={
                 "contract_id": contract.id,
-                "steps": [{"id": s.id, "description": s.description} for s in run.plan],
+                "steps": steps_payload,
                 "v2_phased": plan_tree is not None,
                 "obligation_class": oc,
             },
@@ -230,16 +254,33 @@ class Activator(_BaseActivator):
             outcome = self._extract_performer_outcome(run, iter_start_len)
             run.last_outcome = outcome  # type: ignore[attr-defined]
 
-            # R19.7-prep: emit a trace event with the Performer's actual text
-            # response + tools called. Before this, JSONL captured only token
-            # counts (no content), so any "why did the LLM act this way"
-            # diagnostic was inference, not observation. This event makes the
-            # LLM's reasoning visible for offline analysis. Wrapped in try/
-            # except so a payload-validation slip never crashes the agent.
+            # R19.10 trace-completeness: emit performer_response with EVERYTHING
+            # needed to diagnose the planner → performer hand-off:
+            #   - what step + intent + suggested tool/args were active (planner)
+            #   - what tool + args the Performer actually called (performer)
+            #   - did the Performer follow the suggestion? (match flag)
+            # Previously the LLM-text + tool-name were captured; now the
+            # plan→action diff is observable in one event row.
+            # Wrapped in try/except — diagnostic events never load-bearing.
             try:
                 attn_intent_for_trace = (
                     getattr(attention_node, "intent", None) if attention_node else None
                 )
+                sugg_tool = (
+                    getattr(attention_node, "suggested_tool", None)
+                    if attention_node else None
+                )
+                sugg_args = (
+                    getattr(attention_node, "suggested_args", {}) or {}
+                    if attention_node else {}
+                )
+                # Did the Performer's first tool call match the suggestion?
+                first_invocation = outcome.invocations[0] if outcome.invocations else None
+                called_tool = first_invocation.tool_name if first_invocation else None
+                suggestion_match = (
+                    called_tool == sugg_tool if (called_tool and sugg_tool) else None
+                )
+
                 self.recorder.append(TraceEvent(
                     event_id=f"perf-{uuid.uuid4().hex[:6]}",
                     parent_id=run.last_perform_event_id or run.last_iter_anchor,
@@ -249,7 +290,18 @@ class Activator(_BaseActivator):
                         "iter": run.iterations,
                         "attention_id": attention_node.id if attention_node else None,
                         "attention_intent": attn_intent_for_trace,
-                        "text_response": (outcome.text_response or "")[:4000],
+                        "attention_description": (
+                            attention_node.description[:300] if attention_node else None
+                        ),
+                        # ── Planner side: what was suggested ──────────────
+                        "stipulator_suggested_tool": sugg_tool,
+                        "stipulator_suggested_args": (
+                            {k: (str(v)[:300] if isinstance(v, str) else v)
+                             for k, v in (sugg_args or {}).items()}
+                            if isinstance(sugg_args, dict) else {}
+                        ),
+                        # ── Performer side: what was called ───────────────
+                        "performer_called_tool": called_tool,
                         "tools_called": [
                             {"name": inv.tool_name,
                              "args": {k: (str(v)[:200] if isinstance(v, str) else v)
@@ -257,6 +309,10 @@ class Activator(_BaseActivator):
                              "succeeded": inv.succeeded}
                             for inv in outcome.invocations
                         ],
+                        # ── Diff ──────────────────────────────────────────
+                        "suggestion_match": suggestion_match,
+                        # ── Outcome flags ─────────────────────────────────
+                        "text_response": (outcome.text_response or "")[:4000],
                         "any_tool_called": outcome.any_tool_called,
                         "any_durable_change": outcome.any_durable_change,
                         "any_tool_errored": outcome.any_tool_errored,
