@@ -12,7 +12,7 @@ Why pydantic:
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -308,3 +308,127 @@ class AttributionVerdict(BaseModel):
     limitation_secondary: str = ""
     improvement_vector: str = ""
     confidence: str = ""
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Performer outcome — structured normalization of one executor turn
+#
+# Each per-iter LLM call (Performer) used to be summarized as a single bool
+# ("keep_going") with the real signals scattered across run.messages and re-
+# derived by separate helpers (_infer_durable_change, _infer_verifier_outcome,
+# step_done's [ERROR] check). PerformerOutcome centralizes all of that into
+# one typed object consumed by every downstream phase (observe, attestor,
+# surprise, resolver). Also closes the R19 leak: a "text-only, no tool call"
+# response on a mutate/verify step is no longer silently interpreted as DONE.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class ToolInvocation(BaseModel):
+    """One tool call executed during a Performer turn.
+
+    Carries the canonical (post-normalization) args, the success/error
+    signal, and the derived facts (durable_change, files_modified) so
+    downstream consumers don't re-derive them from message history.
+    """
+    tool_name: str
+    args: dict = Field(default_factory=dict)
+    succeeded: bool = True
+    output_text: str = ""
+    error: str = ""
+    durable_change: bool = False
+    files_modified: list[str] = Field(default_factory=list)
+
+
+_WRITE_TOOLS = ("str_replace", "multi_edit", "apply_patch", "write")
+_TEST_COMMAND_MARKERS = ("pytest", "runtests", "tox", "unittest", "django-admin test")
+
+
+class PerformerOutcome(BaseModel):
+    """Structured result of one Performer turn. Replaces the old (keep_going: bool)
+    return value of _perform_once. Every downstream phase reads off this object.
+    """
+    text_response: str = ""
+    invocations: list[ToolInvocation] = Field(default_factory=list)
+    finish_reason: str = ""
+    tokens_in: int = 0
+    tokens_out: int = 0
+
+    # ── Derived properties (computed from invocations) ────────────────────
+
+    @property
+    def any_tool_called(self) -> bool:
+        return len(self.invocations) > 0
+
+    @property
+    def any_durable_change(self) -> bool:
+        return any(inv.durable_change for inv in self.invocations if inv.succeeded)
+
+    @property
+    def any_tool_errored(self) -> bool:
+        return any(not inv.succeeded for inv in self.invocations)
+
+    @property
+    def files_modified(self) -> list[str]:
+        out: list[str] = []
+        for inv in self.invocations:
+            if inv.succeeded:
+                for f in inv.files_modified:
+                    if f and f not in out:
+                        out.append(f)
+        return out
+
+    @property
+    def verifier_outcome(self) -> "Optional[str]":
+        """Parse pytest/runtests/tox output for PASS/FAIL.
+
+        Returns None when the last invocation wasn't a recognizable test
+        invocation (so we don't false-positive on unrelated bash output).
+        """
+        if not self.invocations:
+            return None
+        # Look at the last invocation — if it's a test command, parse its output.
+        last = self.invocations[-1]
+        cmd = ""
+        if last.tool_name == "bash":
+            cmd = (last.args.get("command", "") or "").lower()
+        is_test = (
+            last.tool_name in ("oracle", "runtests") or
+            (last.tool_name == "bash" and any(m in cmd for m in _TEST_COMMAND_MARKERS))
+        )
+        if not is_test:
+            return None
+        if not last.succeeded:
+            return "FAIL"
+        out = last.output_text or ""
+        lc = out.lower()
+        fail_markers = (
+            " failed", "failed,", "failed]", "= fail", "errored",
+            "traceback (most recent call last)", "internalerror",
+            "no module named",
+        )
+        if any(m in lc for m in fail_markers):
+            return "FAIL"
+        if "FAILED" in out or "ERROR" in out[-2000:]:
+            return "FAIL"
+        if "passed" in lc and "failed" not in lc:
+            return "PASS"
+        if "no tests ran" in lc:
+            return None  # ambiguous
+        return None
+
+    # ── Decision helper ──────────────────────────────────────────────────
+
+    def is_terminal(self, attention_intent: "Optional[str]") -> bool:
+        """True iff this Performer response is a legitimate DONE signal
+        given the current attention step's intent.
+
+        - Made a tool call → not done (continuing work this iter).
+        - No tool call + intent in {mutate, verify} → NOT done (Performer
+          described an action without executing it; counts as stall).
+        - No tool call + intent in {investigate, design, other} → legit done.
+        """
+        if self.any_tool_called:
+            return False
+        if attention_intent in ("mutate", "verify"):
+            return False
+        return True
