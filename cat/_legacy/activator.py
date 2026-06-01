@@ -59,8 +59,11 @@ You will be given:
 - the BUDGET STATUS
 
 Rules:
-1. Take exactly ONE concrete performance act per turn (one tool call) OR emit \
-a brief text "DONE" only when every plan step is checked complete.
+1. EVERY TURN MUST CALL A TOOL. Your only role is to ACT — never reply with \
+text alone, never describe what you "would do", never summarize. Acting is \
+your contract. If you need information, call a search/read tool. If the step \
+is to mutate, call a write tool. If the step is to verify, call bash with \
+the test command. There is no legitimate text-only response.
 2. Address the FIRST un-checked step. Do not skip ahead.
 3. Be terse. Do not narrate. Do not re-state the plan. Just act.
 4. If a tool returns an error, diagnose and try a corrected action; do NOT repeat \
@@ -71,6 +74,10 @@ and the attestor close steps.
 patterns. Those files are the verification harness — your job is to change the \
 SOURCE CODE so tests pass. Modifying test files breaks the oracle's view of \
 your fix and is almost never the correct intervention.
+7. If the planner's suggested tool or args look wrong/missing, FIX them and \
+still call a tool. Reading the file first (to learn exact strings) and then \
+mutating next turn IS the right pattern. Doing nothing is never the right \
+pattern.
 
 Tool-selection guidance (prefer the SPECIFIC tool over `bash`; one call is \
 cheaper than ten):
@@ -669,10 +676,15 @@ class Activator:
                 {"role": "system", "content": hint_text}
             ]
 
+        # R19.5: tool_choice="required" — Performer's contract is to ACT, not
+        # to describe. Forcing a tool call at the API level makes text-only
+        # responses architecturally impossible. When the planner's suggestion
+        # is wrong, the Performer fixes the args inside a tool call (e.g.
+        # reads the file first, then mutates next turn) — still always a tool.
         result = self.llm.chat(
             messages=messages_with_hint,
             tools=tools,
-            tool_choice="auto",
+            tool_choice="required",
             role_tag="performer",
             temperature=0.2,
             parent_event_id=iter_parent,
