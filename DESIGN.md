@@ -1,5 +1,10 @@
 # Contract Activation Theory — Agentic Loop Design
 
+> **Companion documents**:
+> - `design_schema.md` — Schema library + naming convention (`Schema` suffix for Pydantic models, `Op` suffix for tree-edit verbs, no suffix for roles/dataclasses). Single source of truth for the data shapes that flow between layers.
+> - `docs/iteration.md` — per-iter loop semantics (PLAN → ACTION → OBSERVE)
+> - `roadmap.md` — deferred ideas (R27 NodeSchema nesting, R28 enriched render_outline, R30 tool effects metadata)
+
 ## Premise
 
 An agent is a contract-fulfillment system. A contract is a daemon-like object:
