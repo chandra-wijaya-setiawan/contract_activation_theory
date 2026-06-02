@@ -3,7 +3,7 @@
 > **Companion documents**:
 > - `design_schema.md` — Schema library + naming convention (`Schema` suffix for Pydantic models, `Op` suffix for tree-edit verbs, no suffix for roles/dataclasses). Single source of truth for the data shapes that flow between layers.
 > - `docs/iteration.md` — per-iter loop semantics (PLAN → ACTION → OBSERVE)
-> - `roadmap.md` — deferred ideas (R27 NodeSchema nesting, R28 enriched render_outline, R30 tool effects metadata)
+> - `roadmap.md` — deferred ideas (R28 NodeSchema nesting / UpdateStepOp, R29 FixVerify, R31 MutateBudget, R32 RollbackOnCorrupted, R33 MultiCandidatePlan)
 
 ## Premise
 
@@ -52,13 +52,26 @@ and theory.
 | **Stipulator** | 3 STIPULATE | LLM | `stipulator` |
 | **Performer** | 5 SELECT + 6 PERFORM | LLM | `performer` |
 | **Attestor** | 7 VERIFY (per-stipulation) | LLM | `attestor` |
+| **Resolver** | end-of-iter — fires on stall | LLM | `resolver` |
+| **PlanPatcher** | invoked by Resolver to mutate the plan tree | LLM | `plan_patcher` |
 | **Auditor** | 7 VERIFY (criterion / oracle) | deterministic | bash predicate (no LLM) |
 | Surveyor | 2 REPRESENT | deterministic | `Representer` class (no LLM) |
 | Registrar | 4 ACTIVATE | deterministic | `Activator._admit` (no LLM) |
 | Recorder | cross-cutting | deterministic | `Recorder` class |
 | Enforcer | cross-cutting | deterministic | `Constraints.check` + `_check_budget` |
 
-The four bold roles each issue an LLM call; the others are pure code. Theory-only roles (Surveyor / Registrar / Recorder / Enforcer) are documented here as conceptual actors but do not exist as separate code classes — they refer to existing components (`Representer`, `Activator`, `Recorder`, `Constraints`).
+The five bold roles each issue an LLM call; the others are pure code.
+Theory-only roles (Surveyor / Registrar / Recorder / Enforcer) are
+documented here as conceptual actors but do not exist as separate code
+classes — they refer to existing components (`Representer`, `Activator`,
+`Recorder`, `Constraints`).
+
+**Resolver + PlanPatcher.** When a node stalls (default 3 iters without
+`step_done`), the Resolver decides one of four moves:
+`forward / patch_plan / backward / give_up`. If `patch_plan`, it hands off
+to the PlanPatcher which emits tree-edit ops (`CommitOp`, `RefineOp`,
+`BranchOp`, `DropOp`, `CommitNewOp`, `CheckoutOp`, `MergeOp`) against the
+plan tree. See `cat/schemas.py` for `ResolverSchema` and `PatcherSchema`.
 
 Future roles introduced in v1.7-v1.8:
 - **Librarian** — DAG-corpus retrieval at STIPULATE / DELIBERATE time (v1.7)

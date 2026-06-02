@@ -20,11 +20,20 @@ in **docs/PRD/**.
 | v1.6.6.7–14 | ✅ 2026-05-29 | 14-tool surface, −55% tool calls, read truncation nudge → [PRD](docs/PRD/v1.6.6.7-14_tool_surface_expansion.md) |
 | v1.7.0 | ✅ 2026-05-30 | Offline CEGAR + Dijkstra simulator validated → [PRD](docs/PRD/v1.7.0_offline_simulation.md) |
 | v1.7 A.1 | ✅ 2026-05-30 | Live corpus + LIBRARIAN advisory; smoke 2/3 PASS @ −18 to −25% tokens → [PRD](docs/PRD/v1.7_A1_corpus_librarian.md) |
-| **v1.7 A.2** | **🎯 NEXT** | **ADVISOR + ELECTION** (math arbitrates between N=2 candidates) → [PRD](docs/PRD/v1.7_A2_election_and_followons.md) |
+| v1.7 A.2 | ⏸ deferred | PlanComposer scaffold built (R18) then deferred in favour of contract-discipline pass |
+| v1.8 M1–M7 | ✅ 2026-05-31 | Plan-tree + tree-edit ops + Stipulator phased schema + surprise vector + librarian writes; swe10 baseline 8/10 |
+| v1.8 R1–R12 | ✅ 2026-05-31 | Attestor-driven step_done, Pydantic plan schema, Revisor → PlanPatcher rename, premature-DONE fixes |
+| v1.8 R13–R22 | ✅ 2026-06-01 | OutcomeSchema (R19), tool_choice=required (R19.5), trace surface (R19.10), request_revision escape valve (R22) |
+| v1.8 R26 | ✅ 2026-06-01 | Schema library `cat/schemas.py` + Schema-suffix naming; **swe5x5 = 13/25 (52%)** |
+| **v1.8 R27** | **✅ 2026-06-02** | **request_revision → `reason` tool arg; swe5x5 = 17/25 (68%), +16pp vs R26** |
 
 ## Next
 
-- **v1.7 A.2 — ELECTION + follow-ons.** Math arbitrates between LLM-generated candidates instead of just advising. Single PRD bundles A.2 (primary), A* heuristic + SUSPENDED resume (ship only if data demands). ~150 LOC primary. → [PRD](docs/PRD/v1.7_A2_election_and_followons.md)
+- **R29 FixVerify** — parse `FAILED (failures=N)` from django test runner output as `verifier_outcome=FAIL`; force step !done and route to Resolver. Single highest-leverage fix per django-13315 surgical analysis — both fail trials had verify-step false-positives. ~50 LOC.
+- **R31 MutateBudget** — after ≥3 successful str_replace on one node with verify still failing, auto-fire PlanPatcher `BranchOp`. Stops trial-4-style corruption (6 edits across 2 files).
+- **R32 RollbackOnCorrupted** — if verify produces ImportError/SyntaxError after mutate, `git checkout` the file and re-plan.
+- **R28 UpdateStepOp + locate-before-mutate** — PlanPatcher op for in-place arg refinement; kills Stipulator old_str hallucination loop.
+- **R33 MultiCandidatePlan** — root-cause fix for django-13315: Stipulator emits N=2 candidate plans (different file targets), LLM-attestor picks. Bigger build (revives R18 PlanComposer).
 
 ## Roadmap
 
