@@ -37,6 +37,7 @@ RUN_ID=""
 TASK_IDS=()
 AGENT_PATH="benchmarks.swe_bench:TbSweAgent"
 CONCURRENCY=3
+N_ATTEMPTS=1
 NO_LLM=0
 DATASET_PATH="${TB_DATASET_PATH:-$HOME/.cache/terminal-bench/swebench-verified/head}"
 
@@ -46,6 +47,7 @@ while [[ $# -gt 0 ]]; do
     --task-id)       TASK_IDS+=("$2"); shift 2;;
     --agent-import-path|--agent) AGENT_PATH="$2"; shift 2;;
     --concurrency)   CONCURRENCY="$2"; shift 2;;
+    --n-attempts)    N_ATTEMPTS="$2"; shift 2;;
     --dataset-path)  DATASET_PATH="$2"; shift 2;;
     --no-llm-attribution) NO_LLM=1; shift;;
     *) echo "unknown flag: $1" >&2; exit 2;;
@@ -182,7 +184,7 @@ fi
 TB_ARGS=(
   --dataset-path "$DATASET_PATH"
   --agent-import-path "$AGENT_PATH"
-  --n-attempts 1
+  --n-attempts "$N_ATTEMPTS"
   --output-path "$RUN_DIR"
   --run-id "$RUN_ID"
   --n-concurrent-trials "$CONCURRENCY"
