@@ -592,6 +592,7 @@ class Activator(_BaseActivator):
                 args=args if isinstance(args, dict) else {"_raw": str(args)[:200]},
                 reason=reason_text,
                 succeeded=not is_error,
+                execution_status="error" if is_error else "success",  # R29
                 output_text=content[:5000],
                 error=content[7:300].strip() if is_error else "",
                 durable_change=durable,
@@ -855,11 +856,38 @@ class Activator(_BaseActivator):
             actual_verifier_outcome=actual_verifier_outcome,
         )
 
-        # R7: step_done requires CONSISTENCY across all 7 dimensions
-        # (per docs/iteration.md §4b). Attestor is ONE dimension, not the
-        # gatekeeper. A mutate step cannot be 'done' when durable_match or
-        # files_match is False — even if the attestor said YES.
-        attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
+        # R29: deterministic short-circuit. When the Performer's last
+        # invocation returned execution_status="error" (e.g. bash non-zero
+        # exit, str_replace old_str-not-found), there is nothing for the
+        # Attestor LLM to judge — the failure is a fact, not a verdict.
+        # Skip the LLM call (cost saving + correctness), force step_done=False
+        # via critical_dim_violated, and bump the stall counter so the
+        # Resolver fires on this iter's end-of-loop check. The Resolver
+        # then routes to the PlanPatcher to refine/branch the failed node.
+        deterministic_error = bool(outcome and outcome.any_tool_errored)
+        if deterministic_error:
+            last_err_inv = next(
+                (inv for inv in reversed(outcome.invocations) if not inv.succeeded),
+                None,
+            )
+            err_tool = last_err_inv.tool_name if last_err_inv else "?"
+            err_msg = (last_err_inv.error or last_err_inv.output_text[:300]) if last_err_inv else ""
+            sv.details["deterministic_error"] = f"{err_tool}: {err_msg}"[:400]
+            sv.details["attestor_skipped"] = "deterministic_error_short_circuit"
+            attestor_done = False
+            attestor_reason = f"deterministic error from {err_tool} — no LLM judgement needed"
+            # Bump stall counter so Resolver fires this iter (R22 trick).
+            run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
+            run._stall_count[attention_node.id] = max(
+                run._stall_count.get(attention_node.id, 0),
+                self.stall_threshold,
+            )
+        else:
+            # R7: step_done requires CONSISTENCY across all 7 dimensions
+            # (per docs/iteration.md §4b). Attestor is ONE dimension, not the
+            # gatekeeper. A mutate step cannot be 'done' when durable_match or
+            # files_match is False — even if the attestor said YES.
+            attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
         sv.details["attestor_reason"] = attestor_reason
         sv.details["attestor_done"] = "yes" if attestor_done else "no"
 
@@ -1039,6 +1067,20 @@ class Activator(_BaseActivator):
         expects = attention_node.expects if isinstance(attention_node.expects, dict) else {}
         files_expected = list(expects.get("files_modified") or [])
 
+        # R29: pull deterministic_error from the latest surprise event so the
+        # Resolver sees the handler-level error verbatim and can route to a
+        # PlanPatcher op that actually addresses it.
+        det_err = ""
+        try:
+            for e in reversed(self.recorder.traj.events[-10:]):
+                if e.kind == "surprise":
+                    d = (e.payload or {}).get("details", {}) or {}
+                    if d.get("deterministic_error"):
+                        det_err = str(d["deterministic_error"])[:500]
+                        break
+        except Exception:
+            pass
+
         ctx = StallContext(
             attention_node_id=attention_node.id,
             attention_description=attention_node.description,
@@ -1056,6 +1098,7 @@ class Activator(_BaseActivator):
             files_expected=files_expected,
             files_actually_modified=files_actually_modified[-5:],
             intent_tool_counts=intent_counts,
+            deterministic_error=det_err,
         )
 
         try:

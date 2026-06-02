@@ -56,6 +56,11 @@ class StallContext:
     files_actually_modified: list[str] = field(default_factory=list)
     intent_tool_counts: dict[str, int] = field(default_factory=dict)
     # e.g., {"investigate": 12, "mutate": 0, "verify": 0, "other": 1}
+    # R29: deterministic error signal from the Performer's last invocation.
+    # Set by the Activator's _observe_phase when outcome.any_tool_errored.
+    # When non-empty, the Resolver should prefer patch_plan over forward and
+    # the PlanPatcher should produce an op that addresses this specific error.
+    deterministic_error: str = ""
 
     def to_prompt_payload(self) -> str:
         """Compact stringification for LLM prompt."""
@@ -82,8 +87,16 @@ class StallContext:
             f"  - {r[:200]}" for r in self.attestor_reasons[-3:]
         ) or "  (none)"
 
+        det_err_block = ""
+        if self.deterministic_error:
+            det_err_block = (
+                f"DETERMINISTIC ERROR (the Performer's last tool call FAILED — this is\n"
+                f"a fact from the handler, not an LLM judgement. Address it directly):\n"
+                f"  {self.deterministic_error[:500]}\n\n"
+            )
         return (
             f"OBLIGATION (brief): {self.obligation_brief[:300]}\n\n"
+            f"{det_err_block}"
             f"STUCK AT: [{self.attention_node_id}] "
             f"({self.attention_phase}/{self.attention_intent})\n"
             f"  description: {self.attention_description[:200]}\n"

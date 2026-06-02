@@ -52,6 +52,30 @@ def test_outcome_with_failed_tool_marks_errored_no_durable_change():
     assert o.any_tool_errored
 
 
+def test_invocation_execution_status_defaults_to_success():
+    """R29: new execution_status field defaults to 'success'."""
+    inv = _inv("read", args={"path": "/x.py"})
+    assert inv.execution_status == "success"
+    assert inv.succeeded is True
+
+
+def test_invocation_execution_status_set_to_error_on_failed_tool():
+    """R29: execution_status follows the succeeded flag automatically — the
+    model_validator on InvocationSchema keeps the two in sync so older callers
+    that only set succeeded=False still produce execution_status='error'."""
+    inv = _inv("str_replace", succeeded=False, error="old_str not found")
+    assert inv.execution_status == "error"
+
+
+def test_invocation_execution_status_explicit_error_marks_unsucceeded():
+    """The inverse: setting execution_status='error' on construction must
+    also flip succeeded=False so downstream readers get a coherent record."""
+    from cat.plan_schema import ToolInvocation
+    inv = ToolInvocation(tool_name="bash", execution_status="error")
+    assert inv.succeeded is False
+    assert inv.execution_status == "error"
+
+
 def test_outcome_files_modified_dedupes_and_skips_failed():
     """If two invocations touch the same file (and one fails), the file
     appears once in files_modified and only if the touching one succeeded."""

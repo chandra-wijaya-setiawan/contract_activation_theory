@@ -358,15 +358,32 @@ class InvocationSchema(BaseModel):
     args; it lives on the Invocation (actual execution) record, not on
     the ExecutionSchema (plan side). Populated by the LLM via a top-level
     `reason` field in tool args, stripped at dispatch.
+
+    `execution_status` is the deterministic outcome — set by the handler
+    (e.g. bash exit code, str_replace old_str-not-found). When "error",
+    the Activator short-circuits the Attestor LLM call (no judgement
+    needed for a deterministic event) and routes directly to the
+    Resolver/PlanPatcher pipeline. See R29.
     """
     tool_name: str
     args: dict = Field(default_factory=dict)
     reason: str = ""
     succeeded: bool = True
+    execution_status: Literal["success", "error"] = "success"
     output_text: str = ""
     error: str = ""
     durable_change: bool = False
     files_modified: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _sync_status_with_succeeded(self):
+        """Keep `execution_status` and `succeeded` in lockstep so older code
+        paths that only set `succeeded` still produce a coherent record."""
+        if self.execution_status == "success" and not self.succeeded:
+            self.execution_status = "error"
+        elif self.execution_status == "error" and self.succeeded:
+            self.succeeded = False
+        return self
 
 
 _WRITE_TOOLS = ("str_replace", "multi_edit", "apply_patch", "write")
