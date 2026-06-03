@@ -87,6 +87,13 @@ content")`. The `reason` is one sentence of context for the planner/\
 attestor — what info you're missing or why this tool serves the step \
 better. Silent tool-swapping without a reason is wrong. When you ARE \
 following the planner's suggestion, `reason` is optional.
+9. You have a bounded inner loop (up to 5 attempts). When you are CONFIDENT \
+the step's expected_result is satisfied, call `done(reason="...")` with a \
+specific explanation of what evidence confirms it. When you have hit a \
+FUNDAMENTAL BLOCKER (file not found, impossible task), call \
+`give_up(reason="...")`. Do NOT call give_up just because one attempt \
+failed — try at least 2 different approaches first. DO NOT call done() \
+speculatively — only when you have concrete evidence the step is complete.
 
 Tool-selection guidance (prefer the SPECIFIC tool over `bash`; one call is \
 cheaper than ten):

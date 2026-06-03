@@ -220,6 +220,12 @@ class Activator(_BaseActivator):
                 contract.re_entry_condition = "fresh representations or extended envelope"
                 break
 
+            # R37: apply restipulate plan swap if _observe_phase produced a new tree
+            new_tree = getattr(run, "_new_plan_tree", None)  # type: ignore[attr-defined]
+            if new_tree is not None:
+                plan_tree = new_tree
+                run._new_plan_tree = None  # type: ignore[attr-defined]
+
             # PLAN phase
             attention_node = plan_tree.get_attention() if plan_tree else None
             if plan_tree and attention_node is None:
@@ -243,16 +249,12 @@ class Activator(_BaseActivator):
             cost_before = contract.cost.tokens_in + contract.cost.tokens_out
             iter_start_len = len(run.messages)
 
-            # ACTION (Step 5+6: SELECT + PERFORM)
-            keep_going = self._perform_once(contract, state, run)
+            # ACTION (Step 5+6: SELECT + PERFORM) — R38 inner react loop
+            outcome = self._perform_loop(contract, state, run, plan_tree, attention_node)
+            run.last_outcome = outcome  # type: ignore[attr-defined]
+
             cost_after = contract.cost.tokens_in + contract.cost.tokens_out
             actual_cost = cost_after - cost_before
-
-            # R19b: extract the Performer's outcome from the messages this
-            # iteration appended. One centralized walk replaces the scattered
-            # _infer_durable_change + _infer_verifier_outcome + [ERROR] checks.
-            outcome = self._extract_performer_outcome(run, iter_start_len)
-            run.last_outcome = outcome  # type: ignore[attr-defined]
 
             # R19.10 trace-completeness: emit performer_response with EVERYTHING
             # needed to diagnose the planner → performer hand-off:
@@ -331,88 +333,51 @@ class Activator(_BaseActivator):
                 # Diagnostic-only event — never let it crash the loop.
                 pass
 
-            if not keep_going:
-                # Defensive: distinguish a REAL "DONE" signal from a degenerate
-                # LLM response (zero tokens, no text, no tool calls). The former
-                # is the LLM saying it's finished; the latter is a transient
-                # API error (rate limit, content filter, etc.) and should NOT
-                # terminate the contract.
-                degenerate = (actual_cost == 0) and not (run.final_text or "").strip()
-                if degenerate:
-                    # Treat as transient — emit a trace event, force-advance
-                    # attention (so we don't loop here forever), and continue
-                    self.recorder.append(TraceEvent(
-                        event_id=f"err-{uuid.uuid4().hex[:6]}",
-                        parent_id=run.last_perform_event_id or run.last_iter_anchor,
-                        ts=utcnow_iso(),
-                        kind="surprise",
-                        payload={
-                            "iter": run.iterations,
-                            "error": "degenerate_llm_response",
-                            "note": "performer returned 0 tokens / no text / no tools; treating as transient",
-                        },
-                    ))
-                    if plan_tree and attention_node:
+            # Degenerate: zero-cost loop (transient API error) — force-advance
+            if actual_cost == 0 and not outcome.invocations:
+                self.recorder.append(TraceEvent(
+                    event_id=f"err-{uuid.uuid4().hex[:6]}",
+                    parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                    ts=utcnow_iso(),
+                    kind="surprise",
+                    payload={"iter": run.iterations, "error": "degenerate_llm_response"},
+                ))
+                if plan_tree and attention_node:
+                    self._default_advance(plan_tree, attention_node, run)
+                continue
+
+            # R38: Performer give_up bypasses Attestor → PlanPatcher directly
+            if outcome.verdict == "give_up":
+                self.recorder.append(TraceEvent(
+                    event_id=f"pgiveup-{uuid.uuid4().hex[:6]}",
+                    parent_id=run.last_perform_event_id or run.last_iter_anchor,
+                    ts=utcnow_iso(),
+                    kind="performer_give_up",
+                    payload={
+                        "iter": run.iterations,
+                        "attention_id": attention_node.id if attention_node else None,
+                        "reason": outcome.performer_reason,
+                    },
+                ))
+                # Route directly to PlanPatcher with give_up context
+                try:
+                    self._handle_planpatcher(
+                        contract, run, plan_tree, attention_node,
+                        diagnosis=f"Performer give_up: {outcome.performer_reason}",
+                        state_now_class=state_now_class, oc=oc,
+                    )
+                except Exception:
+                    if attention_node:
                         self._default_advance(plan_tree, attention_node, run)
-                    # Reset run.final_text so v1 doesn't think we exited
-                    run.final_text = None
-                    # Don't break — continue the loop
-                    continue
+                continue
 
-                # R19c: text-only response is only a real DONE when the
-                # current attention step doesn't *require* a tool call.
-                # On mutate/verify intent steps, "I'll modify the file"
-                # without actually calling str_replace is the Performer
-                # describing the action without executing it — bump the
-                # stall counter and let the loop's Resolver/PlanPatcher
-                # machinery handle it instead of silently exiting.
-                attn_intent = getattr(attention_node, "intent", None) if attention_node else None
-                if not outcome.is_terminal(attn_intent):
-                    self.recorder.append(TraceEvent(
-                        event_id=f"err-{uuid.uuid4().hex[:6]}",
-                        parent_id=run.last_perform_event_id or run.last_iter_anchor,
-                        ts=utcnow_iso(),
-                        kind="surprise",
-                        payload={
-                            "iter": run.iterations,
-                            "attention_id": attention_node.id if attention_node else None,
-                            "attention_intent": attn_intent,
-                            "error": "performer_text_only_on_action_step",
-                            "note": (
-                                "Performer returned text without a tool call on a "
-                                f"{attn_intent!r}-intent step. Treating as stall (not DONE) "
-                                "so the loop's stall + Resolver + PlanPatcher pipeline can engage."
-                            ),
-                        },
-                    ))
-                    # Bump the stall counter for this attention so Resolver
-                    # fires once threshold is hit. Loop continues; the next
-                    # iter will re-prompt the Performer with the same plan
-                    # attention hint.
-                    if attention_node is not None:
-                        run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
-                        run._stall_count[attention_node.id] = run._stall_count.get(attention_node.id, 0) + 1  # type: ignore[attr-defined]
-                    run.final_text = None
-                    continue
-
-                # Real DONE: check criteria + terminate
-                if self._verify_criteria(contract, state, run):
-                    self._transition(contract, ContractState.FULFILLED,
-                                     "executor stopped and criteria satisfied", run)
-                else:
-                    self._transition(contract, ContractState.FAILED,
-                                     "executor stopped before criteria satisfied", run)
-                    run.failure_reason = "executor_quit_early"
-                break
-
-            # OBSERVE phase — wrapped to guarantee loop continues even if helpers fail
+            # OBSERVE phase (R37 expanded Attestor) — wrapped to guarantee loop continues
             try:
                 self._observe_phase(
                     contract, run, plan_tree, attention_node, actual_cost,
                     state_now_class, oc,
                 )
             except Exception as e:
-                # Log + force-advance to prevent infinite loop on crash
                 import traceback
                 self.recorder.append(TraceEvent(
                     event_id=f"err-{uuid.uuid4().hex[:6]}",
@@ -510,6 +475,228 @@ class Activator(_BaseActivator):
             node.suggested_args = {"command": oracle_cmd, "timeout_s": 300}  # type: ignore[attr-defined]
             bound += 1
         return bound
+
+    # ── R38: Performer inner react loop ─────────────────────────────────────
+
+    MAX_INNER_ATTEMPTS = 5   # K for the inner loop
+
+    def _perform_loop(
+        self,
+        contract: "Contract",
+        state: "State",
+        run: ActivatorRun,
+        plan_tree: "Optional[PlanTree]",
+        attention_node: "Optional[Any]",
+    ) -> "PerformerOutcome":
+        """R38: inner react loop. Performer gets up to MAX_INNER_ATTEMPTS tool
+        calls before the Attestor sees the result. It can self-correct errors
+        within the loop and signals done/give_up explicitly via pseudo-tools.
+
+        Returns an OutcomeSchema with:
+          verdict="completed"  if Performer called done()
+          verdict="exhausted"  if inner loop hit MAX_INNER_ATTEMPTS
+          verdict="give_up"    if Performer called give_up()
+        """
+        from cat.plan_schema import PerformerOutcome, ToolInvocation
+        from cat.capabilities import PERFORMER_DONE_MARKER, PERFORMER_GIVE_UP_MARKER
+
+        # Inject attention hint ONCE before the inner loop
+        if plan_tree and attention_node:
+            self._inject_plan_attention(run, plan_tree)
+
+        all_invocations: list[ToolInvocation] = []
+        verdict = "exhausted"
+        performer_reason = ""
+
+        for attempt in range(1, self.MAX_INNER_ATTEMPTS + 1):
+            iter_start = len(run.messages)
+            keep_going = self._perform_once(contract, state, run)
+            inner_outcome = self._extract_performer_outcome(run, iter_start)
+
+            # Tag each invocation with the attempt number
+            for inv in inner_outcome.invocations:
+                inv.attempt = attempt
+                all_invocations.append(inv)
+
+            # Check for exit signals
+            done_inv = next(
+                (inv for inv in inner_outcome.invocations
+                 if inv.tool_name == "done"), None)
+            give_up_inv = next(
+                (inv for inv in inner_outcome.invocations
+                 if inv.tool_name == "give_up"), None)
+
+            if done_inv:
+                verdict = "completed"
+                performer_reason = (
+                    done_inv.args.get("reason", "")
+                    or done_inv.output_text.replace(PERFORMER_DONE_MARKER, "").strip()
+                )
+                break
+
+            if give_up_inv:
+                verdict = "give_up"
+                performer_reason = (
+                    give_up_inv.args.get("reason", "")
+                    or give_up_inv.output_text.replace(PERFORMER_GIVE_UP_MARKER, "").strip()
+                )
+                break
+
+            # LLM stopped calling tools — implicit completion signal
+            if not keep_going:
+                verdict = "completed"
+                performer_reason = "Performer stopped calling tools (implicit done)"
+                break
+
+            # Durable change with no error on a mutate step — likely done,
+            # but let Performer confirm or do one more check
+            if inner_outcome.any_durable_change and not inner_outcome.any_tool_errored:
+                # Give Performer one more iter to call done() or verify
+                if attempt >= self.MAX_INNER_ATTEMPTS - 1:
+                    verdict = "completed"
+                    performer_reason = "Durable change with no error (implicit done)"
+                    break
+                # else continue — Performer can verify/confirm next iter
+
+        # If exhausted: summarisation call to produce structured reason
+        if verdict == "exhausted" and all_invocations:
+            try:
+                last_outputs = "\n---\n".join(
+                    f"attempt {inv.attempt} {inv.tool_name}: {inv.output_text[:300]}"
+                    for inv in all_invocations[-3:]
+                )
+                summary_msgs = [
+                    {"role": "system", "content": (
+                        "You are summarising a failed Performer loop for the Attestor. "
+                        "In 2-3 sentences: what was tried, what blocked completion, "
+                        "what info would help. Be specific about file paths and errors."
+                    )},
+                    {"role": "user", "content": (
+                        f"Step: {getattr(attention_node, 'description', '?')}\n\n"
+                        f"Last tool outputs:\n{last_outputs}"
+                    )},
+                ]
+                summary_result = self.llm.chat(
+                    summary_msgs, role_tag="performer",
+                    parent_event_id=run.last_perform_event_id,
+                )
+                self._charge_llm(contract, summary_result)
+                performer_reason = summary_result.text or "Exhausted max attempts"
+            except Exception:
+                performer_reason = "Exhausted max inner attempts"
+
+        # Build aggregate outcome
+        combined = PerformerOutcome(
+            text_response="",
+            invocations=all_invocations,
+            finish_reason="inner_loop",
+        )
+        combined.verdict = verdict
+        combined.performer_reason = performer_reason
+        return combined
+
+    # ── R37: expanded Attestor + restipulate ────────────────────────────────
+
+    def _handle_planpatcher(
+        self,
+        contract: "Contract",
+        run: ActivatorRun,
+        plan_tree: "Optional[PlanTree]",
+        attention_node: "Optional[Any]",
+        diagnosis: str,
+        state_now_class: str,
+        oc: "Optional[Any]",
+    ) -> None:
+        """Call PlanPatcher with a diagnosis string. Used by both the Attestor
+        patch_plan path and Performer give_up bypass."""
+        from cat.resolver import StallContext, enforce_guards, ResolverOutput
+        if not plan_tree or not attention_node:
+            return
+        outcome = getattr(run, "last_outcome", None)
+        sv = compute_surprise(
+            expects=attention_node.expects if isinstance(attention_node.expects, dict) else {},
+            actual_cost=0.0,
+            actual_durable_change=bool(outcome and outcome.any_durable_change),
+            actual_files_modified=list(outcome.files_modified) if outcome else [],
+            actual_verifier_outcome=None,
+        )
+        ctx = StallContext(
+            attention_node_id=attention_node.id,
+            attention_description=attention_node.description,
+            attention_intent=attention_node.intent,
+            attention_phase=attention_node.phase_name,
+            expects=attention_node.expects if isinstance(attention_node.expects, dict) else {},
+            surprise_dims=sv.to_dict(),
+            stall_count=0,
+            patch_plan_count=getattr(run, "patch_plan_count", 0),
+            plan_tree_outline=plan_tree.render_outline(),
+            recent_tool_calls=[],
+            obligation_brief=(contract.obligation or "")[:500],
+            state_now_class=state_now_class,
+            deterministic_error=diagnosis,
+        )
+        forced = ResolverOutput(decision="patch_plan", reason=diagnosis)
+        self._apply_resolver_decision(
+            contract, run, plan_tree, attention_node,
+            forced.decision, sv, state_now_class,
+        )
+
+    def _handle_restipulate(
+        self,
+        contract: "Contract",
+        run: ActivatorRun,
+        plan_tree: "Optional[PlanTree]",
+        diagnosis: str,
+    ) -> "Optional[PlanTree]":
+        """R37: throw away the current plan and re-stipulate with failure context.
+        Returns the new plan_tree (or None on failure, in which case caller should
+        continue with old tree).
+        """
+        from cat.llm import call_stipulator_phased
+        run.restipulate_count = getattr(run, "restipulate_count", 0) + 1  # type: ignore[attr-defined]
+        if run.restipulate_count > getattr(self, "max_restipulates_per_task", 2):  # type: ignore[attr-defined]
+            return None
+
+        # Build failure context for the new Stipulator call
+        committed = []
+        if plan_tree:
+            for node_id, node in plan_tree.nodes.items():
+                if getattr(node, "committed", False) or getattr(node, "complete", False):
+                    committed.append(f"- {node_id}: {node.description[:100]}")
+        what_worked = "\n".join(committed) or "(none)"
+
+        restip_context = (
+            f"PRIOR PLAN FAILED. Reason: {diagnosis[:500]}\n\n"
+            f"WHAT WORKED (do not redo):\n{what_worked}\n\n"
+            f"Do NOT repeat the same approach. Make a fundamentally different plan "
+            f"that addresses the failure reason above."
+        )
+        try:
+            new_plan_dict, llm_result = call_stipulator_phased(
+                self.llm,
+                obligation=contract.obligation,
+                representations=contract.representations,
+                extra_context=restip_context,
+                parent_event_id=run.last_stipulate_event_id,
+            )
+            self._charge_llm(contract, llm_result)
+            if not new_plan_dict:
+                return None
+            new_tree = PlanTree.from_phased_plan(new_plan_dict)
+            self.recorder.append(TraceEvent(
+                event_id=f"restip-{uuid.uuid4().hex[:6]}",
+                parent_id=run.last_stipulate_event_id,
+                ts=utcnow_iso(),
+                kind="plan_restipulate",
+                payload={
+                    "iter": run.iterations,
+                    "diagnosis": diagnosis[:300],
+                    "restipulate_count": run.restipulate_count,
+                },
+            ))
+            return new_tree
+        except Exception:
+            return None
 
     def _extract_performer_outcome(
         self, run: ActivatorRun, iter_start_len: int,
@@ -856,73 +1043,20 @@ class Activator(_BaseActivator):
             actual_verifier_outcome=actual_verifier_outcome,
         )
 
-        # R29: deterministic short-circuit. When the Performer's last
-        # invocation returned execution_status="error" (e.g. bash non-zero
-        # exit, str_replace old_str-not-found), there is nothing for the
-        # Attestor LLM to judge — the failure is a fact, not a verdict.
-        # Skip the LLM call (cost saving + correctness), force step_done=False
-        # via critical_dim_violated, and bump the stall counter so the
-        # Resolver fires on this iter's end-of-loop check. The Resolver
-        # then routes to the PlanPatcher to refine/branch the failed node.
-        deterministic_error = bool(outcome and outcome.any_tool_errored)
-        if deterministic_error:
-            last_err_inv = next(
-                (inv for inv in reversed(outcome.invocations) if not inv.succeeded),
-                None,
-            )
-            err_tool = last_err_inv.tool_name if last_err_inv else "?"
-            err_msg = (last_err_inv.error or last_err_inv.output_text[:300]) if last_err_inv else ""
-            sv.details["deterministic_error"] = f"{err_tool}: {err_msg}"[:400]
-            sv.details["attestor_skipped"] = "deterministic_error_short_circuit"
-            attestor_done = False
-            attestor_reason = f"deterministic error from {err_tool} — no LLM judgement needed"
-            # Bump stall counter so Resolver fires this iter (R22 trick).
-            run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
-            run._stall_count[attention_node.id] = max(
-                run._stall_count.get(attention_node.id, 0),
-                self.stall_threshold,
-            )
-        else:
-            # R7: step_done requires CONSISTENCY across all 7 dimensions
-            # (per docs/iteration.md §4b). Attestor is ONE dimension, not the
-            # gatekeeper. A mutate step cannot be 'done' when durable_match or
-            # files_match is False — even if the attestor said YES.
-            attestor_done, attestor_reason = self._attestor_verdict(contract, run, attention_node)
+        # R37: call the expanded Attestor with Performer verdict + plan context.
+        performer_verdict = getattr(outcome, "verdict", "completed") if outcome else "completed"
+        performer_reason = getattr(outcome, "performer_reason", "") if outcome else ""
+
+        attestor_verdict, attestor_reason, diagnosis = self._attestor_verdict_v2(
+            contract, run, plan_tree, attention_node, sv,
+            performer_verdict=performer_verdict,
+            performer_reason=performer_reason,
+        )
+        sv.details["attestor_verdict"] = attestor_verdict
         sv.details["attestor_reason"] = attestor_reason
-        sv.details["attestor_done"] = "yes" if attestor_done else "no"
+        sv.details["attestor_done"] = "yes" if attestor_verdict == "complete" else "no"
 
-        # step_done = attestor_done AND no mechanical dimension diverges on
-        # the dims that matter for this intent.
-        # For mutate intent: durable_match AND files_match must hold.
-        # For verify intent: verifier_match must hold (when expected != N/A).
-        # For investigate / design / other: mechanical dims rarely diverge
-        # (expects.durable_change=False, etc.) so attestor effectively rules.
-        critical_dim_violated = False
-        if attention_node.intent == "mutate":
-            if not (sv.durable_match and sv.files_match):
-                critical_dim_violated = True
-                sv.details["block_step_done"] = (
-                    "mutate intent requires durable_match AND files_match"
-                )
-        elif attention_node.intent == "verify":
-            ev = attention_node.expects.get("verifier_outcome", "N/A") if isinstance(attention_node.expects, dict) else "N/A"
-            if ev in ("PASS", "FAIL") and not sv.verifier_match:
-                critical_dim_violated = True
-                sv.details["block_step_done"] = (
-                    "verify intent requires verifier_match"
-                )
-
-        if critical_dim_violated:
-            step_done = False
-        elif attestor_done:
-            step_done = True
-        elif self._mechanical_evidence_strong(attention_node, sv):
-            step_done = True
-            sv.details["override"] = "mechanical evidence overrode attestor=NO"
-        else:
-            step_done = False
-
-        # Record surprise event (now includes attestor verdict)
+        # Record surprise event
         self.recorder.append(TraceEvent(
             event_id=f"sup-{uuid.uuid4().hex[:6]}",
             parent_id=run.last_perform_event_id or run.last_iter_anchor,
@@ -933,54 +1067,62 @@ class Activator(_BaseActivator):
                 "attention_id": attention_node.id,
                 "state_now": state_now_class,
                 "state_next": state_next_class,
-                "step_done": step_done,
+                "step_done": attestor_verdict == "complete",
+                "attestor_verdict": attestor_verdict,
                 **sv.to_dict(),
             },
         ))
 
-        # Record edge in librarian (if configured) for cross-task transfer
+        # Record librarian edge
         if self.librarian_writer is not None:
             try:
                 action_class = self._compute_action_class(run, attention_node)
-                outcome_label = "PASS" if not sv.any_surprised else "SURPRISE"
                 self.librarian_writer.record_edge(
-                    state_now_class,
-                    action_class,
-                    state_next_class,
+                    state_now_class, action_class, state_next_class,
                     int(actual_cost),
-                    outcome_label,
+                    "PASS" if attestor_verdict == "complete" else "SURPRISE",
                     task_id=contract.id,
                 )
             except Exception:
                 pass
 
-        # Track stall count per attention node (resets when attention moves)
-        att_id = attention_node.id
-        run._stall_count = getattr(run, "_stall_count", {})  # type: ignore[attr-defined]
-        run.backward_count = getattr(run, "backward_count", 0)  # type: ignore[attr-defined]
-
-        if step_done:
-            # Natural progress — COMMIT + advance
+        # Route based on Attestor verdict (R37)
+        if attestor_verdict == "complete":
             self._default_advance(plan_tree, attention_node, run)
-            run._stall_count[att_id] = 0
             return
 
-        # Step is NOT done. Increment stall counter for this node.
-        run._stall_count[att_id] = run._stall_count.get(att_id, 0) + 1
-        below_stall_threshold = run._stall_count[att_id] < self.stall_threshold
-
-        if below_stall_threshold:
-            # Below threshold → let the LLM (Performer) take another shot
-            # at the same attention next iter. No Resolver call yet.
+        if attestor_verdict == "patch_plan":
+            self._handle_planpatcher(
+                contract, run, plan_tree, attention_node,
+                diagnosis=diagnosis or attestor_reason,
+                state_now_class=state_now_class, oc=oc,
+            )
             return
 
-        # Stall threshold hit — ESCALATE to Resolver
-        output = self._invoke_resolver(
-            contract, run, plan_tree, attention_node, sv, state_now_class,
-        )
-        self._apply_resolver_decision(
-            contract, run, plan_tree, attention_node, output.decision, sv, state_now_class,
-        )
+        if attestor_verdict == "restipulate":
+            new_tree = self._handle_restipulate(contract, run, plan_tree, diagnosis or attestor_reason)
+            if new_tree is not None:
+                # Replace plan tree reference via side-channel: store on run
+                run._new_plan_tree = new_tree  # type: ignore[attr-defined]
+            else:
+                # Restipulate failed or capped — fall back to patch_plan
+                self._handle_planpatcher(
+                    contract, run, plan_tree, attention_node,
+                    diagnosis=f"restipulate failed; fallback patch: {diagnosis[:200]}",
+                    state_now_class=state_now_class, oc=oc,
+                )
+            return
+
+        if attestor_verdict == "give_up":
+            self._transition(
+                contract, ContractState.FAILED,
+                f"Attestor give_up: {attestor_reason}", run,
+            )
+            run.failure_reason = f"attestor_give_up: {attestor_reason[:200]}"
+            return
+
+        # Fallback: advance (should not reach here)
+        self._default_advance(plan_tree, attention_node, run)
 
     def _invoke_resolver(
         self,
@@ -1259,6 +1401,88 @@ class Activator(_BaseActivator):
             expected_v = expects.get("verifier_outcome", "N/A")
             return expected_v in ("PASS", "FAIL") and sv.verifier_match
         return False
+
+    def _attestor_verdict_v2(
+        self,
+        contract: Contract,
+        run: ActivatorRun,
+        plan_tree: "Optional[PlanTree]",
+        attention_node,
+        sv: "SurpriseVector",
+        performer_verdict: str = "completed",
+        performer_reason: str = "",
+    ) -> "tuple[str, str, str]":
+        """R37 expanded Attestor: plan-aware, multi-verdict.
+
+        Returns (verdict, reason, diagnosis) where verdict is one of:
+        "complete" | "patch_plan" | "restipulate" | "give_up".
+        """
+        try:
+            # State summary from inner loop tool outputs
+            recent_tool_msgs: list[str] = []
+            for m in reversed(run.messages):
+                if m.get("role") == "tool":
+                    c = m.get("content", "")
+                    if isinstance(c, str):
+                        recent_tool_msgs.append(c[:600])
+                if len(recent_tool_msgs) >= 4:
+                    break
+            state_summary = "\n---\n".join(reversed(recent_tool_msgs)) or "(no tool output yet)"
+
+            # Build step description
+            expects = attention_node.expects if isinstance(attention_node.expects, dict) else {}
+            expected_result = str(expects.get("result", "") or expects.get("knowledge_gained", "")).strip()
+            step_desc = (
+                f"description: {attention_node.description}\n"
+                f"intent: {attention_node.intent}\n"
+                f"expected_result: {expected_result or '(none specified)'}\n"
+                f"durable_change_expected: {expects.get('durable_change', False)}, "
+                f"verifier_outcome_expected: {expects.get('verifier_outcome', 'N/A')}"
+            )
+
+            # Build prev/next N steps context
+            prev_summary = ""
+            next_summary = ""
+            if plan_tree:
+                try:
+                    nodes = list(plan_tree.nodes.values())
+                    attn_idx = next((i for i, n in enumerate(nodes) if n.id == attention_node.id), -1)
+                    if attn_idx > 0:
+                        prev_nodes = nodes[max(0, attn_idx-3):attn_idx]
+                        prev_summary = "\n".join(
+                            f"- {n.id} [{n.intent}] {n.description[:80]} "
+                            f"({'DONE' if getattr(n,'committed',False) else 'prior'})"
+                            for n in prev_nodes
+                        )
+                    if attn_idx >= 0 and attn_idx + 1 < len(nodes):
+                        next_nodes = nodes[attn_idx+1:attn_idx+4]
+                        next_summary = "\n".join(
+                            f"- {n.id} [{n.intent}] {n.description[:80]}"
+                            for n in next_nodes
+                        )
+                except Exception:
+                    pass
+
+            verdict, reason, diagnosis, llm_result = call_attestor(
+                self.llm,
+                step_description=step_desc,
+                state_summary=state_summary,
+                performer_verdict=performer_verdict,
+                performer_reason=performer_reason,
+                prev_steps_summary=prev_summary,
+                next_steps_summary=next_summary,
+                obligation_brief=(contract.obligation or "")[:400],
+                parent_event_id=run.last_perform_event_id or run.last_iter_anchor,
+            )
+            self._charge_llm(contract, llm_result)
+            if llm_result is None or (
+                getattr(llm_result, "tokens_in", 0) == 0
+                and getattr(llm_result, "tokens_out", 0) == 0
+            ):
+                return "patch_plan", "attestor returned empty response", ""
+            return verdict, reason[:300], diagnosis[:400]
+        except Exception as e:
+            return "patch_plan", f"attestor error: {e}"[:300], ""
 
     def _attestor_verdict(
         self, contract: Contract, run: ActivatorRun, attention_node,

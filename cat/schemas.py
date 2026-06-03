@@ -194,17 +194,40 @@ class PhasedPlanSchema(BaseModel):
 
 
 class AttestorSchema(BaseModel):
-    """Attestor's verdict on whether the current step is done.
+    """Attestor's plan-aware verdict (R37).
 
-    The Activator only consumes `complete` (bool) and `reason` (free-text);
-    additional fields can be added without breaking callers.
+    The Attestor sees the Performer's result + prev/next N plan steps + the
+    overall goal. It decides the next action, not just "is this step done?".
+
+    `verdict` values:
+    - complete     → step satisfied, advance attention to next node
+    - patch_plan   → step not done, plan is sound, PlanPatcher can fix locally
+    - restipulate  → plan premise is wrong, call Stipulator again with failure context
+    - give_up      → unrecoverable, abort the task
+
+    `diagnosis` is required for patch_plan and restipulate — what specifically
+    is wrong, so PlanPatcher / the new Stipulator can act on it.
+
+    Backward-compat: `complete` property maps verdict=="complete" → True so
+    older code paths that check attestor_done still work during migration.
     """
-
-    complete: bool = Field(description="True iff the step appears done.")
+    verdict: Literal["complete", "patch_plan", "restipulate", "give_up"] = Field(
+        description="What the Attestor decided to do next."
+    )
     reason: str = Field(
         default="",
         description="Short justification (≤300 chars). Truncated by caller.",
     )
+    diagnosis: str = Field(
+        default="",
+        description="For patch_plan/restipulate: what is wrong and why. "
+                    "Required for actionable recovery.",
+    )
+
+    @property
+    def complete(self) -> bool:
+        """Backward-compat: True when verdict=='complete'."""
+        return self.verdict == "complete"
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -368,6 +391,7 @@ class InvocationSchema(BaseModel):
     tool_name: str
     args: dict = Field(default_factory=dict)
     reason: str = ""
+    attempt: int = 1      # which inner-loop attempt produced this call (R38)
     succeeded: bool = True
     execution_status: Literal["success", "error"] = "success"
     output_text: str = ""
@@ -391,14 +415,26 @@ _TEST_COMMAND_MARKERS = ("pytest", "runtests", "tox", "unittest", "django-admin 
 
 
 class OutcomeSchema(BaseModel):
-    """Structured result of one Performer turn. Replaces the old (keep_going: bool)
-    return value of _perform_once. Every downstream phase reads off this object.
+    """Structured result of one Performer inner-loop run (R38).
+
+    Replaces the old single-turn OutcomeSchema. The Performer now runs a
+    bounded react loop (up to max_inner attempts) and self-reports its
+    verdict. The Attestor validates and routes based on this.
+
+    `verdict`:
+    - completed  → Performer self-assessed the step is done
+    - exhausted  → K attempts without success; reason is a summarisation
+    - give_up    → Performer hit a fundamental blocker; bypass Attestor
+    `performer_reason` is MANDATORY for all verdicts — always explains why.
     """
     text_response: str = ""
     invocations: list[InvocationSchema] = Field(default_factory=list)
     finish_reason: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
+    # R38: inner-loop verdict fields
+    verdict: Literal["completed", "exhausted", "give_up"] = "completed"
+    performer_reason: str = ""   # mandatory explanation from Performer
 
     # ── Derived properties (computed from invocations) ────────────────────
 

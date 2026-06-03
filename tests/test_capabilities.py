@@ -36,7 +36,10 @@ def test_every_tool_schema_exposes_reason_param():
         assert props["reason"]["type"] == "string"
         # `reason` must remain OPTIONAL — never in the required list.
         required = tool["function"]["parameters"].get("required", [])
-        assert "reason" not in required, f"reason should not be required on {tool['function']['name']}"
+        # done/give_up exit signals require reason by design — they have no
+        # other args, so mandatory reason is correct and intentional.
+        if tool["function"]["name"] not in ("done", "give_up"):
+            assert "reason" not in required, f"reason should not be required on {tool['function']['name']}"
 
 
 def test_reason_arg_is_stripped_before_handler(tmp_path: Path):

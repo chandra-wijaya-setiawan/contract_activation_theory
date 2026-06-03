@@ -327,13 +327,29 @@ def _h_str_replace(args: dict[str, Any], state: State) -> ToolResult:
                       output=f"replaced 1 occurrence in {resolved.relative_to(state.workdir.resolve())}")
 
 
-# R22 removed → R27: the request_revision SIGNAL tool was deleted. The new
-# convention is: every tool accepts an optional `reason` arg (one sentence
-# of execution-side metadata). The Performer fills `reason` when deviating
-# from the planner's suggested_tool, and the value is captured on
-# InvocationSchema and surfaced in the performer_response trace event so
-# the attestor / planner can see the gap between plan and actual execution.
-# See design_schema.md for the plan-vs-actual schema split.
+# ── R38: Performer inner-loop exit signals ───────────────────────────────────
+# `done` and `give_up` are pseudo-tools — they carry no file-system effect.
+# The Performer calls one of these to exit its inner react loop and hand off
+# to the Attestor. They are detected by name in _perform_loop and stripped
+# before invoking any handler. The `reason` arg is mandatory and becomes
+# OutcomeSchema.performer_reason.
+
+PERFORMER_DONE_MARKER = "[PERFORMER_DONE]"
+PERFORMER_GIVE_UP_MARKER = "[PERFORMER_GIVE_UP]"
+
+
+def _h_done(args: dict[str, Any], state: State) -> ToolResult:
+    reason = str(args.get("reason", "") or "").strip()
+    return ToolResult(tool="done", is_error=False,
+                      output=f"{PERFORMER_DONE_MARKER} {reason}",
+                      detail={"reason": reason})
+
+
+def _h_give_up(args: dict[str, Any], state: State) -> ToolResult:
+    reason = str(args.get("reason", "") or "").strip()
+    return ToolResult(tool="give_up", is_error=False,
+                      output=f"{PERFORMER_GIVE_UP_MARKER} {reason}",
+                      detail={"reason": reason})
 
 
 def build_default_registry() -> CapabilityRegistry:
@@ -405,7 +421,55 @@ def build_default_registry() -> CapabilityRegistry:
         },
         handler=_h_str_replace,
     ))
+    _register_performer_exit_tools(reg)
     return reg
+
+
+def _register_performer_exit_tools(reg: "CapabilityRegistry") -> None:
+    """R38: register done/give_up exit-signal tools into any registry."""
+    reg.register(Capability(
+        name="done",
+        description=(
+            "Signal that you have COMPLETED this step. Call this when you are "
+            "confident the step's expected_result is satisfied. "
+            "MANDATORY: provide a `reason` explaining WHY you believe the step "
+            "is done — what specific evidence from your tool results confirms it."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why you believe this step is complete. "
+                                   "Reference specific tool output as evidence.",
+                },
+            },
+            "required": ["reason"],
+        },
+        handler=_h_done,
+    ))
+    reg.register(Capability(
+        name="give_up",
+        description=(
+            "Signal that you CANNOT complete this step after trying. Call this "
+            "only when you have hit a fundamental blocker — the file doesn't "
+            "exist, the task is impossible as stated, or the environment is "
+            "broken. DO NOT call this just because one attempt failed — try "
+            "at least 2 different approaches first. "
+            "MANDATORY: provide a `reason` explaining the specific blocker."
+        ),
+        json_schema={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "The specific blocker preventing completion.",
+                },
+            },
+            "required": ["reason"],
+        },
+        handler=_h_give_up,
+    ))
 
 
 def build_tmux_registry(session: object) -> "CapabilityRegistry":
@@ -614,6 +678,7 @@ def build_tmux_registry(session: object) -> "CapabilityRegistry":
         },
         handler=_str_replace,
     ))
+    _register_performer_exit_tools(reg)
     return reg
 
 
@@ -1544,5 +1609,5 @@ def build_docker_registry(container: "object", default_workdir: str = "/testbed"
         },
         handler=_outline,
     ))
-
+    _register_performer_exit_tools(reg)
     return reg

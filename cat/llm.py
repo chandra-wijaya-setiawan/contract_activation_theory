@@ -264,29 +264,44 @@ Output a JSON object with this exact shape:
 
 
 ATTESTOR_SYSTEM_PROMPT = """\
-You are the ATTESTOR role in a contract-disciplined agent. You receive a STEP \
-(description + expected_result + intent) and a STATE SUMMARY (recent tool \
-outputs).
+You are the ATTESTOR role in a contract-disciplined agent. You receive:
+- PERFORMER RESULT: what the Performer did and its self-verdict
+- CURRENT STEP: what was planned
+- PLAN CONTEXT: prior committed steps + upcoming planned steps + the overall goal
+- TOOL OUTPUTS: what the tools returned
 
-Your job: decide whether `expected_result` HOLDS based on the evidence in \
-STATE SUMMARY. The step is complete iff expected_result is satisfied.
+Your job: make a plan-level verdict — not just "is this step done?" but \
+"is the PLAN still sound?". Output one of four verdicts:
 
-KEY INTERPRETATION RULES:
-- expected_result may include OR clauses with NEGATIVE-RESULT possibilities
-  (e.g., "X is defined here OR confirmed not defined here, implying inherited").
-  A search that returned 0 matches IS valid evidence for the negative branch.
-  If the agent searched the right place and got 0 results, that satisfies the
-  negative branch — mark complete=true.
-- expected_result is the CONTRACT. Do not require evidence the contract did
-  not ask for.
-- If expected_result mentions a fact and the STATE SUMMARY confirms or denies
-  that fact within the contract, the step is complete.
-- If the agent ran a tool with output suggesting "no match in requested
-  location, found in broader scope" — this is also a complete answer to a
-  "locate X" step (X is not at the asked location; we now know it's elsewhere).
+complete     → The step is done AND the plan makes sense going forward. \
+               Advance to the next step.
+patch_plan   → The step is not done, but the plan strategy is correct. \
+               The PlanPatcher can fix the current node locally \
+               (wrong args, wrong file path, etc.).
+restipulate  → The plan PREMISE is wrong — wrong file, wrong class list, \
+               wrong approach entirely. Local fixes cannot help. \
+               A fresh plan with failure context is needed.
+give_up      → Unrecoverable. The task itself is impossible or the \
+               environment is broken beyond repair.
+
+DECISION RULES:
+- If Performer verdict is "completed" AND expected_result is satisfied: → complete
+- If Performer verdict is "completed" BUT plan's next steps seem misaligned \
+  with the goal (wrong files touched, wrong scope): → restipulate
+- If Performer verdict is "exhausted" AND the approach seems right \
+  (right file, right method, just stuck on args): → patch_plan
+- If Performer verdict is "exhausted" AND verify has failed 2+ times with the \
+  same error, or the files modified don't match what the tests exercise: → restipulate
+- If Performer verdict is "give_up": → restipulate (try fresh plan) or give_up
+- Always provide `diagnosis` for patch_plan and restipulate — be specific \
+  about what is wrong so the PlanPatcher / new Stipulator can act on it.
 
 Output ONLY a JSON object:
-{"complete": true|false, "reason": "<single most important piece of evidence>"}
+{
+  "verdict": "complete" | "patch_plan" | "restipulate" | "give_up",
+  "reason": "<single most important piece of evidence>",
+  "diagnosis": "<for patch_plan/restipulate: what is wrong and why>"
+}
 """
 
 
@@ -338,18 +353,40 @@ def call_stipulator(
 
 
 def call_attestor(
-    llm: LLM, step_description: str, state_summary: str,
+    llm: LLM,
+    step_description: str,
+    state_summary: str,
+    performer_verdict: str = "completed",
+    performer_reason: str = "",
+    prev_steps_summary: str = "",
+    next_steps_summary: str = "",
+    obligation_brief: str = "",
     parent_event_id: Optional[str] = None,
-) -> tuple[bool, str, LLMResult]:
-    """Verdict + raw LLMResult so the caller can charge full cost to the contract.
+) -> tuple[str, str, str, LLMResult]:
+    """Plan-aware Attestor (R37). Returns (verdict, reason, diagnosis, result).
 
-    Returns (complete, reason, result). Conservative on parse failure
-    (complete=False). The caller is responsible for charging result's tokens,
-    usd, and wall_s to contract.cost via _charge_llm().
+    `verdict` is one of: "complete", "patch_plan", "restipulate", "give_up".
+    Conservative on parse failure (verdict="patch_plan") — never silently advances.
     """
+    plan_context = ""
+    if prev_steps_summary:
+        plan_context += f"\nPRIOR COMMITTED STEPS (what was accomplished):\n{prev_steps_summary}"
+    if next_steps_summary:
+        plan_context += f"\nUPCOMING PLANNED STEPS (where plan is going):\n{next_steps_summary}"
+    if obligation_brief:
+        plan_context += f"\nOVERALL GOAL:\n{obligation_brief}"
+
+    user_content = (
+        f"PERFORMER RESULT:\n"
+        f"  verdict: {performer_verdict}\n"
+        f"  reason: {performer_reason[:400]}\n\n"
+        f"CURRENT STEP:\n{step_description}\n\n"
+        f"TOOL OUTPUTS (recent):\n{state_summary}"
+        f"{plan_context}"
+    )
     messages = [
         {"role": "system", "content": ATTESTOR_SYSTEM_PROMPT},
-        {"role": "user", "content": f"STEP: {step_description}\n\nSTATE SUMMARY:\n{state_summary}"},
+        {"role": "user", "content": user_content},
     ]
     result = llm.chat(
         messages=messages,
@@ -359,14 +396,16 @@ def call_attestor(
         parent_event_id=parent_event_id,
     )
     if not result.text:
-        return False, "attestor returned no text", result
+        return "patch_plan", "attestor returned no text", "", result
     from cat.plan_schema import AttestorVerdict
     from pydantic import ValidationError
     try:
-        verdict = AttestorVerdict.model_validate_json(result.text)
+        v = AttestorVerdict.model_validate_json(result.text)
+        verdict_str = getattr(v, "verdict", "complete" if v.complete else "patch_plan")
+        diagnosis = getattr(v, "diagnosis", "")
+        return verdict_str, v.reason[:300], diagnosis[:500], result
     except ValidationError:
-        return False, "attestor schema validation failed", result
-    return verdict.complete, verdict.reason[:300], result
+        return "patch_plan", "attestor schema validation failed", "", result
 
 
 # Backward-compat aliases (read-only — DO NOT remove until v1.7+)
@@ -563,6 +602,7 @@ def call_stipulator_phased(
     representations: "Optional[list[Any]]" = None,
     plan_templates: "Optional[list[dict[str,Any]]]" = None,
     anti_templates: "Optional[list[dict[str,Any]]]" = None,
+    extra_context: str = "",      # R37: failure context for restipulate calls
     parent_event_id: Optional[str] = None,
 ) -> tuple[Optional[dict[str, Any]], LLMResult]:
     """Cold-start phased Stipulate. Returns (phased_plan_dict_or_None, llm_result).
@@ -589,9 +629,10 @@ def call_stipulator_phased(
         for i, t in enumerate(anti_templates[:3], 1):
             templates_section += f"  anti-template {i}: {json.dumps(t, indent=2)[:600]}\n"
 
+    extra_section = f"\n\n{extra_context}" if extra_context else ""
     messages = [
         {"role": "system", "content": STIPULATOR_COLD_SYSTEM_PROMPT},
-        {"role": "user", "content": f"OBLIGATION:\n{obligation}{env_section}{templates_section}"},
+        {"role": "user", "content": f"OBLIGATION:\n{obligation}{env_section}{templates_section}{extra_section}"},
     ]
 
     # R12 follow-up: retry-on-schema-failure. Cheap "flash" LLMs sometimes
