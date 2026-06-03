@@ -340,18 +340,9 @@ PERFORMER_GIVE_UP_MARKER = "[PERFORMER_GIVE_UP]"
 
 def _h_done(args: dict[str, Any], state: State) -> ToolResult:
     reason = str(args.get("reason", "") or "").strip()
-    if not reason:
-        # Only reject truly empty reason. A non-empty reason (even brief) is
-        # accepted — the system prompt enforces quality; the handler enforces presence.
-        return ToolResult(
-            tool="done", is_error=True,
-            output=(
-                "[ERROR] done() called with empty `reason`. You MUST provide a "
-                "specific reason citing concrete evidence, e.g.: "
-                "done(reason=\"str_replace succeeded — file now has .distinct() "
-                "after complex_filter()\"). Call done() again with a non-empty reason."
-            ),
-        )
+    # Accept all done() calls — reason quality is validated by the Attestor,
+    # not the handler. Rejecting empty reasons caused deepseek-v4-flash to
+    # burn all 5 inner attempts calling done() repeatedly without adapting.
     return ToolResult(tool="done", is_error=False,
                       output=f"{PERFORMER_DONE_MARKER} {reason}",
                       detail={"reason": reason})
