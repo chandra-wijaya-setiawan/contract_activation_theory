@@ -50,32 +50,124 @@ and theory.
 | Role | Step it drives | Kind | LLM role_tag in code |
 |---|---|---|---|
 | **Stipulator** | 3 STIPULATE | LLM | `stipulator` |
-| **Performer** | 5 SELECT + 6 PERFORM | LLM | `performer` |
-| **Attestor** | 7 VERIFY (per-stipulation) | LLM | `attestor` |
-| **Resolver** | end-of-iter — fires on stall | LLM | `resolver` |
-| **PlanPatcher** | invoked by Resolver to mutate the plan tree | LLM | `plan_patcher` |
+| **Performer** | 5 SELECT + 6 PERFORM — inner react loop | LLM | `performer` |
+| **Attestor** | 7 VERIFY — plan-aware, multi-verdict | LLM | `attestor` |
+| **PlanPatcher** | invoked by Attestor on `patch_plan` verdict | LLM | `plan_patcher` |
 | **Auditor** | 7 VERIFY (criterion / oracle) | deterministic | bash predicate (no LLM) |
 | Surveyor | 2 REPRESENT | deterministic | `Representer` class (no LLM) |
 | Registrar | 4 ACTIVATE | deterministic | `Activator._admit` (no LLM) |
 | Recorder | cross-cutting | deterministic | `Recorder` class |
 | Enforcer | cross-cutting | deterministic | `Constraints.check` + `_check_budget` |
 
-The five bold roles each issue an LLM call; the others are pure code.
-Theory-only roles (Surveyor / Registrar / Recorder / Enforcer) are
-documented here as conceptual actors but do not exist as separate code
-classes — they refer to existing components (`Representer`, `Activator`,
-`Recorder`, `Constraints`).
+The four bold roles each issue an LLM call; the others are pure code.
 
-**Resolver + PlanPatcher.** When a node stalls (default 3 iters without
-`step_done`), the Resolver decides one of four moves:
-`forward / patch_plan / backward / give_up`. If `patch_plan`, it hands off
-to the PlanPatcher which emits tree-edit ops (`CommitOp`, `RefineOp`,
-`BranchOp`, `DropOp`, `CommitNewOp`, `CheckoutOp`, `MergeOp`) against the
-plan tree. See `cat/schemas.py` for `ResolverSchema` and `PatcherSchema`.
+**Resolver is eliminated (R37/R38).** Previously a thin routing layer between
+stall detection and PlanPatcher. Its decisions (`forward / patch_plan /
+backward / give_up`) are absorbed into the Attestor, which has richer
+plan-context to make them correctly. `stall_count` is also eliminated —
+the Performer's inner loop is the retry mechanism.
 
-Future roles introduced in v1.7-v1.8:
-- **Librarian** — DAG-corpus retrieval at STIPULATE / DELIBERATE time (v1.7)
-- **Advisor** — candidate scoring for the Dijkstra layer (v1.8, see below)
+---
+
+### Performer — inner react loop (R38)
+
+The Performer owns step execution end-to-end. It receives a `PerformerTask`
+(current `StepSchema` + compressed context from prior committed steps) and
+runs a bounded react loop:
+
+```
+for attempt in 1..max_attempts:
+    call LLM with PerformerTask + accumulated tool results
+    dispatch tool calls → see results
+    if believes step is done → exit loop with verdict="completed"
+    if fundamentally impossible → exit loop with verdict="give_up"
+    # otherwise continue inner loop (self-corrects errors, refines args)
+if loop exhausted → call LLM once more to summarise → verdict="exhausted"
+```
+
+The Performer returns a `PerformerResultSchema`:
+
+```python
+PerformerResultSchema {
+    step_id:    str
+    verdict:    "completed" | "exhausted" | "give_up"
+    reason:     str          # MANDATORY — always explains the verdict
+    attempts:   int
+    executions: list[ExecutionSchema]   # one per tool call in the loop
+}
+```
+
+`reason` on `exhausted` is produced by a dedicated summarisation LLM call
+that sees all K tool results and explains what blocked completion and what
+information would help. On `completed` the Performer articulates why it
+believes the step is done. On `give_up` it states the fundamental blocker.
+
+The Performer does NOT see the full plan tree. It receives only the current
+`StepSchema` and a short `context_summary` of key facts from prior committed
+steps. Narrow context → cheaper model tier viable.
+
+---
+
+### Attestor — plan-aware recovery judge (R37)
+
+The Attestor receives the `PerformerResultSchema` and makes a plan-level
+verdict. It sees:
+
+- `PerformerResultSchema` (what the Performer did + its verdict + reason)
+- Current `StepSchema` (what was planned)
+- Previous N committed steps (what was accomplished)
+- Next N planned steps (where the plan is going)
+- Overall obligation
+
+It outputs `AttestorSchema`:
+
+```python
+AttestorSchema {
+    verdict:   "complete" | "patch_plan" | "restipulate" | "give_up"
+    reason:    str
+    diagnosis: str    # for patch_plan / restipulate: what specifically is wrong
+}
+```
+
+Routing by Attestor verdict:
+- `complete` → advance attention to next step
+- `patch_plan` → PlanPatcher (local tree ops; plan is sound, step needs repair)
+- `restipulate` → Stipulator re-called with failure context; plan tree reset
+- `give_up` → task aborted
+
+Performer `give_up` bypasses the Attestor entirely and routes directly to
+PlanPatcher (which will typically choose `restipulate` or abort).
+
+The Attestor's wide view enables the key judgement: is this a local step
+failure (plan sound → patch_plan) or a premise failure (plan broken →
+restipulate)? Seeing prev/next nodes and the overall goal makes this
+judgement principled rather than count-based.
+
+---
+
+### PlanPatcher — local tree surgery
+
+Called only when Attestor decides `patch_plan`. Receives the plan tree +
+Attestor's diagnosis. Emits tree-edit ops:
+
+```
+CommitOp      → mark current node done
+RefineOp      → rewrite current node's description / args
+BranchOp      → add sibling alternative node
+DropOp        → delete current node
+CommitNewOp   → insert a new node
+MergeOp       → collapse branches
+```
+
+PlanPatcher does NOT make the patch_plan vs restipulate decision — that
+belongs to the Attestor. PlanPatcher only decides HOW to locally edit the
+tree once that decision is made.
+
+---
+
+Future roles:
+- **Librarian** — DAG-corpus retrieval at STIPULATE time (v1.7)
+- **Advisor** — candidate scoring for the Dijkstra layer (v1.8)
 
 ---
 
@@ -343,61 +435,117 @@ real choice.
 
 ---
 
-### Step 6 — PERFORM
+### Step 6 — PERFORM (inner react loop, R38)
 
-**What:** One **performer** LLM call → one tool call → one tool result.
-Strictly one performance act per turn. The result is appended to the
-message thread so the next turn sees it.
+**What:** The Performer runs a bounded react loop for the current step.
+It sees only the current `StepSchema` + a compressed context summary of
+prior committed steps — not the full plan tree, not the full message history.
+This narrow focus enables a cheaper model tier and reduces prompt noise.
 
 **Formula:**
 ```
-messages = [
-    {role: system,    content: PERFORMER_SYSTEM_PROMPT},
-    {role: user,      content: build_user_prompt(obligation, plan_checklist, budget)},
-    ...run.messages[-window_size*2:]   # last window_size turns (action + result pairs)
-]
+task = PerformerTask(
+    step         = attention_node.to_step_schema(),
+    context_summary = compress_prior_steps(committed_nodes[-N:]),
+    max_attempts = K,          # e.g. K=5
+    tools        = registry.tool_schemas(only=grant),
+)
 
-result = llm.chat(messages, tools, temperature=0.2, role_tag="performer")
-contract.cost += result.tokens
+executions = []
+for attempt in range(1, K+1):
+    result = llm.chat(
+        messages = [system_prompt, task_prompt] + inner_messages,
+        tools    = task.tools,
+        role_tag = "performer",
+    )
+    tool_results = dispatch_tool_calls(result.tool_calls)
+    executions.append(ExecutionSchema(attempt, ...))
+    inner_messages += [assistant_msg, tool_result_msgs]
 
-# No silent normalization. If args are malformed, the tool reports an error
-# and the performer sees that error in the next turn — same as any other failure.
-tool_result = registry.invoke(name, args, state)
-contract.cost.tool_calls += 1
+    if performer_says_done(result):      break  # verdict = completed
+    if performer_gives_up(result):       break  # verdict = give_up
+    if any durable_change and no error:  break  # verdict = completed
 
-run.messages.append({role: assistant, tool_calls: [...]})
-run.messages.append({role: tool, content: tool_result.output})
+# If loop exhausted:
+if verdict not set:
+    summary = llm.chat(summarise_prompt(executions), role_tag="performer")
+    verdict  = "exhausted"
+    reason   = summary.text
+
+return PerformerResultSchema(verdict, reason, attempts, executions)
 ```
 
-There is no Action Realizer. There are no tool preconditions or
-precondition_failed flags. There is no failure-attribution taxonomy.
-Tool errors are simply tool errors; the performer sees them and decides
-the next action.
+`ExecutionSchema` records each tool call within the loop:
+```python
+ExecutionSchema {
+    attempt:          int     # 1..K
+    tool_name:        str
+    args:             dict    # after `reason` stripped at dispatch
+    reason:           str     # why this tool (R27 — deviation explanation)
+    execution_status: str     # "success" | "error" — deterministic from handler
+    output_text:      str
+    error:            str
+    durable_change:   bool
+    files_modified:   list[str]
+}
+```
 
-**Trace event:** `capability_perform` (legacy alias `capability_invoke` still
-accepted for pre-1.6.2.9 traces).
+**Trace event:** `capability_perform` per inner tool call; `performer_result`
+once per outer step (carries `PerformerResultSchema`).
 
 ---
 
-### Step 7 — VERIFY
+### Step 7 — VERIFY (Attestor as plan-health judge, R37)
 
-**What:** Run criteria after each PERFORM (subject to
-`criterion_check_interval` to keep oracle-probe cost bounded).
+**What:** Two layers of verification after each PERFORM.
 
+**Layer 1 — Oracle (deterministic, authoritative):**
 ```
 if criterion.is_oracle:
     passed, evidence = criterion.predicate(state)
-    state.kv["last_criterion_output"] = evidence.detail["output"]
-    if passed:
-        contract.state = FULFILLED
+    if passed: contract.state = FULFILLED   # done — exit loop
 ```
 
-**Oracle is authoritative — attestor is advisory.** When any oracle criterion
-is present, attestor (LLM judge) criteria are skipped at close time. The
-contract closes on real test results, not model opinion.
+**Layer 2 — Attestor (LLM, plan-aware):**
+Called after every Performer inner loop completes (every outer iter).
+Receives `PerformerResultSchema` + plan context. Returns `AttestorSchema`:
 
-The per-step **attestor** (Step 7 secondary) marks stipulations complete
-for the performer's context only. It is advisory.
+```
+attestor_input = AttestorContext(
+    performer_result = result,              # verdict + reason + executions
+    current_step     = attention_node,      # what was planned
+    prev_n_steps     = committed_nodes[-N:], # what was accomplished
+    next_n_steps     = pending_nodes[:N],    # where plan is going
+    obligation       = contract.obligation,
+)
+
+verdict, reason, diagnosis = call_attestor(llm, attestor_input)
+
+match verdict:
+    "complete"     → advance attention to next step
+    "patch_plan"   → call PlanPatcher(plan_tree, diagnosis)
+    "restipulate"  → call Stipulator again with RestipulateContext;
+                     reset plan_tree; reset attention to A1
+    "give_up"      → contract.state = FAILED
+
+# Performer give_up bypasses Attestor:
+if performer_result.verdict == "give_up":
+    → PlanPatcher directly (typically chooses restipulate or abort)
+```
+
+**Restipulate context** passed to Stipulator on `restipulate` verdict:
+```python
+RestipulateContext {
+    failure_summary:  str   # what was tried, what errors occurred, test outputs
+    anti_template:    str   # prior plan's failed steps (do not repeat)
+    what_worked:      str   # prior committed steps (don't redo)
+}
+```
+`run.messages` persist across restipulation — the Performer still sees
+prior tool outputs. Only the plan tree and attention reset.
+
+**Oracle is authoritative.** Attestor verdict cannot override a fulfilled
+oracle. If the oracle passes, the contract closes regardless of Attestor.
 
 ---
 
@@ -652,6 +800,54 @@ class ActivatorRun:
 
 ---
 
+## Schema layer (R37/R38 — plan side vs execution side)
+
+Two schema families cleanly separate planning from execution:
+
+**Plan side** — Stipulator writes, Performer reads as task:
+```python
+StepSchema {              # one step in the plan (formerly ExecutionSchema)
+    id, phase, intent, description,
+    suggested_tool, suggested_args,
+    expects: ExpectsSchema {
+        result: str              # done-criterion prose for Attestor
+        durable_change: bool
+        files_modified: list[str]
+        verifier_outcome: str    # "PASS"|"FAIL"|"N/A"
+    }
+}
+```
+
+**Execution side** — Performer writes, Attestor reads:
+```python
+ExecutionSchema {         # one tool call in the inner loop (formerly InvocationSchema)
+    attempt: int          # 1..K — which inner iteration
+    tool_name, args, reason,
+    execution_status: "success" | "error"
+    output_text, error,
+    durable_change: bool, files_modified: list[str]
+}
+
+PerformerResultSchema {   # full inner loop result (formerly OutcomeSchema)
+    step_id: str
+    verdict: "completed" | "exhausted" | "give_up"
+    reason:  str          # MANDATORY — always explains the verdict
+    attempts: int
+    executions: list[ExecutionSchema]
+}
+```
+
+**Attestor output:**
+```python
+AttestorSchema {
+    verdict:   "complete" | "patch_plan" | "restipulate" | "give_up"
+    reason:    str
+    diagnosis: str    # for patch_plan/restipulate: what is wrong and why
+}
+```
+
+---
+
 ## Why This Is Different from a Normal Agent Loop
 
 | Normal agent loop | Contract-activation loop |
@@ -660,12 +856,13 @@ class ActivatorRun:
 | Tool calls dispatched ad hoc | Tool calls are invocations under a contract grant |
 | "Done" decided by the model | Done = oracle predicate returns True |
 | Failure = exception or silent hallucination | Failure = explicit contract state with reason |
+| Retry = silent re-run same prompt | Retry = Performer inner loop with full result visibility |
+| Stuck = silent loop until timeout | Stuck = Attestor judges plan health → patch/restipulate/quit |
 | Sub-tasks are stack frames | Sub-tasks are contracts with their own lifecycles (v2 work) |
 | Budget is loose (max_tokens) | Budget is the envelope granted at admission |
 | Obligation acted on as-received | Obligation grounded in verified representations before admission |
-| Context grows unboundedly | Context = sliding window + compressed prior_attempts |
+| Context grows unboundedly | Performer: narrow step context; Attestor: plan-wide context |
 | Tools always available | Tools available only when the grant includes them (gating; v2 work) |
-| Stuck = silent loop until timeout | Stuck = SUSPENDED with a reason and a re-entry condition |
 
 ---
 

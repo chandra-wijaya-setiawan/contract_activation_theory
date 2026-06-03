@@ -28,7 +28,7 @@ in **docs/PRD/**.
 | **v1.8 R27** | **✅ 2026-06-02** | **request_revision → `reason` tool arg; swe5x5 = 17/25 (68%), +16pp vs R26** |
 | **v1.8 R29** | **✅ 2026-06-02** | **deterministic tool error → skip attestor → Resolver; swe500-partial +12pp (36%→48%)** |
 
-## Next — R37 + R38 (two architectural abstractions)
+## Next — R37 + R38 (two architectural abstractions, see DESIGN.md for full spec)
 
 All previous surgical R30-R36 fixes (OracleFirstPlan, LocateBeforeMutate, MutateBudget,
 RollbackOnCorrupted, MultiCandidatePlan, VerifyStrict, TrueRestipulate) collapse into two
