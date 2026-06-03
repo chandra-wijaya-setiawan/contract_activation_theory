@@ -26,14 +26,56 @@ in **docs/PRD/**.
 | v1.8 R13–R22 | ✅ 2026-06-01 | OutcomeSchema (R19), tool_choice=required (R19.5), trace surface (R19.10), request_revision escape valve (R22) |
 | v1.8 R26 | ✅ 2026-06-01 | Schema library `cat/schemas.py` + Schema-suffix naming; **swe5x5 = 13/25 (52%)** |
 | **v1.8 R27** | **✅ 2026-06-02** | **request_revision → `reason` tool arg; swe5x5 = 17/25 (68%), +16pp vs R26** |
+| **v1.8 R29** | **✅ 2026-06-02** | **deterministic tool error → skip attestor → Resolver; swe500-partial +12pp (36%→48%)** |
 
-## Next
+## Next — R-chain (ordered by expected ROI)
 
-- **R29 FixVerify** — parse `FAILED (failures=N)` from django test runner output as `verifier_outcome=FAIL`; force step !done and route to Resolver. Single highest-leverage fix per django-13315 surgical analysis — both fail trials had verify-step false-positives. ~50 LOC.
-- **R31 MutateBudget** — after ≥3 successful str_replace on one node with verify still failing, auto-fire PlanPatcher `BranchOp`. Stops trial-4-style corruption (6 edits across 2 files).
-- **R32 RollbackOnCorrupted** — if verify produces ImportError/SyntaxError after mutate, `git checkout` the file and re-plan.
-- **R28 UpdateStepOp + locate-before-mutate** — PlanPatcher op for in-place arg refinement; kills Stipulator old_str hallucination loop.
-- **R33 MultiCandidatePlan** — root-cause fix for django-13315: Stipulator emits N=2 candidate plans (different file targets), LLM-attestor picks. Bigger build (revives R18 PlanComposer).
+| R# | Name | Pattern it kills | Size | Status |
+|---|---|---|---|---|
+| **R30** | **OracleFirstPlan** | Stipulator scope-miss (django-15161: listed wrong classes) | S | 🎯 next |
+| **R31** | **LocateBeforeMutate** | Stipulator old_str hallucination (A Pattern) | M | pending |
+| **R32** | **MutateBudget** | N successful str_replace on 1 node + verify still fails → BranchOp | S | pending |
+| **R33** | **RollbackOnCorrupted** | ImportError/SyntaxError after mutate → git checkout + re-plan | S | pending |
+| **R34** | **MultiCandidatePlan** | Wrong-file anchor (C Pattern, django-13315) | L | deferred |
+| **R35** | **VerifyStrict** | False-positive verify (B Pattern, test runner exit code) | S | pending |
+| **R36** | **TrueRestipulate** | Whole-plan-wrong: Resolver calls full re-stipulate with failure context | M | deferred |
+
+### R30 — OracleFirstPlan (next)
+When `INITIAL_TEST_FAILURE` is present in representations (it always is for SWE-bench),
+the Stipulator should run the oracle test **as the first MAP step** to discover *which*
+classes/functions actually fail — not hallucinate a list from training data.
+
+Current behavior: Stipulator reads the issue text and guesses the list of affected classes
+(e.g. C1-C6 for 6 expression classes). Missing ones discovered mid-flight via PlanPatcher.
+
+Fix: add to Stipulator system prompt: "If INITIAL_TEST_FAILURE is present, your first MAP
+step MUST be `bash: run the oracle test to see which specific names/classes currently fail`.
+All subsequent mutate steps must be grounded in that output."
+
+Costs one extra bash iter per task. Expected payoff: eliminates scope-miss failures on
+tasks like django-15161 (363K tokens, 39 iters, missed `Case`/`When`).
+
+### R31 — LocateBeforeMutate
+For mutate steps where `suggested_args.old_str` is long (>100c), prepend a locate substep
+that reads the file to confirm exact content. PlanPatcher auto-fills `old_str` from the
+read result before Performer runs str_replace. Kills the 3-6 iter rg/read churn loop.
+
+### R32 — MutateBudget
+If a single mutate node accumulates ≥3 *successful* str_replace calls AND verify still
+reports FAIL, auto-fire PlanPatcher with `BranchOp` to try a different approach. Stops
+the 6-edit corruption seen in django-13315.4.
+
+### R33 — RollbackOnCorrupted
+If verify produces `ImportError`/`SyntaxError`/`IndentationError` after a mutate phase,
+run `git checkout <file>` on the touched files and re-plan from scratch. The corrupted
+file state was the worst-case terminal failure mode (django-13315.4, astropy-13579 past
+runs).
+
+### R35 — VerifyStrict
+Capture bash exit code deterministically (already have it in `ToolResult`), and add it to
+the attestor's input as `[EXIT_CODE: N]`. For verify-intent steps, `exit_code != 0` →
+`complete=False` regardless of attestor LLM judgement. Closes the `--tb=short` invalid-
+flag silent-pass and all django runner `FAILED (failures=1)` false-positives.
 
 ## Roadmap
 
