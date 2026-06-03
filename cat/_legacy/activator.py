@@ -87,13 +87,16 @@ content")`. The `reason` is one sentence of context for the planner/\
 attestor — what info you're missing or why this tool serves the step \
 better. Silent tool-swapping without a reason is wrong. When you ARE \
 following the planner's suggestion, `reason` is optional.
-9. You have a bounded inner loop (up to 5 attempts). When you are CONFIDENT \
-the step's expected_result is satisfied, call `done(reason="...")` with a \
-specific explanation of what evidence confirms it. When you have hit a \
-FUNDAMENTAL BLOCKER (file not found, impossible task), call \
-`give_up(reason="...")`. Do NOT call give_up just because one attempt \
-failed — try at least 2 different approaches first. DO NOT call done() \
-speculatively — only when you have concrete evidence the step is complete.
+9. You have a bounded inner loop (up to 5 tool calls). You MUST call \
+`done(reason="...")` or `give_up(reason="...")` to exit the loop — \
+never leave a step without one of these signals. \
+CRITICAL: `reason` is MANDATORY and must be a SPECIFIC sentence citing \
+concrete evidence. Example: `done(reason="str_replace succeeded: \
+file now contains .distinct() after complex_filter()")`. An empty or \
+vague reason will be rejected and you will waste an attempt. \
+Call `give_up(reason="...")` only for a fundamental blocker that \
+multiple approaches cannot solve. Every step must end with done() or \
+give_up() — do not exhaust all 5 attempts without signalling.
 
 Tool-selection guidance (prefer the SPECIFIC tool over `bash`; one call is \
 cheaper than ten):

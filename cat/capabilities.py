@@ -340,17 +340,16 @@ PERFORMER_GIVE_UP_MARKER = "[PERFORMER_GIVE_UP]"
 
 def _h_done(args: dict[str, Any], state: State) -> ToolResult:
     reason = str(args.get("reason", "") or "").strip()
-    if len(reason) < 15:
-        # Pydantic-style rejection: empty/vague reason forces the LLM to retry
-        # with real evidence. The error message appears in the next inner-loop
-        # message so the Performer sees exactly what is required.
+    if not reason:
+        # Only reject truly empty reason. A non-empty reason (even brief) is
+        # accepted — the system prompt enforces quality; the handler enforces presence.
         return ToolResult(
             tool="done", is_error=True,
             output=(
-                "[ERROR] done() requires a specific `reason` (≥15 chars) citing "
-                "concrete evidence from your tool results — e.g. 'str_replace succeeded: "
-                "file now has .distinct() after complex_filter()'. "
-                f"Received: {reason!r}. Call done() again with a real justification."
+                "[ERROR] done() called with empty `reason`. You MUST provide a "
+                "specific reason citing concrete evidence, e.g.: "
+                "done(reason=\"str_replace succeeded — file now has .distinct() "
+                "after complex_filter()\"). Call done() again with a non-empty reason."
             ),
         )
     return ToolResult(tool="done", is_error=False,
