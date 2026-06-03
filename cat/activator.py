@@ -518,13 +518,16 @@ class Activator(_BaseActivator):
                 inv.attempt = attempt
                 all_invocations.append(inv)
 
-            # Check for exit signals
+            # Check for exit signals — only act on SUCCESSFUL done/give_up calls.
+            # A failed done() (is_error=True, e.g. empty reason) means the
+            # validation rejected it; the inner loop should continue so the
+            # Performer can call done() again with a real reason.
             done_inv = next(
                 (inv for inv in inner_outcome.invocations
-                 if inv.tool_name == "done"), None)
+                 if inv.tool_name == "done" and inv.succeeded), None)
             give_up_inv = next(
                 (inv for inv in inner_outcome.invocations
-                 if inv.tool_name == "give_up"), None)
+                 if inv.tool_name == "give_up" and inv.succeeded), None)
 
             if done_inv:
                 verdict = "completed"
