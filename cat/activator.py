@@ -660,19 +660,66 @@ class Activator(_BaseActivator):
         if run.restipulate_count > getattr(self, "max_restipulates_per_task", 2):  # type: ignore[attr-defined]
             return None
 
-        # Build failure context for the new Stipulator call
-        committed = []
-        if plan_tree:
-            for node_id, node in plan_tree.nodes.items():
-                if getattr(node, "committed", False) or getattr(node, "complete", False):
-                    committed.append(f"- {node_id}: {node.description[:100]}")
-        what_worked = "\n".join(committed) or "(none)"
+        # Build enriched knowledge-transfer context for the new Stipulator.
+        # Key insight: committed investigation steps contain real tool outputs
+        # (what was actually read/found). Pass those so the new plan can skip
+        # re-investigation and start directly at IMPLEMENT.
+        knowledge_lines: list[str] = []
+        committed_descs: list[str] = []
+
+        # Build iter→tool_outputs map from trace events
+        iter_outputs: dict[int, list[tuple[str, str]]] = {}
+        cur_iter_num: int = 0
+        try:
+            for ev in self.recorder.traj.events:
+                p = ev.payload or {}
+                if ev.kind == "capability_perform":
+                    cur_iter_num = p.get("iteration") or p.get("iter") or cur_iter_num
+                if ev.kind == "tool_result" and cur_iter_num:
+                    tool = p.get("tool", "")
+                    if tool not in ("done", "give_up"):
+                        out = (p.get("output") or "")[:400]
+                        if out:
+                            iter_outputs.setdefault(cur_iter_num, []).append((tool, out))
+        except Exception:
+            pass
+
+        # Map plan commits to iters + extract outputs
+        try:
+            committed_iters: set[int] = set()
+            for ev in self.recorder.traj.events:
+                p = ev.payload or {}
+                if ev.kind == "plan_commit":
+                    node_id = p.get("node_id")
+                    it = p.get("iter")
+                    if node_id and it:
+                        committed_iters.add(it)
+                        node = plan_tree.nodes.get(node_id) if plan_tree else None
+                        desc = getattr(node, "description", "") if node else ""
+                        intent = getattr(node, "intent", "?") if node else "?"
+                        committed_descs.append(f"- {node_id} [{intent}]: {desc[:80]}")
+                        outputs = iter_outputs.get(it, [])
+                        if outputs:
+                            best = max(outputs, key=lambda x: len(x[1]))
+                            knowledge_lines.append(
+                                f"- {node_id} [{intent}]: {desc[:80]}\n"
+                                f"  TOOL OUTPUT: [{best[0]}] {best[1][:300]}"
+                            )
+        except Exception:
+            pass
+
+        knowledge_str = "\n".join(knowledge_lines) if knowledge_lines else "\n".join(committed_descs) or "(none)"
 
         restip_context = (
             f"PRIOR PLAN FAILED. Reason: {diagnosis[:500]}\n\n"
-            f"WHAT WORKED (do not redo):\n{what_worked}\n\n"
-            f"Do NOT repeat the same approach. Make a fundamentally different plan "
-            f"that addresses the failure reason above."
+            f"KNOWLEDGE ALREADY ESTABLISHED — do NOT re-investigate, treat as facts:\n"
+            f"{knowledge_str}\n\n"
+            f"INSTRUCTIONS:\n"
+            f"- Skip any investigation step whose answer appears above\n"
+            f"- Start your plan from IMPLEMENT using the knowledge above\n"
+            f"- Use the exact file paths and function names shown in TOOL OUTPUT\n"
+            f"- End with: run the oracle test and confirm it exits 0\n"
+            f"- Make a plan that avoids the failure reason stated above"
         )
         try:
             new_plan_dict, llm_result = call_stipulator_phased(
