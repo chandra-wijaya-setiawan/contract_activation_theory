@@ -284,17 +284,32 @@ restipulate  → The plan PREMISE is wrong — wrong file, wrong class list, \
 give_up      → Unrecoverable. The task itself is impossible or the \
                environment is broken beyond repair.
 
+COST AWARENESS — restipulate and patch_plan are EXPENSIVE:
+- `complete` costs nothing extra. Prefer it when there is reasonable evidence.
+- `patch_plan` triggers one PlanPatcher LLM call. Use when the step needs a \
+  local fix (wrong args, wrong path) but the plan strategy is sound.
+- `restipulate` triggers a full re-plan LLM call AND resets all progress. \
+  Use ONLY when you have overwhelming evidence the plan PREMISE is wrong — \
+  not just that one step struggled. If restipulate_count is already ≥1, \
+  raise the bar significantly before choosing it again.
+- If Performer made a successful durable change (any file was modified), \
+  you MUST NOT choose restipulate. The Performer found the right place — \
+  choose complete or patch_plan instead.
+
 DECISION RULES:
 - If Performer verdict is "completed" AND expected_result is satisfied: → complete
+- If Performer verdict is "completed" AND durable_change=true: → complete \
+  (do not penalise a correct edit just because the file differs from the plan)
 - If Performer verdict is "completed" BUT plan's next steps seem misaligned \
-  with the goal (wrong files touched, wrong scope): → restipulate
+  with the goal (wrong files touched, wrong scope) AND durable_change=false: → restipulate
 - If Performer verdict is "exhausted" AND the approach seems right \
   (right file, right method, just stuck on args): → patch_plan
 - If Performer verdict is "exhausted" AND verify has failed 2+ times with the \
-  same error, or the files modified don't match what the tests exercise: → restipulate
+  same error, or the files modified don't match what the tests exercise, \
+  AND restipulate_count=0: → restipulate
+- If restipulate_count ≥ 1: strongly prefer patch_plan over restipulate
 - If Performer verdict is "give_up": → restipulate (try fresh plan) or give_up
-- Always provide `diagnosis` for patch_plan and restipulate — be specific \
-  about what is wrong so the PlanPatcher / new Stipulator can act on it.
+- Always provide `diagnosis` for patch_plan and restipulate.
 
 Output ONLY a JSON object:
 {
@@ -361,6 +376,9 @@ def call_attestor(
     prev_steps_summary: str = "",
     next_steps_summary: str = "",
     obligation_brief: str = "",
+    restipulate_count: int = 0,
+    patch_plan_count: int = 0,
+    performer_durable_change: bool = False,
     parent_event_id: Optional[str] = None,
 ) -> tuple[str, str, str, LLMResult]:
     """Plan-aware Attestor (R37). Returns (verdict, reason, diagnosis, result).
@@ -376,6 +394,12 @@ def call_attestor(
     if obligation_brief:
         plan_context += f"\nOVERALL GOAL:\n{obligation_brief}"
 
+    cost_context = (
+        f"\nCOST COUNTERS (already paid this run):\n"
+        f"  restipulate_count={restipulate_count}  patch_plan_count={patch_plan_count}\n"
+        f"  performer_durable_change={performer_durable_change}  "
+        f"{'(file was modified — do NOT choose restipulate)' if performer_durable_change else ''}"
+    )
     user_content = (
         f"PERFORMER RESULT:\n"
         f"  verdict: {performer_verdict}\n"
@@ -383,6 +407,7 @@ def call_attestor(
         f"CURRENT STEP:\n{step_description}\n\n"
         f"TOOL OUTPUTS (recent):\n{state_summary}"
         f"{plan_context}"
+        f"{cost_context}"
     )
     messages = [
         {"role": "system", "content": ATTESTOR_SYSTEM_PROMPT},
@@ -403,6 +428,16 @@ def call_attestor(
         v = AttestorVerdict.model_validate_json(result.text)
         verdict_str = getattr(v, "verdict", "complete" if v.complete else "patch_plan")
         diagnosis = getattr(v, "diagnosis", "")
+
+        # Hard guard: if Performer made a durable change, restipulate is
+        # forbidden — the Performer found and modified the right place.
+        # Override to patch_plan so progress is not discarded.
+        if performer_durable_change and verdict_str == "restipulate":
+            verdict_str = "patch_plan"
+            diagnosis = (
+                f"[GUARD: restipulate blocked — durable change was made] {diagnosis}"
+            )[:500]
+
         return verdict_str, v.reason[:300], diagnosis[:500], result
     except ValidationError:
         return "patch_plan", "attestor schema validation failed", "", result

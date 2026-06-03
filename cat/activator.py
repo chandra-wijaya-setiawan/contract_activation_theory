@@ -1481,6 +1481,8 @@ class Activator(_BaseActivator):
                 except Exception:
                     pass
 
+            outcome = getattr(run, "last_outcome", None)
+            performer_durable = bool(outcome and outcome.any_durable_change)
             verdict, reason, diagnosis, llm_result = call_attestor(
                 self.llm,
                 step_description=step_desc,
@@ -1490,6 +1492,9 @@ class Activator(_BaseActivator):
                 prev_steps_summary=prev_summary,
                 next_steps_summary=next_summary,
                 obligation_brief=(contract.obligation or "")[:400],
+                restipulate_count=getattr(run, "restipulate_count", 0),
+                patch_plan_count=getattr(run, "patch_plan_count", 0),
+                performer_durable_change=performer_durable,
                 parent_event_id=run.last_perform_event_id or run.last_iter_anchor,
             )
             self._charge_llm(contract, llm_result)
