@@ -681,6 +681,13 @@ class Activator(_BaseActivator):
             )
             self._charge_llm(contract, llm_result)
             if not new_plan_dict:
+                self.recorder.append(TraceEvent(
+                    event_id=f"restip-fail-{uuid.uuid4().hex[:6]}",
+                    parent_id=run.last_stipulate_event_id,
+                    ts=utcnow_iso(),
+                    kind="plan_restipulate_failed",
+                    payload={"reason": "stipulator returned no plan"},
+                ))
                 return None
             new_tree = PlanTree.from_phased_plan(new_plan_dict)
             self.recorder.append(TraceEvent(
@@ -695,7 +702,18 @@ class Activator(_BaseActivator):
                 },
             ))
             return new_tree
-        except Exception:
+        except Exception as exc:
+            import traceback
+            self.recorder.append(TraceEvent(
+                event_id=f"restip-err-{uuid.uuid4().hex[:6]}",
+                parent_id=run.last_stipulate_event_id,
+                ts=utcnow_iso(),
+                kind="plan_restipulate_failed",
+                payload={
+                    "error": str(exc)[:300],
+                    "trace": traceback.format_exc()[:500],
+                },
+            ))
             return None
 
     def _extract_performer_outcome(

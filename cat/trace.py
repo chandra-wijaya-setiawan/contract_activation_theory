@@ -47,6 +47,9 @@ EventKind = Literal[
     "plan_patch",                  # PlanPatcher emitted tree-edit ops (was: stipulate_inloop)
     "stipulate_inloop",        # legacy alias for "plan_patch" — pre-rename traces
     "performer_response",      # full Performer text + tools called (added for LLM-reasoning visibility)
+    "performer_give_up",       # R38: Performer gave up on a step
+    "plan_restipulate",        # R37: full re-stipulate with failure context
+    "plan_restipulate_failed", # R37: restipulate attempted but failed
     # Legacy aliases (kept readable for pre-rename traces):
     "contract_decompose",      # legacy alias for contract_stipulate
     "capability_invoke",       # legacy alias for capability_perform
