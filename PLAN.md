@@ -28,54 +28,183 @@ in **docs/PRD/**.
 | **v1.8 R27** | **✅ 2026-06-02** | **request_revision → `reason` tool arg; swe5x5 = 17/25 (68%), +16pp vs R26** |
 | **v1.8 R29** | **✅ 2026-06-02** | **deterministic tool error → skip attestor → Resolver; swe500-partial +12pp (36%→48%)** |
 
-## Next — R-chain (ordered by expected ROI)
+## Next — R37 + R38 (two architectural abstractions)
 
-| R# | Name | Pattern it kills | Size | Status |
-|---|---|---|---|---|
-| **R30** | **OracleFirstPlan** | Stipulator scope-miss (django-15161: listed wrong classes) | S | 🎯 next |
-| **R31** | **LocateBeforeMutate** | Stipulator old_str hallucination (A Pattern) | M | pending |
-| **R32** | **MutateBudget** | N successful str_replace on 1 node + verify still fails → BranchOp | S | pending |
-| **R33** | **RollbackOnCorrupted** | ImportError/SyntaxError after mutate → git checkout + re-plan | S | pending |
-| **R34** | **MultiCandidatePlan** | Wrong-file anchor (C Pattern, django-13315) | L | deferred |
-| **R35** | **VerifyStrict** | False-positive verify (B Pattern, test runner exit code) | S | pending |
-| **R36** | **TrueRestipulate** | Whole-plan-wrong: Resolver calls full re-stipulate with failure context | M | deferred |
+All previous surgical R30-R36 fixes (OracleFirstPlan, LocateBeforeMutate, MutateBudget,
+RollbackOnCorrupted, MultiCandidatePlan, VerifyStrict, TrueRestipulate) collapse into two
+root-cause abstractions. Implementing these two generalizes the fix for all those symptoms.
 
-### R30 — OracleFirstPlan (next)
-When `INITIAL_TEST_FAILURE` is present in representations (it always is for SWE-bench),
-the Stipulator should run the oracle test **as the first MAP step** to discover *which*
-classes/functions actually fail — not hallucinate a list from training data.
+---
 
-Current behavior: Stipulator reads the issue text and guesses the list of affected classes
-(e.g. C1-C6 for 6 expression classes). Missing ones discovered mid-flight via PlanPatcher.
+### R37 — Full Restipulate (plan-level recovery)
 
-Fix: add to Stipulator system prompt: "If INITIAL_TEST_FAILURE is present, your first MAP
-step MUST be `bash: run the oracle test to see which specific names/classes currently fail`.
-All subsequent mutate steps must be grounded in that output."
+**Problem.** `patch_plan` (the current Resolver decision) calls PlanPatcher to edit nodes
+locally. But many failures have a wrong *premise* — wrong file, wrong class list, whole
+approach off. Local node edits can't fix a wrong premise. The agent keeps patching until it
+hits `max_restip_per_task` and gives up.
 
-Costs one extra bash iter per task. Expected payoff: eliminates scope-miss failures on
-tasks like django-15161 (363K tokens, 39 iters, missed `Case`/`When`).
+Examples that would have been fixed:
+- django-15161: Stipulator guessed 6 expression classes, missed `Case`/`When`. 39 iters,
+  363K tokens. PlanPatcher spawned C7-C11 as more guesses — still wrong.
+- django-13315 (fail trials): Stipulator anchored wrong file. All patches operated on the
+  wrong file.
+- astropy-13579 (R27 baseline): Wrong file path on line 1. 4 PlanPatcher firings, all
+  trying to salvage an unfixable plan.
 
-### R31 — LocateBeforeMutate
-For mutate steps where `suggested_args.old_str` is long (>100c), prepend a locate substep
-that reads the file to confirm exact content. PlanPatcher auto-fills `old_str` from the
-read result before Performer runs str_replace. Kills the 3-6 iter rg/read churn loop.
+**What full restipulate is NOT:** calling PlanPatcher. It is calling `call_stipulator_phased`
+again — a fresh plan from scratch — but with the failure context injected.
 
-### R32 — MutateBudget
-If a single mutate node accumulates ≥3 *successful* str_replace calls AND verify still
-reports FAIL, auto-fire PlanPatcher with `BranchOp` to try a different approach. Stops
-the 6-edit corruption seen in django-13315.4.
+**Design.**
 
-### R33 — RollbackOnCorrupted
-If verify produces `ImportError`/`SyntaxError`/`IndentationError` after a mutate phase,
-run `git checkout <file>` on the touched files and re-plan from scratch. The corrupted
-file state was the worst-case terminal failure mode (django-13315.4, astropy-13579 past
-runs).
+1. **New Resolver decision: `restipulate`** (already reserved in `ResolverDecision` Literal
+   since R15a but never chosen). Decision logic:
+   - Choose `restipulate` when `patch_plan_count >= 3 AND stall_count > threshold`
+   - Or when `deterministic_error` implies wrong-file (e.g. "No such file or directory")
+   - Or when verify failure implies scope-miss (the test cites a class not in any mutate step)
+   - Cap: `max_restipulates_per_task = 2` (separate from `max_restip_per_task` which governs PlanPatcher)
 
-### R35 — VerifyStrict
-Capture bash exit code deterministically (already have it in `ToolResult`), and add it to
-the attestor's input as `[EXIT_CODE: N]`. For verify-intent steps, `exit_code != 0` →
-`complete=False` regardless of attestor LLM judgement. Closes the `--tb=short` invalid-
-flag silent-pass and all django runner `FAILED (failures=1)` false-positives.
+2. **Activator handles `restipulate` decision:**
+   ```
+   decision == "restipulate":
+     → build RestipulateContext (failure_summary + anti_template + run.messages[:K])
+     → call call_stipulator_phased(obligation, restipulate_context)
+     → replace plan_tree with new plan
+     → reset attention to A1, reset run_counts, keep run.messages (continuity)
+     → bump run.restipulate_count
+   ```
+
+3. **RestipulateContext injected into Stipulator prompt:**
+   - `failure_summary`: last test output + which files were touched + which errors occurred
+   - `anti_template`: prior plan's phases/steps that failed (so the new plan avoids same structure)
+   - `what_worked`: any steps that already PASSED attestor (don't redo these)
+
+4. **`run.messages` persist.** The new Stipulator call sees the obligation but NOT the
+   message history. The Performer still sees the full message history — so it knows what
+   was already read/tried and doesn't repeat.
+
+**Key difference from PlanPatcher:**
+
+| | PlanPatcher (`patch_plan`) | Full Restipulate (`restipulate`) |
+|---|---|---|
+| Scope | One or a few nodes | Entire plan tree |
+| Input | Current plan tree + error | Original obligation + failure summary |
+| Output | Tree edit ops (RefineOp, BranchOp, etc.) | New `PhasedPlanSchema` |
+| When | Local step failure, wrong args | Wrong premise, wrong file, scope miss |
+| Cost | 2 LLM calls (Resolver + PlanPatcher) | 2 LLM calls (Resolver + Stipulator) |
+
+Same LLM cost, much wider recovery.
+
+**Files to change:**
+- `cat/resolver.py`: add `restipulate` to `ResolverDecision` Literal; update Resolver
+  system prompt to guide when to choose it; update `enforce_guards` to handle the new path.
+- `cat/activator.py`: handle `restipulate` branch in the Resolver output dispatch;
+  add `run.restipulate_count`; add `max_restipulates_per_task` guard; build
+  `RestipulateContext` from recent trace events.
+- `cat/llm.py`: `call_stipulator_phased` already exists — just needs a `restipulate_context`
+  optional arg that enriches the prompt.
+
+**Estimated size:** ~150 LOC across 3 files. 0 new schemas needed.
+
+---
+
+### R38 — Performer Inner React Loop (action-level self-correction)
+
+**Problem.** The Performer today executes exactly ONE LLM call → ONE tool call per logical
+iteration, then immediately hands off to the attestor → Resolver pipeline. This means every
+micro-failure (wrong old_str, missing file, transient error) pays the full orchestration
+tax: attestor LLM call + potential Resolver LLM call + potential PlanPatcher LLM call.
+
+But most micro-failures are self-correctable in 1-2 additional tool calls: read the file →
+see the actual content → str_replace with correct content. The model has the capacity; the
+framework doesn't give it the chance.
+
+Examples that would have been fixed:
+- django-13315 (all fail trials): 3-6 iters of rg/read before str_replace landed, because
+  each failed str_replace went through attestor+Resolver before the next try.
+- astropy-13579 (R27): `# placeholder` line written, bash errored, Performer read the file
+  again — but couldn't just immediately fix the error; had to wait for the next outer iter.
+- Every `old_str not found` error: Performer knows it needs to read-then-retry, but the
+  framework forces it to wait for full orchestration before the next attempt.
+
+**Design.**
+
+The outer loop in `run()` currently:
+```
+while iterations < max:
+    _perform_once()      ← one LLM call → one tool call
+    _extract_outcome()
+    _observe_phase()     ← attestor → maybe Resolver
+```
+
+R38 changes `_perform_once` into `_perform_loop`:
+```
+while iterations < max:
+    _perform_loop(max_inner=3)   ← up to 3 tool calls, LLM sees each result
+    _extract_outcome()           ← summarize all inner calls
+    _observe_phase()             ← attestor only sees final state
+```
+
+`_perform_loop` internals:
+```
+for inner in range(max_inner):
+    call Performer LLM       # LLM sees all tool results so far in messages
+    dispatch tool calls
+    if any_durable_change:   # str_replace / write succeeded → stop, commit the change
+        break
+    if not any_tool_errored: # clean success (read/rg/bash all ok) → stop, hand to attestor
+        break
+    # error: give Performer one more shot to self-correct
+    # (don't break — continue inner loop)
+```
+
+Exit conditions:
+- **Durable change made** → stop. The mutation landed; attestor should evaluate.
+- **No errors** → stop. Clean reads/searches; attestor evaluates.
+- **Max inner reached** → stop, escalate normally to attestor → Resolver.
+- **Performer emits no tool call** → stop (model says done).
+
+The outer `run.iterations` counter increments ONCE per `_perform_loop` call — the inner
+calls are invisible to the outer loop's stall/max_iterations accounting.
+
+**What the attestor sees:** exactly the same as today — the last tool outputs. The inner
+loop just means those outputs reflect a sequence of self-correcting actions, not always
+just one.
+
+**Cost model:**
+- Worst case (all 3 inner calls): +2 Performer LLM calls per iter, but saves
+  attestor + Resolver + PlanPatcher calls that would otherwise fire.
+- Typical case: inner loop exits after 1-2 calls. Net cost close to neutral.
+- Best case: Performer self-corrects without Resolver firing at all. Saves
+  2-3 LLM calls and multiple outer iters.
+
+**Key constraint:** `max_inner=3` is conservative. If all 3 inner calls fail (3x
+`old_str not found`), the outer loop still escalates normally to the Resolver. R38 adds
+a self-correction window; it doesn't replace the Resolver.
+
+**Interaction with R29 (deterministic error):**
+R29 fires on the *outer* iter's outcome: if `any_tool_errored` in the final `OutcomeSchema`,
+skip attestor and go to Resolver. With R38, `any_tool_errored` reflects the last inner
+call. If the Performer self-corrected in inner calls (3rd call succeeded), R29 does NOT
+fire — the outer outcome is clean. If all inner calls errored, R29 fires as normal.
+
+**Files to change:**
+- `cat/activator.py`: rename `_perform_once` call site to `_perform_loop`; add inner loop
+  logic; `_extract_performer_outcome` already handles multi-call message slices.
+- `cat/_legacy/activator.py` (PERFORMER_SYSTEM_PROMPT): add rule: "If your tool call
+  fails, diagnose the error and call the corrected tool in your NEXT response — you have
+  up to 3 attempts before the planner steps in."
+
+**Estimated size:** ~40 LOC in activator.py + 2 prompt lines. Smallest architectural
+change; highest expected token efficiency gain.
+
+---
+
+### Implementation order
+
+R38 first (smaller, self-contained, no schema changes, immediately testable via trace).
+R37 second (needs RestipulateContext design + resolver prompt tuning).
+
+Together they replace all of R30-R36 with two general mechanisms.
 
 ## Roadmap
 
