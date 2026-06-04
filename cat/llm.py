@@ -311,6 +311,18 @@ DECISION RULES:
 - If Performer verdict is "give_up": → restipulate (try fresh plan) or give_up
 - Always provide `diagnosis` for patch_plan and restipulate.
 
+SPECIAL RULES (override the above):
+- DESIGN STEP WITH NO WORK TOOLS: if intent=design and Performer only called \
+  done() with no read/rg/bash/str_replace before it → patch_plan. A design \
+  step must show evidence of deliberation. done() alone is not a decision artifact.
+- VERIFY IMPORT/SYNTAX ERROR: if verify fails with ImportError or SyntaxError \
+  → patch_plan (bad edit, not wrong approach). restipulate only if it persists \
+  after 2+ patch_plan attempts. Do NOT classify a SyntaxError as "environment issue".
+- VERIFY REASON MUST BE SPECIFIC: when deciding on a verify step, your `reason` \
+  MUST name the specific failing test and error. "Pre-existing environment issues" \
+  or "environment problems" are NOT acceptable — examine whether the specific \
+  test was affected by the Performer's edit.
+
 Output ONLY a JSON object:
 {
   "verdict": "complete" | "patch_plan" | "restipulate" | "give_up",
