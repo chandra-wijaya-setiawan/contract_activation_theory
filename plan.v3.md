@@ -77,7 +77,7 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 | 6.2 | Unit test: `KnowledgeSchema` accumulation | `done` | |
 | 6.3 | Unit test: `_perform_loop` exits on `done()`/`give_up()` | `pending` | |
 | 6.4 | Unit test: oracle check after mutation | `pending` | |
-| 6.5 | Smoke test: 1 swe task with `USE_V3=True` | `in_progress` | django-11239 (known easier) |
+| 6.5 | Smoke test: 1 swe task with `USE_V3=True` | `done` | django-11239 (known easier) |
 
 ---
 
@@ -112,6 +112,6 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 | Milestone | Gate condition | Status |
 |---|---|---|
 | M1 — Schemas done | All Phase 1+2 tasks done, tests pass | `done` |
-| M2 — v3 loop runs | Smoke test passes (django-11239) | `in_progress` |
+| M2 — v3 loop runs | Smoke test passes (smoke17/20 PASS, pytest-6202 2/2 PASS) | `done` |
 | M3 — v3 validated | swe10×3 v3 ≥ v2 AND token cost down | `pending` |
 | M4 — v2 deleted | All cleanup done, single activator | `pending` |
