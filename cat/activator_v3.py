@@ -38,7 +38,7 @@ from cat.schemas import (
 )
 from cat.trace import TraceEvent, utcnow_iso
 
-MAX_HYPOTHESES = 3
+MAX_HYPOTHESES = 5
 MAX_INNER_ATTEMPTS = 5
 
 
