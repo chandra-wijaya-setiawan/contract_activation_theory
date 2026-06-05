@@ -1053,7 +1053,9 @@ def call_stipulator_v3(
         lines: list[str] = []
         for r in representations:
             evidence_lines = (r.evidence or "").strip().splitlines()
-            preview = "\n    ".join(ln for ln in evidence_lines[:8] if ln.strip())
+            # Show more lines for high-signal reps (initial_test_failure)
+            n_lines = 30 if "initial_test" in (r.key or "") else 12
+            preview = "\n    ".join(ln for ln in evidence_lines[:n_lines] if ln.strip())
             lines.append(f"  {r.key}:\n    {preview}")
         env_section = "\n\nENVIRONMENT (verified facts):\n" + "\n\n".join(lines)
 
