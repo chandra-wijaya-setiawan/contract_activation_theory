@@ -249,12 +249,18 @@ class ActivatorV3(Activator):
         if task.context:
             hypothesis_prompt += f"\nCONTEXT (already known — do not re-investigate):\n{task.context}\n"
 
-        # Inject as user message
-        run.messages.append({"role": "user", "content": hypothesis_prompt})
+        # V3 inner loop uses its own isolated message thread.
+        # Does NOT use run.messages (which is the v2 flat-plan thread).
+        # The Performer sees: system prompt + hypothesis task + accumulated tool results.
+        inner_messages: list[dict] = [
+            {"role": "user", "content": hypothesis_prompt}
+        ]
 
         all_invocations: list[ToolInvocation] = []
         verdict = "exhausted"
         performer_reason = ""
+
+        tools = self.registry.tool_schemas(only=run.grant) if self.registry else []
 
         for attempt in range(1, task.max_attempts + 1):
             if not self._check_budget(contract, state, run):
@@ -262,28 +268,91 @@ class ActivatorV3(Activator):
                 performer_reason = "budget exhausted"
                 break
 
-            iter_start = len(run.messages)
+            # Direct LLM call with isolated message thread
+            messages = [
+                {"role": "system", "content": PERFORMER_V3_SYSTEM_PROMPT},
+            ] + inner_messages
 
-            # Inject system prompt for first attempt
-            if attempt == 1:
-                messages = [
-                    {"role": "system", "content": PERFORMER_V3_SYSTEM_PROMPT},
-                ] + run.messages
-            else:
-                messages = [
-                    {"role": "system", "content": PERFORMER_V3_SYSTEM_PROMPT},
-                ] + run.messages
+            llm_result = self.llm.chat(
+                messages=messages,
+                tools=tools,
+                tool_choice="required",
+                role_tag="performer",
+                temperature=0.2,
+                parent_event_id=run.last_perform_event_id or run.last_state_event_id,
+            )
+            self._charge_llm(contract, llm_result)
+            run.last_perform_event_id = f"perf-v3-{uuid.uuid4().hex[:6]}"
 
-            # One LLM call
-            keep_going = self._perform_once_with_messages(contract, state, run, messages)
+            # Build assistant message
+            asst_msg: dict = {"role": "assistant", "content": llm_result.text or ""}
+            tool_calls_raw = llm_result.tool_calls or []
+            if tool_calls_raw:
+                asst_msg["tool_calls"] = tool_calls_raw
+            inner_messages.append(asst_msg)
 
-            # Extract invocations from this attempt
-            inner_outcome = self._extract_performer_outcome(run, iter_start)
-            for inv in inner_outcome.invocations:
-                inv.attempt = attempt
+            # Dispatch tool calls
+            iter_invocations: list[ToolInvocation] = []
+            keep_going = bool(tool_calls_raw)
+
+            for tc in tool_calls_raw:
+                tc_id = tc.get("id", f"tc-{uuid.uuid4().hex[:6]}")
+                fn = tc.get("function", {}) or {}
+                tool_name = fn.get("name", "")
+                args_raw = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+                except Exception:
+                    args = {}
+
+                # Dispatch to registry
+                tr = self.registry.invoke(
+                    tool_name, args, state,
+                    recorder=self.recorder,
+                    contract_id=contract.id,
+                    tool_call_id=tc_id,
+                    parent_event_id=run.last_perform_event_id,
+                )
+                self._charge_tool(contract, tr)
+
+                content = tr.output if not tr.is_error else f"[ERROR] {tr.output}"
+                inner_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": content,
+                })
+
+                # Build InvocationSchema
+                is_err = tr.is_error
+                durable = not is_err and tool_name in ("str_replace", "multi_edit", "apply_patch", "write")
+                files: list[str] = []
+                if durable:
+                    path = args.get("path") or ""
+                    if path:
+                        files.append(path)
+
+                reason_arg = args.pop("reason", "") if isinstance(args, dict) else ""
+                inv = ToolInvocation(
+                    tool_name=tool_name,
+                    args=args,
+                    reason=str(reason_arg)[:300],
+                    attempt=attempt,
+                    succeeded=not is_err,
+                    execution_status="error" if is_err else "success",
+                    output_text=content[:3000],
+                    error=content[7:300] if is_err else "",
+                    durable_change=durable,
+                    files_modified=files,
+                )
+                iter_invocations.append(inv)
                 all_invocations.append(inv)
 
-            self._charge_llm_from_run(contract, run, iter_start)
+            # Build outcome for this attempt
+            inner_outcome = PerformerOutcome(
+                text_response=llm_result.text or "",
+                invocations=iter_invocations,
+                finish_reason="tool_calls" if tool_calls_raw else "stop",
+            )
 
             # Check for exit signals (only successful done/give_up)
             done_inv = next(
