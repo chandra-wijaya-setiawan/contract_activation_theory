@@ -487,9 +487,15 @@ class ActivatorV3(Activator):
         if not knowledge.findings:
             return ""
         lines = []
-        for loc, finding in list(knowledge.findings.items())[:8]:
-            lines.append(f"- {loc}: {str(finding)[:150]}")
-        return "\n".join(lines)
+        # Negative findings first — most important for Stipulator
+        for loc, finding in knowledge.findings.items():
+            if loc.startswith("NOT_FOUND:"):
+                lines.append(f"⚠️  {finding}")
+        # Then positive findings
+        for loc, finding in list(knowledge.findings.items())[:6]:
+            if not loc.startswith("NOT_FOUND:"):
+                lines.append(f"- {loc}: {str(finding)[:150]}")
+        return "\n".join(lines[:10])
 
     def _update_knowledge(
         self,
@@ -501,8 +507,16 @@ class ActivatorV3(Activator):
         for inv in result.invocations:
             if inv.tool_name in ("read", "rg", "bash", "goto_def") and inv.succeeded:
                 key = inv.args.get("path") or inv.args.get("pattern") or inv.tool_name
-                if inv.output_text and len(inv.output_text) > 20:
-                    knowledge.findings[str(key)[:60]] = inv.output_text[:300]
+                out = inv.output_text
+                if out and len(out) > 20:
+                    knowledge.findings[str(key)[:60]] = out[:400]
+                    # Explicit negative: if rg returns 0 matches, record it prominently
+                    if inv.tool_name == "rg" and "0 matches" in out:
+                        pattern = inv.args.get("pattern", "?")
+                        knowledge.findings[f"NOT_FOUND:{pattern}"] = (
+                            f"Pattern '{pattern}' does NOT exist in codebase. "
+                            f"Do NOT generate hypotheses using this name."
+                        )
             if inv.durable_change:
                 for f in inv.files_modified:
                     knowledge.findings[f"modified:{f}"] = f"changed by: {inv.tool_name}"
