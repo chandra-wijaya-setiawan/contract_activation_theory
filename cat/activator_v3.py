@@ -40,6 +40,9 @@ from cat.trace import TraceEvent, utcnow_iso
 
 MAX_HYPOTHESES = 5
 MAX_INNER_ATTEMPTS = 5
+# Per-hypothesis tool call budget. Checked after each LLM dispatch.
+# v3 inner loop calls tools directly; budget enforced here not in base _check_budget.
+MAX_TOOLS_PER_HYPOTHESIS = 25
 
 
 class ActivatorV3(Activator):
@@ -259,10 +262,15 @@ class ActivatorV3(Activator):
         all_invocations: list[ToolInvocation] = []
         verdict = "exhausted"
         performer_reason = ""
+        hypothesis_tool_count = 0  # local budget per hypothesis
 
         tools = self.registry.tool_schemas(only=run.grant) if self.registry else []
 
         for attempt in range(1, task.max_attempts + 1):
+            if hypothesis_tool_count >= MAX_TOOLS_PER_HYPOTHESIS:
+                verdict = "exhausted"
+                performer_reason = f"per-hypothesis tool budget ({MAX_TOOLS_PER_HYPOTHESIS}) reached"
+                break
             if not self._check_budget(contract, state, run):
                 verdict = "exhausted"
                 performer_reason = "budget exhausted"
@@ -307,6 +315,7 @@ class ActivatorV3(Activator):
             keep_going = bool(tool_calls_raw)
 
             for tc in tool_calls_raw:
+                hypothesis_tool_count += 1
                 # LLMResult.tool_calls format: {"id", "name", "arguments": dict}
                 tc_id = tc.get("id", f"tc-{uuid.uuid4().hex[:6]}")
                 tool_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
