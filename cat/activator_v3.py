@@ -378,6 +378,7 @@ class ActivatorV3(Activator):
                 performer_reason = (
                     done_inv.args.get("reason", "")
                     or done_inv.output_text.replace(PERFORMER_DONE_MARKER, "").strip()
+                    or "Performer signalled done"
                 )
                 break
 
@@ -386,6 +387,7 @@ class ActivatorV3(Activator):
                 performer_reason = (
                     give_up_inv.args.get("reason", "")
                     or give_up_inv.output_text.replace(PERFORMER_GIVE_UP_MARKER, "").strip()
+                    or "Performer signalled give_up"
                 )
                 break
 
@@ -394,12 +396,18 @@ class ActivatorV3(Activator):
                 performer_reason = "Performer stopped (implicit done)"
                 break
 
-            # Oracle check after any durable change
+            # Auto-detect: successful durable change → treat as "completed"
+            # This handles models that don't reliably call done() explicitly
             if inner_outcome.any_durable_change and not inner_outcome.any_tool_errored:
+                verdict = "completed"
+                performer_reason = (
+                    f"Durable change made via "
+                    f"{[i.tool_name for i in inner_outcome.invocations if i.durable_change]}"
+                )
+                # Also check oracle immediately
                 if self._verify_criteria(contract, state, run):
-                    verdict = "completed"
-                    performer_reason = "oracle passed after durable change"
-                    break
+                    performer_reason += " — oracle passed"
+                break
 
         else:
             # Exhausted — summarisation call
