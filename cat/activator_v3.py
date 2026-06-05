@@ -554,19 +554,38 @@ class ActivatorV3(Activator):
         oracle_cmd: str,
     ) -> None:
         """Extract key findings from the Performer's tool results."""
+        import re
         for inv in result.invocations:
             if inv.tool_name in ("read", "rg", "bash", "goto_def") and inv.succeeded:
                 key = inv.args.get("path") or inv.args.get("pattern") or inv.tool_name
                 out = inv.output_text
                 if out and len(out) > 20:
                     knowledge.findings[str(key)[:60]] = out[:600]
-                    # Explicit negative: if rg returns 0 matches, record it prominently
+
+                    # Extract actual method/function/class names from file reads
+                    # so the Stipulator knows WHAT IS THERE, not just what isn't
+                    if inv.tool_name == "read":
+                        names = re.findall(r'\bdef (\w+)\b', out)
+                        classes = re.findall(r'\bclass (\w+)\b', out)
+                        if names or classes:
+                            found_str = ", ".join(
+                                [f"class {c}" for c in classes[:3]] +
+                                [f"def {n}" for n in names[:5]]
+                            )
+                            file_key = str(key)[:40]
+                            knowledge.findings[f"FOUND_IN:{file_key}"] = (
+                                f"Actual names in file: {found_str}. "
+                                f"Use THESE names in your hypothesis, not others."
+                            )
+
+                    # Explicit negative: rg 0 matches
                     if inv.tool_name == "rg" and "0 matches" in out:
                         pattern = inv.args.get("pattern", "?")
                         knowledge.findings[f"NOT_FOUND:{pattern}"] = (
-                            f"Pattern '{pattern}' does NOT exist in codebase. "
+                            f"'{pattern}' does NOT exist anywhere. "
                             f"Do NOT generate hypotheses using this name."
                         )
+
             if inv.durable_change:
                 for f in inv.files_modified:
                     knowledge.findings[f"modified:{f}"] = f"changed by: {inv.tool_name}"
