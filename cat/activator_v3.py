@@ -56,8 +56,9 @@ class ActivatorV3(Activator):
         """v3 discharge loop: stipulate hypothesis → perform → oracle → repeat."""
         run = ActivatorRun(contract=contract, state=state)
 
-        # Represent + admit (reuse base)
-        self._represent(contract, state, run)
+        # Represent (run env probes) + admit (check gate)
+        # _represent is not a method — probe dispatch is done inside _admit via
+        # contract.representations which are pre-populated by TbSweAgent.
         decision = self._admit(contract, state, run)
         if not decision.ok:
             self._apply_admission_failure(contract, run, decision)
