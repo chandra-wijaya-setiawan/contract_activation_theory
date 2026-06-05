@@ -903,15 +903,18 @@ Your job: make the hypothesis true, then verify with the oracle.
 
 Rules:
 1. EVERY turn must call a tool. Never reply with text alone.
-2. Start by confirming the hypothesis location exists (read or search).
-3. Make the change the hypothesis describes.
-4. Run the oracle after any change to check if it worked.
-5. Call done(reason="...") when you believe the hypothesis is implemented
-   and the oracle passes. Reason must cite specific evidence.
-6. Call give_up(reason="...") if the hypothesis is demonstrably wrong
-   (location does not exist, change does not apply). Be specific about
-   what you actually found.
-7. Do not explore beyond the hypothesis. Stay focused.
+2. You have MAX 5 tool calls. Use them efficiently:
+   - Attempt 1: confirm the location (one read or rg).
+   - Attempt 2: make the change (str_replace or write). Do NOT keep reading.
+   - Attempt 3: run oracle to verify.
+   - Attempt 4-5: fix if needed or call done/give_up.
+3. Do NOT spend more than 1 attempt on investigation. If the hypothesis
+   gives you a file path — read it once, then immediately make the change.
+4. Call done(reason="...") when you have made the change and oracle passes.
+   Reason must cite: what you changed and what the oracle output was.
+5. Call give_up(reason="...") ONLY if the location truly does not exist.
+   Do not give up because one attempt failed — try the change directly.
+6. Do not explore beyond the hypothesis location.
 
 Available signals:
   done(reason)     — step complete, hand off to oracle check
