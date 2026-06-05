@@ -483,19 +483,30 @@ class ActivatorV3(Activator):
         return "cd /testbed && python -m pytest --tb=short -q 2>&1 | tail -20"
 
     def _build_context(self, knowledge: KnowledgeSchema) -> str:
-        """Compress knowledge into a short context string for the Performer."""
+        """Compress knowledge into context string for the Stipulator.
+
+        Shows NOT_FOUND warnings first (highest priority), then file
+        content (so Stipulator sees actual method names), then other findings.
+        """
         if not knowledge.findings:
             return ""
         lines = []
-        # Negative findings first — most important for Stipulator
+        # 1. Negative findings — highest priority
         for loc, finding in knowledge.findings.items():
             if loc.startswith("NOT_FOUND:"):
                 lines.append(f"⚠️  {finding}")
-        # Then positive findings
-        for loc, finding in list(knowledge.findings.items())[:6]:
-            if not loc.startswith("NOT_FOUND:"):
-                lines.append(f"- {loc}: {str(finding)[:150]}")
-        return "\n".join(lines[:10])
+
+        # 2. File reads — show enough to reveal actual method names
+        for loc, finding in knowledge.findings.items():
+            if not loc.startswith("NOT_FOUND:") and ("client.py" in loc or "read" == loc):
+                lines.append(f"FILE CONTENT of {loc}:\n{str(finding)[:500]}")
+                break  # one file is enough
+
+        # 3. Oracle failures
+        for f in knowledge.oracle_failures[-2:]:
+            lines.append(f"ORACLE FAILURE: {f[:200]}")
+
+        return "\n".join(lines[:8])
 
     def _update_knowledge(
         self,
@@ -509,7 +520,7 @@ class ActivatorV3(Activator):
                 key = inv.args.get("path") or inv.args.get("pattern") or inv.tool_name
                 out = inv.output_text
                 if out and len(out) > 20:
-                    knowledge.findings[str(key)[:60]] = out[:400]
+                    knowledge.findings[str(key)[:60]] = out[:600]
                     # Explicit negative: if rg returns 0 matches, record it prominently
                     if inv.tool_name == "rg" and "0 matches" in out:
                         pattern = inv.args.get("pattern", "?")
