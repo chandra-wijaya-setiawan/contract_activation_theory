@@ -431,6 +431,26 @@ class ActivatorV3(Activator):
                 performer_reason = "Performer stopped (implicit done)"
                 break
 
+            # Force-commit: if ≥2 attempts all read-only (no durable change),
+            # inject an explicit instruction to stop exploring and make the edit.
+            # Both flash and pro models explore indefinitely without this nudge.
+            read_only_tools = {"read", "rg", "bash", "fd", "goto_def", "find_refs",
+                               "outline", "list", "git_diff", "git_status"}
+            attempts_so_far = max((inv.attempt for inv in all_invocations), default=0)
+            any_durable_so_far = any(inv.durable_change for inv in all_invocations)
+            if (attempts_so_far >= 2 and not any_durable_so_far
+                    and all(inv.tool_name in read_only_tools for inv in all_invocations)):
+                inner_messages.append({
+                    "role": "user",
+                    "content": (
+                        "FRAMEWORK: You have explored for 2+ attempts without making any change. "
+                        "You now MUST call str_replace (or write/apply_patch) with the content "
+                        "you already read. Do NOT call read/bash/rg again. "
+                        "Use the exact file content you saw to construct the str_replace call. "
+                        "If you genuinely cannot determine the correct edit, call give_up(reason=...)."
+                    ),
+                })
+
             # Auto-detect: successful durable change → treat as "completed"
             # This handles models that don't reliably call done() explicitly
             if inner_outcome.any_durable_change and not inner_outcome.any_tool_errored:
