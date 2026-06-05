@@ -54,7 +54,7 @@ class ActivatorV3(Activator):
 
     def _admit(self, contract: Any, state: Any, run: ActivatorRun):  # type: ignore[override]
         """v3 override: skip the 'empty plan' check — v3 uses hypotheses not a plan."""
-        from cat._legacy.activator import AdmissionDecision
+        from cat.contracts import AdmissionDecision
         import time
 
         if not (contract.obligation or "").strip():
@@ -71,19 +71,14 @@ class ActivatorV3(Activator):
         if not contract.conditions_met(state):
             return AdmissionDecision.reject("environment", "declared conditions not met")
 
-        # Grant full capability set
-        grant = set(contract.capabilities or [])
-        if not grant:
-            from cat._legacy.activator import Activator as LegacyActivator
-            # Build default grant from registry
-            try:
-                grant = set(run.grant) if run.grant else {"bash", "read", "write", "str_replace",
-                             "list", "rg", "fd", "multi_edit", "apply_patch",
-                             "goto_def", "find_refs", "outline", "git_diff",
-                             "git_status", "done", "give_up"}
-            except Exception:
-                grant = {"bash", "read", "write", "str_replace", "done", "give_up"}
-        return AdmissionDecision.grant(grant)
+        # Grant full capability set from registry
+        grant = set(self.registry.names()) if self.registry else {
+            "bash", "read", "write", "str_replace", "list",
+            "rg", "fd", "multi_edit", "apply_patch",
+            "goto_def", "find_refs", "outline", "git_diff", "git_status",
+            "done", "give_up",
+        }
+        return AdmissionDecision.admit(grant)
 
     # ── Outer loop ──────────────────────────────────────────────────────
 
