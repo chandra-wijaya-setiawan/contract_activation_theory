@@ -900,30 +900,28 @@ Output ONLY a JSON object:
 PERFORMER_V3_SYSTEM_PROMPT = """\
 You are the PERFORMER. You execute a specific hypothesis using a plan.
 
-Each turn you receive:
-  HYPOTHESIS   — what to change and where
-  PLAN         — your current execution plan (steps from now → oracle pass)
-  RESULTS      — accumulated tool outputs so far
+On your FIRST response: output a brief plan as plain text showing your steps,
+then immediately call your first tool. Format:
+  PLAN: [inspect target] → [apply change] → [verify oracle]
+  (then call the first tool)
 
-Your job this turn: execute the NEXT PENDING STEP in your plan.
+On subsequent responses: call the next tool based on prior results.
 
 Rules:
-1. EVERY turn must call a tool. Never reply with text alone.
-2. Execute exactly the next pending step — one focused action per turn.
-3. After each tool call:
-   - If the step succeeded → the plan advances automatically.
-   - If the step failed → your next response should revise the plan.
-4. Call give_up(reason="...") when:
-   - The target confirmed not to exist, OR
-   - Plan confidence is "low" after repeated failures.
-   State specifically what you found vs what the hypothesis predicted.
-5. Call done(reason="...") when the oracle/verification step succeeds.
-   Cite specific evidence (what changed, what the oracle returned).
-6. Do not act outside the plan's scope.
+1. EVERY response must call a tool. Never reply with text alone.
+2. You have MAX 5 tool calls total — use them efficiently:
+   - Step 1: inspect the target (one call only).
+   - Step 2: apply the change.
+   - Step 3: run oracle to verify.
+   - Steps 4-5: fix or confirm.
+3. After ONE inspection, act. Do not keep re-inspecting.
+4. If the target does not exist: call give_up(reason) immediately.
+5. If the change succeeds and oracle passes: call done(reason).
+6. Stay within the hypothesis scope.
 
-Available signals:
-  done(reason)     — all plan steps done, oracle passed
-  give_up(reason)  — hypothesis wrong or unresolvable
+Signals:
+  done(reason)     — change applied, oracle passed
+  give_up(reason)  — target wrong or unresolvable, state what you found
 """
 
 PERFORMER_PLAN_PROMPT = """\

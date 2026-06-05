@@ -255,29 +255,10 @@ class ActivatorV3(Activator):
     ) -> PerformerOutcome:
         """Inner react loop: Performer implements one hypothesis guided by a plan."""
 
-        # ── Step 0: Generate PerformerPlanSchema (north star) ────────────────
+        # Plan is embedded in the react loop — no separate LLM call.
+        # Each tool call's `reason` field IS the Thought for that iteration.
+        # PerformerPlanSchema is reconstructed from accumulated reasons for tracing.
         plan: Optional[PerformerPlanSchema] = None
-        try:
-            plan, plan_llm = call_performer_plan(
-                self.llm, task,
-                parent_event_id=run.last_perform_event_id or run.last_state_event_id,
-            )
-            self._charge_llm(contract, plan_llm)
-            if plan:
-                self.recorder.append(TraceEvent(
-                    event_id=f"plan-{uuid.uuid4().hex[:6]}",
-                    parent_id=run.last_state_event_id,
-                    ts=utcnow_iso(),
-                    kind="performer_plan",
-                    payload={
-                        "current_state": plan.current_state,
-                        "steps": [{"action": s.action, "rationale": s.rationale} for s in plan.steps],
-                        "confidence": plan.confidence,
-                        "step_count": len(plan.steps),
-                    },
-                ))
-        except Exception:
-            plan = None  # Proceed without plan if generation fails
 
         # ── Build initial user message with hypothesis + plan ─────────────────
         hypothesis_prompt = (
@@ -457,43 +438,24 @@ class ActivatorV3(Activator):
                     performer_reason += " — oracle passed"
                 break
 
-            # Update plan: mark current step done/failed, revise if needed
-            if plan and plan.next_step:
-                next_s = plan.next_step
-                if inner_outcome.any_tool_errored:
-                    next_s.status = "failed"
-                    # Revise plan after failure if budget allows
-                    if attempt < task.max_attempts - 1:
-                        try:
-                            prior_results = "\n".join(
-                                f"{inv.tool_name}: {inv.output_text[:150]}"
-                                for inv in all_invocations[-3:]
-                            )
-                            new_plan, rev_llm = call_performer_plan(
-                                self.llm, task,
-                                prior_results=prior_results,
-                                parent_event_id=run.last_perform_event_id,
-                            )
-                            self._charge_llm(contract, rev_llm)
-                            if new_plan:
-                                plan = new_plan
-                                # If confidence is now low → suggest give_up path
-                                if plan.confidence == "low":
-                                    verdict = "give_up"
-                                    performer_reason = (
-                                        f"Plan revised to low confidence after failure: "
-                                        f"{plan.current_state}"
-                                    )
-                                    break
-                                # Inject revised plan into next message
-                                inner_messages.append({
-                                    "role": "user",
-                                    "content": f"REVISED PLAN:\n{self._format_plan(plan)}"
-                                })
-                        except Exception:
-                            pass
-                else:
-                    next_s.status = "done"
+            # Build a live PerformerPlanSchema from accumulated reasons (for trace)
+            # No extra LLM call — each tool's `reason` IS the Thought step
+            if all_invocations:
+                steps = []
+                for inv in all_invocations:
+                    if inv.reason or inv.tool_name not in ("done", "give_up"):
+                        from cat.schemas import PerformerStepSchema
+                        steps.append(PerformerStepSchema(
+                            action=f"{inv.tool_name}: {str(list(inv.args.values())[:1])[:50]}",
+                            rationale=inv.reason[:100] if inv.reason else "proceed to next step",
+                            status="done" if inv.succeeded else "failed",
+                        ))
+                if steps:
+                    plan = PerformerPlanSchema(
+                        current_state=f"attempt {attempt}, last={all_invocations[-1].tool_name}",
+                        steps=steps,
+                        confidence="high" if not inner_outcome.any_tool_errored else "medium",
+                    )
 
         else:
             # Exhausted — summarisation call
