@@ -515,3 +515,61 @@ class OutcomeSchema(BaseModel):
         if attention_intent in ("mutate", "verify"):
             return False
         return True
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# v3 schemas — hypothesis-based loop engine (see design.v3.md)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class HypothesisSchema(BaseModel):
+    """The Stipulator's output in v3: one specific, testable prediction
+    about what change will satisfy the contract obligation.
+
+    NOT a multi-step plan — a single hypothesis about WHERE to act,
+    WHAT to do, and WHAT will be true after. The Performer figures out
+    HOW to implement it.
+    """
+    location: str = Field(description="WHERE to act — file path, function name, API endpoint, record ID, etc.")
+    change: str = Field(description="WHAT to do — specific enough for Performer to execute directly.")
+    predicts: str = Field(description="WHAT will be true after — verifiable statement about world state.")
+    basis: str = Field(default="", description="WHY this hypothesis — reasoning from obligation + knowledge.")
+
+
+class PerformerTaskSchema(BaseModel):
+    """What the Performer receives in v3: narrow, focused context.
+
+    Deliberately does NOT include the full message history or plan tree —
+    only what is needed to implement the hypothesis and verify it.
+    Enables cheaper model tier for Performer.
+    """
+    obligation: str = Field(description="Original task — semantic anchor so Performer understands intent.")
+    hypothesis: HypothesisSchema
+    oracle: str = Field(description="Test/verification command — Performer can self-verify after mutation.")
+    context: str = Field(default="", description="Compressed knowledge from prior attempts — key facts already known.")
+    max_attempts: int = Field(default=5)
+
+
+class KnowledgeSchema(BaseModel):
+    """What transfers between hypothesis cycles in v3.
+
+    Populated by the Performer's findings and oracle failure messages.
+    Passed to the next Stipulator call so it can generate a better
+    hypothesis without re-investigating already-known facts.
+    """
+    findings: dict = Field(default_factory=dict, description="location → what was actually found there")
+    failed_hypotheses: list = Field(default_factory=list, description="list of {hypothesis, verdict, reason} dicts")
+    oracle_failures: list = Field(default_factory=list, description="specific oracle failure messages from prior attempts")
+
+
+class AttestorV3Schema(BaseModel):
+    """Attestor output in v3 — only two verdicts.
+
+    Called ONCE per hypothesis cycle, only when the oracle failed.
+    Decides: try a new hypothesis (with updated knowledge) or give up.
+    """
+    verdict: Literal["new_hypothesis", "give_up"] = Field(
+        description="new_hypothesis: try again | give_up: task unrecoverable"
+    )
+    reason: str = Field(description="Specific evidence for the verdict.")
+    diagnosis: str = Field(default="", description="What was wrong — informs the next hypothesis.")

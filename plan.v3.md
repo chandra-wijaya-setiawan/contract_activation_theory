@@ -12,11 +12,11 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 
 | # | Task | Status | Notes |
 |---|---|---|---|
-| 1.1 | Add `HypothesisSchema` {location, change, predicts, basis} | `pending` | New — replaces PhasedPlanSchema |
-| 1.2 | Add `PerformerTaskSchema` {obligation, hypothesis, oracle, context, max_attempts} | `pending` | New — what Performer receives |
-| 1.3 | Add `KnowledgeSchema` {findings, failed_hypotheses, oracle_failures} | `pending` | New — knowledge transfer between hypotheses |
+| 1.1 | Add `HypothesisSchema` {location, change, predicts, basis} | `done` | New — replaces PhasedPlanSchema |
+| 1.2 | Add `PerformerTaskSchema` {obligation, hypothesis, oracle, context, max_attempts} | `done` | New — what Performer receives |
+| 1.3 | Add `KnowledgeSchema` {findings, failed_hypotheses, oracle_failures} | `done` | New — knowledge transfer between hypotheses |
 | 1.4 | Keep existing `ExecutionSchema`, `PerformerResultSchema` | `done` | Already added in R37+R38 |
-| 1.5 | Add `AttestorV3Schema` {verdict: "new_hypothesis"\|"give_up", reason, diagnosis} | `pending` | Simpler than v2 AttestorSchema |
+| 1.5 | Add `AttestorV3Schema` {verdict: "new_hypothesis"\|"give_up", reason, diagnosis} | `done` | Simpler than v2 AttestorSchema |
 
 ---
 

@@ -25,6 +25,10 @@ from terminal_bench.agents.failure_mode import FailureMode
 from terminal_bench.terminal.tmux_session import TmuxSession
 
 from cat.activator import Activator
+# v3: USE_V3=true env var selects hypothesis-based engine
+import os as _os
+if _os.environ.get("USE_V3", "").lower() in ("1", "true", "yes"):
+    from cat.activator_v3 import ActivatorV3 as Activator  # type: ignore[assignment]
 from cat.capabilities import build_docker_registry, build_tmux_registry
 from cat.contracts import Constraints, Contract, Criterion, Evidence, State
 from cat.llm import LLM, call_judge

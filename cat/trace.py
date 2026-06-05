@@ -50,6 +50,10 @@ EventKind = Literal[
     "performer_give_up",       # R38: Performer gave up on a step
     "plan_restipulate",        # R37: full re-stipulate with failure context
     "plan_restipulate_failed", # R37: restipulate attempted but failed
+    # v3 hypothesis engine
+    "hypothesis_attempt",      # v3: Stipulator emitted a hypothesis (attempt N)
+    "knowledge_update",        # v3: knowledge accumulated after a hypothesis cycle
+    "attestor_give_up",        # v3: Attestor decided task is unrecoverable
     # Legacy aliases (kept readable for pre-rename traces):
     "contract_decompose",      # legacy alias for contract_stipulate
     "capability_invoke",       # legacy alias for capability_perform

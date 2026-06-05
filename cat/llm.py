@@ -865,3 +865,219 @@ JUDGE_SYSTEM_PROMPT = ATTESTOR_SYSTEM_PROMPT
 
 # Backward-compat: previous name for the PlanPatcher role; do not remove until v1.8+
 call_stipulator_inloop = call_plan_patcher
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# v3 — hypothesis-based engine (see design.v3.md)
+# ──────────────────────────────────────────────────────────────────────────
+
+STIPULATOR_V3_SYSTEM_PROMPT = """\
+You are the STIPULATOR. Given an obligation and what is already known from
+prior attempts, generate ONE specific hypothesis that will satisfy the
+obligation.
+
+A hypothesis is NOT a plan. It is a single, testable prediction:
+WHERE to act, WHAT change to make, WHAT will be true afterwards.
+
+Rules:
+1. Be specific. Name the exact file, function, field, or record to change.
+2. If prior knowledge gives you the location — use it directly. Do not
+   re-investigate what is already known.
+3. If prior attempts failed — choose a DIFFERENT location or approach.
+4. Your hypothesis must be implementable in a single focused action.
+5. Do not describe multiple steps. One hypothesis, one target, one change.
+
+Output ONLY a JSON object:
+{
+  "location": "<exact file/function/endpoint/record — as specific as possible>",
+  "change":   "<what to do there — specific enough to implement directly>",
+  "predicts": "<what will be true after — the verifiable outcome>",
+  "basis":    "<one sentence: why you believe this will work>"
+}
+"""
+
+PERFORMER_V3_SYSTEM_PROMPT = """\
+You are the PERFORMER. You have a specific hypothesis to implement.
+
+Your job: make the hypothesis true, then verify with the oracle.
+
+Rules:
+1. EVERY turn must call a tool. Never reply with text alone.
+2. Start by confirming the hypothesis location exists (read or search).
+3. Make the change the hypothesis describes.
+4. Run the oracle after any change to check if it worked.
+5. Call done(reason="...") when you believe the hypothesis is implemented
+   and the oracle passes. Reason must cite specific evidence.
+6. Call give_up(reason="...") if the hypothesis is demonstrably wrong
+   (location does not exist, change does not apply). Be specific about
+   what you actually found.
+7. Do not explore beyond the hypothesis. Stay focused.
+
+Available signals:
+  done(reason)     — step complete, hand off to oracle check
+  give_up(reason)  — hypothesis is wrong, explain what you found instead
+"""
+
+ATTESTOR_V3_SYSTEM_PROMPT = """\
+You are the ATTESTOR. The oracle failed after a hypothesis attempt.
+Decide: should we try a new hypothesis, or give up entirely?
+
+You receive:
+- What the Performer tried (hypothesis + verdict + reason)
+- What was learned (findings from tool outputs)
+- What has been tried before (prior failed hypotheses)
+
+Output ONE of two verdicts:
+  new_hypothesis — a different approach could still work. The task is
+                   solvable but this hypothesis was wrong.
+  give_up        — the task is unrecoverable. The obligation cannot be
+                   satisfied with the available tools and information.
+
+Rules:
+1. Prefer new_hypothesis unless there is clear evidence the task itself
+   is impossible or the environment is broken.
+2. If all plausible locations/approaches have been tried → give_up.
+3. Your diagnosis must explain WHY the hypothesis failed and WHAT the
+   next hypothesis should target (if new_hypothesis).
+
+Output ONLY a JSON object:
+{
+  "verdict":   "new_hypothesis" | "give_up",
+  "reason":    "<specific evidence for your verdict>",
+  "diagnosis": "<what was wrong and what to try next>"
+}
+"""
+
+
+def call_stipulator_v3(
+    llm: "LLM",
+    obligation: str,
+    representations: "Optional[list[Any]]" = None,
+    knowledge: "Optional[Any]" = None,
+    prior_attempts: "Optional[list[dict]]" = None,
+    parent_event_id: Optional[str] = None,
+) -> "tuple[Optional[Any], LLMResult]":
+    """v3 Stipulator: returns (HypothesisSchema | None, LLMResult).
+
+    Generates a single, specific hypothesis. Passes knowledge from prior
+    attempts so the Stipulator can avoid re-investigating known facts.
+    """
+    from cat.schemas import HypothesisSchema
+    from pydantic import ValidationError
+
+    env_section = ""
+    if representations:
+        lines: list[str] = []
+        for r in representations:
+            evidence_lines = (r.evidence or "").strip().splitlines()
+            preview = "\n    ".join(ln for ln in evidence_lines[:8] if ln.strip())
+            lines.append(f"  {r.key}:\n    {preview}")
+        env_section = "\n\nENVIRONMENT (verified facts):\n" + "\n\n".join(lines)
+
+    knowledge_section = ""
+    if knowledge:
+        findings = getattr(knowledge, "findings", {}) or {}
+        if findings:
+            knowledge_section += "\n\nKNOWLEDGE ALREADY ESTABLISHED (do NOT re-investigate):\n"
+            for loc, finding in list(findings.items())[:10]:
+                knowledge_section += f"  {loc}: {str(finding)[:200]}\n"
+
+    prior_section = ""
+    if prior_attempts:
+        prior_section = "\n\nPRIOR HYPOTHESES THAT FAILED (do NOT repeat):\n"
+        for i, pa in enumerate(prior_attempts[-3:], 1):
+            h = pa.get("hypothesis")
+            reason = pa.get("reason", "")[:200]
+            if h:
+                loc = getattr(h, "location", str(h))[:80]
+                prior_section += f"  {i}. Location: {loc}\n     Why failed: {reason}\n"
+
+    user_content = (
+        f"OBLIGATION:\n{obligation}"
+        f"{env_section}{knowledge_section}{prior_section}"
+    )
+    messages = [
+        {"role": "system", "content": STIPULATOR_V3_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    result = llm.chat(
+        messages=messages,
+        response_format={"type": "json_object"},
+        role_tag="stipulator",
+        temperature=0.1,
+        parent_event_id=parent_event_id,
+    )
+    if not result.text:
+        return None, result
+    try:
+        data = json.loads(result.text)
+        hypothesis = HypothesisSchema(**data)
+        return hypothesis, result
+    except (json.JSONDecodeError, ValidationError, TypeError):
+        return None, result
+
+
+def call_attestor_v3(
+    llm: "LLM",
+    performer_result: "Any",
+    knowledge: "Optional[Any]" = None,
+    prior_attempts: "Optional[list[dict]]" = None,
+    parent_event_id: Optional[str] = None,
+) -> "tuple[Any, LLMResult]":
+    """v3 Attestor: returns (AttestorV3Schema, LLMResult).
+
+    Called only when oracle fails. Decides: new_hypothesis or give_up.
+    """
+    from cat.schemas import AttestorV3Schema
+    from pydantic import ValidationError
+
+    verdict_str = getattr(performer_result, "verdict", "exhausted")
+    reason_str = getattr(performer_result, "performer_reason", "") or ""
+    findings = getattr(knowledge, "findings", {}) if knowledge else {}
+    oracle_failures = getattr(knowledge, "oracle_failures", []) if knowledge else []
+
+    prior_str = ""
+    if prior_attempts:
+        for i, pa in enumerate(prior_attempts[-3:], 1):
+            h = pa.get("hypothesis")
+            loc = getattr(h, "location", "?") if h else "?"
+            r = pa.get("reason", "")[:150]
+            prior_str += f"\n  Attempt {i}: location={loc[:60]}, verdict={pa.get('verdict','?')}\n  reason: {r}"
+
+    findings_str = ""
+    for loc, finding in list(findings.items())[:5]:
+        findings_str += f"\n  {loc}: {str(finding)[:150]}"
+
+    oracle_str = ""
+    for f in oracle_failures[-2:]:
+        oracle_str += f"\n  {str(f)[:200]}"
+
+    user_content = (
+        f"PERFORMER RESULT:\n"
+        f"  verdict: {verdict_str}\n"
+        f"  reason:  {reason_str[:400]}\n"
+        f"\nFINDINGS FROM EXECUTION:{findings_str or ' (none)'}\n"
+        f"\nORACLE FAILURES:{oracle_str or ' (none)'}\n"
+        f"\nPRIOR FAILED ATTEMPTS:{prior_str or ' (none)'}"
+    )
+    messages = [
+        {"role": "system", "content": ATTESTOR_V3_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    result = llm.chat(
+        messages=messages,
+        response_format={"type": "json_object"},
+        role_tag="attestor",
+        temperature=0.0,
+        parent_event_id=parent_event_id,
+    )
+    if not result.text:
+        from cat.schemas import AttestorV3Schema
+        return AttestorV3Schema(verdict="new_hypothesis", reason="attestor returned no text"), result
+    try:
+        data = json.loads(result.text)
+        v = AttestorV3Schema(**data)
+        return v, result
+    except (json.JSONDecodeError, ValidationError, TypeError):
+        from cat.schemas import AttestorV3Schema
+        return AttestorV3Schema(verdict="new_hypothesis", reason="attestor parse failed"), result
