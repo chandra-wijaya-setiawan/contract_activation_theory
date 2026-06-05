@@ -93,7 +93,7 @@ class ActivatorV3(Activator):
 
         # Represent: run environment probes (same as base)
         from cat.representer import Representer
-        representer = Representer()
+        representer = Representer(registry=self.registry, recorder=self.recorder)
         pre_reps = list(contract.representations or [])
         contract.representations = pre_reps + representer.represent(
             contract, state, parent_event_id=run.last_state_event_id,
