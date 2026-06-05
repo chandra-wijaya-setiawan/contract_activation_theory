@@ -485,12 +485,12 @@ if __name__ == "__main__":
     # Find results.json
     results = find_results_json(jsonl_path)
 
-    # Output path
+    # Output path — default: same folder as the JSONL (agent-logs/)
     if len(sys.argv) >= 3:
         out_path = sys.argv[2]
     else:
         base = Path(jsonl_path).stem
-        out_path = str(Path(jsonl_path).parent.parent / f"{base}_report.html")
+        out_path = str(Path(jsonl_path).parent / f"{base}.html")
 
     html_content = generate_html(jsonl_path, results)
     Path(out_path).write_text(html_content)
