@@ -436,19 +436,34 @@ class ActivatorV3(Activator):
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def _extract_oracle(self, contract: Any) -> str:
-        """Extract the oracle test command from contract representations."""
+        """Extract the oracle test command from contract criteria or representations.
+
+        Priority:
+        1. criterion.command (most reliable — the actual test runner)
+        2. representations with eval_command/oracle_command key
+        """
+        import re
+
+        # 1. Extract from criteria description  "exit_code==0 for: <cmd>"
+        for c in getattr(contract, "criteria", []):
+            desc = getattr(c, "description", "") or ""
+            m = re.search(r"exit_code==0 for:\s*(.+)", desc)
+            if m:
+                return m.group(1).strip()[:600]
+            cmd = getattr(c, "command", "") or getattr(c, "cmd", "")
+            if cmd and len(cmd.strip()) > 5:
+                return cmd.strip()[:600]
+
+        # 2. Representations
         for rep in (contract.representations or []):
             key = getattr(rep, "key", "")
-            if key in ("eval_command", "oracle_command", "test_command"):
-                val = getattr(rep, "value", "") or getattr(rep, "evidence", "")
-                if val and len(val.strip()) > 5:
-                    return val.strip()[:500]
-        # Fallback: look for oracle in criteria
-        for c in getattr(contract, "criteria", []):
-            cmd = getattr(c, "command", "") or getattr(c, "cmd", "")
-            if cmd:
-                return cmd[:500]
-        return "(oracle command not found in representations)"
+            if key in ("eval_command", "oracle_command"):
+                val = (getattr(rep, "value", "") or getattr(rep, "evidence", "") or "").strip()
+                # skip terminal noise
+                if val and len(val) > 10 and "TERM environment" not in val:
+                    return val[:600]
+
+        return "cd /testbed && python -m pytest --tb=short -q 2>&1 | tail -20"
 
     def _build_context(self, knowledge: KnowledgeSchema) -> str:
         """Compress knowledge into a short context string for the Performer."""
