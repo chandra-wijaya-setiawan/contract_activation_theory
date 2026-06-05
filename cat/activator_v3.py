@@ -285,10 +285,21 @@ class ActivatorV3(Activator):
             run.last_perform_event_id = f"perf-v3-{uuid.uuid4().hex[:6]}"
 
             # Build assistant message
-            asst_msg: dict = {"role": "assistant", "content": llm_result.text or ""}
             tool_calls_raw = llm_result.tool_calls or []
+            asst_msg: dict = {"role": "assistant", "content": llm_result.text or ""}
             if tool_calls_raw:
-                asst_msg["tool_calls"] = tool_calls_raw
+                # Convert LLMResult format → OpenAI message format for next turn
+                asst_msg["tool_calls"] = [
+                    {
+                        "id": tc.get("id", f"tc-{uuid.uuid4().hex[:6]}"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("name", ""),
+                            "arguments": json.dumps(tc.get("arguments", {})),
+                        },
+                    }
+                    for tc in tool_calls_raw
+                ]
             inner_messages.append(asst_msg)
 
             # Dispatch tool calls
@@ -296,10 +307,10 @@ class ActivatorV3(Activator):
             keep_going = bool(tool_calls_raw)
 
             for tc in tool_calls_raw:
+                # LLMResult.tool_calls format: {"id", "name", "arguments": dict}
                 tc_id = tc.get("id", f"tc-{uuid.uuid4().hex[:6]}")
-                fn = tc.get("function", {}) or {}
-                tool_name = fn.get("name", "")
-                args_raw = fn.get("arguments", "{}")
+                tool_name = tc.get("name", "") or tc.get("function", {}).get("name", "")
+                args_raw = tc.get("arguments", {}) or tc.get("function", {}).get("arguments", "{}")
                 try:
                     args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
                 except Exception:
