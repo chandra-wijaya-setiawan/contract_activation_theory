@@ -24,11 +24,11 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 
 | # | Task | Status | Notes |
 |---|---|---|---|
-| 2.1 | Add `STIPULATOR_V3_SYSTEM_PROMPT` — outputs HypothesisSchema not PhasedPlan | `pending` | One hypothesis, not multi-step plan |
-| 2.2 | Add `call_stipulator_v3(llm, obligation, representations, knowledge, prior_attempts)` | `pending` | Returns HypothesisSchema |
+| 2.1 | Add `STIPULATOR_V3_SYSTEM_PROMPT` — outputs HypothesisSchema not PhasedPlan | `done` | One hypothesis, not multi-step plan |
+| 2.2 | Add `call_stipulator_v3(llm, obligation, representations, knowledge, prior_attempts)` | `done` | Returns HypothesisSchema |
 | 2.3 | Existing `call_stipulator_phased` stays for regression baseline | `done` | Keep until v3 validated |
 | 2.4 | Add `ATTESTOR_V3_SYSTEM_PROMPT` — verdict: new_hypothesis or give_up | `pending` | Simpler than v2 (only 2 verdicts) |
-| 2.5 | Add `call_attestor_v3(llm, result, knowledge, prior_attempts)` | `pending` | Returns AttestorV3Schema |
+| 2.5 | Add `call_attestor_v3(llm, result, knowledge, prior_attempts)` | `done` | Returns AttestorV3Schema |
 
 ---
 
@@ -36,11 +36,11 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 
 | # | Task | Status | Notes |
 |---|---|---|---|
-| 3.1 | Create `cat/activator_v3.py` skeleton — class `ActivatorV3` | `pending` | New file, old activator untouched |
-| 3.2 | Implement `_perform_loop(oracle, hypothesis, max_attempts=5)` | `pending` | Same inner loop as R38 but with PerformerTaskSchema input |
-| 3.3 | Oracle check after every mutation inside inner loop | `pending` | Not just at verify step |
+| 3.1 | Create `cat/activator_v3.py` skeleton — class `ActivatorV3` | `done` | New file, old activator untouched |
+| 3.2 | Implement `_perform_loop(oracle, hypothesis, max_attempts=5)` | `done` | Same inner loop as R38 but with PerformerTaskSchema input |
+| 3.3 | Oracle check after every mutation inside inner loop | `done` | Not just at verify step |
 | 3.4 | `done()`/`give_up()` signals already registered in capabilities | `done` | R37+R38 |
-| 3.5 | Extract `findings` from inner loop messages | `pending` | Key facts for KnowledgeSchema |
+| 3.5 | Extract `findings` from inner loop messages | `done` | Key facts for KnowledgeSchema |
 | 3.6 | Exhaustion summarisation LLM call | `done` | Already in R38 |
 
 ---
@@ -49,12 +49,12 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 
 | # | Task | Status | Notes |
 |---|---|---|---|
-| 4.1 | Implement `run(contract, state)` outer loop | `pending` | MAX_HYPOTHESES=3 |
-| 4.2 | KnowledgeSchema accumulation across hypotheses | `pending` | findings + failed_hypotheses |
-| 4.3 | Oracle check after each `_perform_loop` | `pending` | Contract fulfilled → return immediately |
-| 4.4 | Call `call_attestor_v3` only on oracle failure | `pending` | Not every iter |
-| 4.5 | Pass enriched KnowledgeSchema to Stipulator on next hypothesis | `pending` | Key for token savings |
-| 4.6 | `_represent` + `_admit` unchanged — reuse from base Activator | `pending` | Inherit from existing |
+| 4.1 | Implement `run(contract, state)` outer loop | `done` | MAX_HYPOTHESES=3 |
+| 4.2 | KnowledgeSchema accumulation across hypotheses | `done` | findings + failed_hypotheses |
+| 4.3 | Oracle check after each `_perform_loop` | `done` | Contract fulfilled → return immediately |
+| 4.4 | Call `call_attestor_v3` only on oracle failure | `done` | Not every iter |
+| 4.5 | Pass enriched KnowledgeSchema to Stipulator on next hypothesis | `done` | Key for token savings |
+| 4.6 | `_represent` + `_admit` unchanged — reuse from base Activator | `done` | Inherit from existing |
 
 ---
 
@@ -62,9 +62,9 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 
 | # | Task | Status | Notes |
 |---|---|---|---|
-| 5.1 | `benchmarks/swe_bench.py` — add flag `USE_V3=True` env var | `pending` | Switch between v2 and v3 |
+| 5.1 | `benchmarks/swe_bench.py` — add flag `USE_V3=True` env var | `done` | Switch between v2 and v3 |
 | 5.2 | `scripts/run_bench.sh` — add `--v3` flag | `pending` | Pass USE_V3 |
-| 5.3 | Trace events: add `hypothesis_attempt`, `knowledge_update` to EventKind | `pending` | cat/trace.py |
+| 5.3 | Trace events: add `hypothesis_attempt`, `knowledge_update` to EventKind | `done` | cat/trace.py |
 | 5.4 | Update `scripts/launch_swe500.sh` to support v3 flag | `pending` | |
 
 ---
@@ -73,11 +73,11 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 
 | # | Task | Status | Notes |
 |---|---|---|---|
-| 6.1 | Unit test: `HypothesisSchema` validates correctly | `pending` | |
-| 6.2 | Unit test: `KnowledgeSchema` accumulation | `pending` | |
+| 6.1 | Unit test: `HypothesisSchema` validates correctly | `done` | |
+| 6.2 | Unit test: `KnowledgeSchema` accumulation | `done` | |
 | 6.3 | Unit test: `_perform_loop` exits on `done()`/`give_up()` | `pending` | |
 | 6.4 | Unit test: oracle check after mutation | `pending` | |
-| 6.5 | Smoke test: 1 swe task with `USE_V3=True` | `pending` | django-11239 (known easier) |
+| 6.5 | Smoke test: 1 swe task with `USE_V3=True` | `in_progress` | django-11239 (known easier) |
 
 ---
 
@@ -111,7 +111,7 @@ Status legend: `pending` · `in_progress` · `done` · `skip`
 
 | Milestone | Gate condition | Status |
 |---|---|---|
-| M1 — Schemas done | All Phase 1+2 tasks done, tests pass | `pending` |
-| M2 — v3 loop runs | Smoke test passes (django-11239) | `pending` |
+| M1 — Schemas done | All Phase 1+2 tasks done, tests pass | `done` |
+| M2 — v3 loop runs | Smoke test passes (django-11239) | `in_progress` |
 | M3 — v3 validated | swe10×3 v3 ≥ v2 AND token cost down | `pending` |
 | M4 — v2 deleted | All cleanup done, single activator | `pending` |

@@ -17,8 +17,8 @@ import json
 import uuid
 from typing import Any, Optional
 
+from cat.activator import Activator  # v2 activator — has librarian_writer, _represent, etc.
 from cat._legacy.activator import (
-    Activator,
     ActivatorRun,
     ContractState,
 )
