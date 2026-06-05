@@ -196,6 +196,11 @@ class ActivatorV3(Activator):
                 self._finalize(contract, run)
                 return run
 
+            # If durable change was made, don't run more hypotheses —
+            # further cycles may corrupt the edit. Let the harness judge.
+            if result.verdict == "completed" and result.any_durable_change:
+                break
+
             # Record oracle failure
             oracle_failure = self._get_last_test_output(run)
             if oracle_failure:
