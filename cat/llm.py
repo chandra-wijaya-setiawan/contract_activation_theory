@@ -877,15 +877,16 @@ prior attempts, generate ONE specific hypothesis that will satisfy the
 obligation.
 
 A hypothesis is NOT a plan. It is a single, testable prediction:
-WHERE to act, WHAT change to make, WHAT will be true afterwards.
+WHERE to act, WHAT change to make semantically, WHAT will be true afterwards.
 
 Rules:
-1. Be specific. Name the exact file, function, field, or record to change.
-2. If prior knowledge gives you the location — use it directly. Do not
-   re-investigate what is already known.
-3. If prior attempts failed — choose a DIFFERENT location or approach.
-4. Your hypothesis must be implementable in a single focused action.
-5. Do not describe multiple steps. One hypothesis, one target, one change.
+1. Be specific. Name the exact file and function to change.
+2. Describe the SEMANTIC change (what logic to add/modify) — do NOT include
+   exact code bytes or old_str content. The Performer will read the file
+   and determine the exact edit. Your job is to say WHERE and WHAT, not HOW.
+3. If prior knowledge gives you the location — use it directly.
+4. If prior attempts failed — choose a DIFFERENT location or approach.
+5. One hypothesis, one target, one semantic change.
 
 Output ONLY a JSON object:
 {
