@@ -330,6 +330,26 @@ def render_hypothesis(hyp: dict, idx: int) -> str:
             f'{steps_html}</div></div>'
         )
 
+    # Build execution plan from tool call reasons (the Performer's react thoughts)
+    all_tcs = [tc for att in hyp.get("attempts", []) for tc in att.get("tool_calls", [])]
+    reason_steps = [(tc.get("tool","?"), tc.get("reason","")) for tc in all_tcs if tc.get("reason")]
+    if reason_steps:
+        steps_html = ""
+        for tool, reason in reason_steps:
+            steps_html += (
+                f'<div class="step">'
+                f'<span class="step-status" style="color:#0550ae">→</span>'
+                f'<div><div class="step-action">'
+                f'<span style="font-family:monospace;color:#6f42c1">{h(tool)}</span>'
+                f'</div>'
+                f'<div class="step-rationale">{h(reason[:120])}</div></div>'
+                f'</div>'
+            )
+        parts.append(
+            f'<div class="field"><div class="field-label">Performer reasoning (react thoughts)</div>'
+            f'<div class="plan-steps">{steps_html}</div></div>'
+        )
+
     # Attempts / tool calls
     attempts = hyp.get("attempts", [])
     if attempts:
@@ -404,6 +424,9 @@ def generate_html(jsonl_path: str, results: dict) -> str:
         for r, v in sorted(by_role.items(), key=lambda x: -x[1])
     )
 
+    # Obligation from results
+    obligation = (results.get("instruction") or "")[:400]
+
     hyps_html = "\n".join(
         render_hypothesis(hyp, i + 1)
         for i, hyp in enumerate(data["hypotheses"])
@@ -455,8 +478,10 @@ def generate_html(jsonl_path: str, results: dict) -> str:
   </table>
 </div>
 
+{'<div style="background:white;border:1px solid #ddd;border-radius:6px;padding:12px;margin-bottom:16px"><h3>Obligation (Stipulator input)</h3><p style="margin-top:6px;font-size:12px;color:#444;white-space:pre-wrap">' + h(obligation) + '</p></div>' if obligation else ''}
+
 <h2>Hypotheses ({n_hyp})</h2>
-<p style="font-size:11px;color:#888;margin-bottom:8px">Click a hypothesis header to expand/collapse details.</p>
+<p style="font-size:11px;color:#888;margin-bottom:8px">Click a hypothesis header to expand. <strong>Performer reasoning</strong> shows the react loop thoughts from tool <code>reason</code> fields.</p>
 {hyps_html}
 
 </body>
