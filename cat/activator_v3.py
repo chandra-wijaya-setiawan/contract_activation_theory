@@ -50,15 +50,57 @@ class ActivatorV3(Activator):
     hypothesis loop.
     """
 
+    # ── Admission override ──────────────────────────────────────────────
+
+    def _admit(self, contract: Any, state: Any, run: ActivatorRun):  # type: ignore[override]
+        """v3 override: skip the 'empty plan' check — v3 uses hypotheses not a plan."""
+        from cat._legacy.activator import AdmissionDecision
+        import time
+
+        if not (contract.obligation or "").strip():
+            return AdmissionDecision.reject("boundary", "empty obligation")
+        if not contract.criteria:
+            return AdmissionDecision.reject("boundary", "no criteria declared")
+        # NOTE: no run.plan check — v3 generates hypotheses at runtime, not a pre-baked plan
+        cons = contract.constraints
+        if cons.max_tokens_total <= 0 or cons.max_tool_calls <= 0 or cons.max_llm_calls <= 0:
+            return AdmissionDecision.reject("boundary", "non-positive constraint bounds")
+        now = time.time()
+        if cons.deadline_ts is not None and now > cons.deadline_ts:
+            return AdmissionDecision.reject("boundary", "deadline already passed")
+        if not contract.conditions_met(state):
+            return AdmissionDecision.reject("environment", "declared conditions not met")
+
+        # Grant full capability set
+        grant = set(contract.capabilities or [])
+        if not grant:
+            from cat._legacy.activator import Activator as LegacyActivator
+            # Build default grant from registry
+            try:
+                grant = set(run.grant) if run.grant else {"bash", "read", "write", "str_replace",
+                             "list", "rg", "fd", "multi_edit", "apply_patch",
+                             "goto_def", "find_refs", "outline", "git_diff",
+                             "git_status", "done", "give_up"}
+            except Exception:
+                grant = {"bash", "read", "write", "str_replace", "done", "give_up"}
+        return AdmissionDecision.grant(grant)
+
     # ── Outer loop ──────────────────────────────────────────────────────
 
     def run(self, contract: Any, state: Any) -> ActivatorRun:
         """v3 discharge loop: stipulate hypothesis → perform → oracle → repeat."""
         run = ActivatorRun(contract=contract, state=state)
 
-        # Represent (run env probes) + admit (check gate)
-        # _represent is not a method — probe dispatch is done inside _admit via
-        # contract.representations which are pre-populated by TbSweAgent.
+        # Represent: run environment probes (same as base)
+        from cat.representer import Representer
+        representer = Representer()
+        pre_reps = list(contract.representations or [])
+        contract.representations = pre_reps + representer.represent(
+            contract, state, parent_event_id=run.last_state_event_id,
+        )
+        self._maybe_inject_oracle_criterion(contract)
+
+        # Admit: v3 override skips the 'empty plan' check
         decision = self._admit(contract, state, run)
         if not decision.ok:
             self._apply_admission_failure(contract, run, decision)
