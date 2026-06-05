@@ -27,10 +27,12 @@ from cat.llm import (
     PERFORMER_V3_SYSTEM_PROMPT,
     call_stipulator_v3,
     call_attestor_v3,
+    call_performer_plan,
 )
 from cat.schemas import (
     HypothesisSchema,
     PerformerTaskSchema,
+    PerformerPlanSchema,
     KnowledgeSchema,
     AttestorV3Schema,
     InvocationSchema as ToolInvocation,
@@ -231,6 +233,19 @@ class ActivatorV3(Activator):
 
     # ── Inner loop ───────────────────────────────────────────────────────
 
+    def _format_plan(self, plan: "Optional[PerformerPlanSchema]") -> str:
+        """Format plan for injection into the Performer's user message."""
+        if plan is None:
+            return ""
+        lines = [f"PLAN (current_state: {plan.current_state}, confidence: {plan.confidence}):"]
+        for i, s in enumerate(plan.steps, 1):
+            marker = "→" if s.status == "pending" else ("✓" if s.status == "done" else "✗")
+            lines.append(f"  {marker} Step {i}: {s.action}  [{s.rationale[:80]}]")
+        next_s = plan.next_step
+        if next_s:
+            lines.append(f"\nEXECUTE NOW: {next_s.action}")
+        return "\n".join(lines)
+
     def _perform_hypothesis(
         self,
         contract: Any,
@@ -238,8 +253,33 @@ class ActivatorV3(Activator):
         run: ActivatorRun,
         task: PerformerTaskSchema,
     ) -> PerformerOutcome:
-        """Inner react loop: Performer implements one hypothesis."""
-        # Build initial prompt
+        """Inner react loop: Performer implements one hypothesis guided by a plan."""
+
+        # ── Step 0: Generate PerformerPlanSchema (north star) ────────────────
+        plan: Optional[PerformerPlanSchema] = None
+        try:
+            plan, plan_llm = call_performer_plan(
+                self.llm, task,
+                parent_event_id=run.last_perform_event_id or run.last_state_event_id,
+            )
+            self._charge_llm(contract, plan_llm)
+            if plan:
+                self.recorder.append(TraceEvent(
+                    event_id=f"plan-{uuid.uuid4().hex[:6]}",
+                    parent_id=run.last_state_event_id,
+                    ts=utcnow_iso(),
+                    kind="performer_plan",
+                    payload={
+                        "current_state": plan.current_state,
+                        "steps": [{"action": s.action, "rationale": s.rationale} for s in plan.steps],
+                        "confidence": plan.confidence,
+                        "step_count": len(plan.steps),
+                    },
+                ))
+        except Exception:
+            plan = None  # Proceed without plan if generation fails
+
+        # ── Build initial user message with hypothesis + plan ─────────────────
         hypothesis_prompt = (
             f"OBLIGATION:\n{task.obligation}\n\n"
             f"HYPOTHESIS:\n"
@@ -247,14 +287,14 @@ class ActivatorV3(Activator):
             f"  Change:   {task.hypothesis.change}\n"
             f"  Predicts: {task.hypothesis.predicts}\n"
             f"  Basis:    {task.hypothesis.basis}\n\n"
-            f"ORACLE (run after any change to verify):\n{task.oracle}\n"
+            f"ORACLE (run when ready to verify):\n{task.oracle}\n"
         )
         if task.context:
-            hypothesis_prompt += f"\nCONTEXT (already known — do not re-investigate):\n{task.context}\n"
+            hypothesis_prompt += f"\nDOMAIN CONTEXT:\n{task.context}\n"
+        if plan:
+            hypothesis_prompt += f"\n{self._format_plan(plan)}\n"
 
-        # V3 inner loop uses its own isolated message thread.
-        # Does NOT use run.messages (which is the v2 flat-plan thread).
-        # The Performer sees: system prompt + hypothesis task + accumulated tool results.
+        # V3 inner loop uses its own isolated message thread
         inner_messages: list[dict] = [
             {"role": "user", "content": hypothesis_prompt}
         ]
@@ -413,10 +453,47 @@ class ActivatorV3(Activator):
                     f"Durable change made via "
                     f"{[i.tool_name for i in inner_outcome.invocations if i.durable_change]}"
                 )
-                # Also check oracle immediately
                 if self._verify_criteria(contract, state, run):
                     performer_reason += " — oracle passed"
                 break
+
+            # Update plan: mark current step done/failed, revise if needed
+            if plan and plan.next_step:
+                next_s = plan.next_step
+                if inner_outcome.any_tool_errored:
+                    next_s.status = "failed"
+                    # Revise plan after failure if budget allows
+                    if attempt < task.max_attempts - 1:
+                        try:
+                            prior_results = "\n".join(
+                                f"{inv.tool_name}: {inv.output_text[:150]}"
+                                for inv in all_invocations[-3:]
+                            )
+                            new_plan, rev_llm = call_performer_plan(
+                                self.llm, task,
+                                prior_results=prior_results,
+                                parent_event_id=run.last_perform_event_id,
+                            )
+                            self._charge_llm(contract, rev_llm)
+                            if new_plan:
+                                plan = new_plan
+                                # If confidence is now low → suggest give_up path
+                                if plan.confidence == "low":
+                                    verdict = "give_up"
+                                    performer_reason = (
+                                        f"Plan revised to low confidence after failure: "
+                                        f"{plan.current_state}"
+                                    )
+                                    break
+                                # Inject revised plan into next message
+                                inner_messages.append({
+                                    "role": "user",
+                                    "content": f"REVISED PLAN:\n{self._format_plan(plan)}"
+                                })
+                        except Exception:
+                            pass
+                else:
+                    next_s.status = "done"
 
         else:
             # Exhausted — summarisation call

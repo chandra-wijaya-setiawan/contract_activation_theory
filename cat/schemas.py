@@ -573,3 +573,85 @@ class AttestorV3Schema(BaseModel):
     )
     reason: str = Field(description="Specific evidence for the verdict.")
     diagnosis: str = Field(default="", description="What was wrong — informs the next hypothesis.")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# PerformerPlanSchema — Performer's internal north star (v3)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class PerformerStepSchema(BaseModel):
+    """One step in the Performer's internal execution plan.
+
+    Domain-agnostic: describes WHAT to do and WHY, not which tool.
+    The Performer picks the appropriate tool at execution time.
+    The last step is ALWAYS oracle/criterion verification.
+    """
+    action: str = Field(
+        description="What to do — domain-agnostic description of the action."
+    )
+    rationale: str = Field(
+        description="Why this step is needed before the oracle can pass."
+    )
+    status: Literal["pending", "done", "failed"] = Field(
+        default="pending",
+        description="Execution status — updated as the Performer works through the plan.",
+    )
+
+
+class PerformerPlanSchema(BaseModel):
+    """The Performer's internal execution plan — from current position to oracle pass.
+
+    Created once at the start of the inner loop (before the first tool call).
+    Revised when a step fails or new information changes the path forward.
+
+    Design principles:
+    - Universal: works for 1-step (just verify) or N-step (inspect → change → verify)
+    - Domain-agnostic: steps use semantic language, not tool names
+    - Last step is ALWAYS oracle/criterion verification
+    - confidence drives the give_up decision — low after repeated failures
+
+    Lifecycle:
+      1. Created by first LLM call (no tools yet)
+      2. Executor works through steps in order
+      3. Each step updates status: pending → done | failed
+      4. On failure: plan is revised or confidence drops
+      5. confidence="low" → Performer should call give_up()
+      6. All steps done + oracle step done → call done()
+    """
+    current_state: str = Field(
+        description=(
+            "Where we are RIGHT NOW — what has been inspected, changed, or "
+            "confirmed so far. 'Not started' if this is the first attempt."
+        )
+    )
+    steps: list[PerformerStepSchema] = Field(
+        description=(
+            "Ordered list of actions from current state to oracle pass. "
+            "Must contain at least one step. Last step must be oracle/criterion verification."
+        )
+    )
+    confidence: Literal["high", "medium", "low"] = Field(
+        description=(
+            "How confident the Performer is this plan will reach oracle pass. "
+            "high=clear path; medium=uncertain but worth trying; low=approach likely wrong→consider give_up."
+        )
+    )
+
+    @property
+    def next_step(self) -> "Optional[PerformerStepSchema]":
+        """First pending step — the Performer's immediate target."""
+        return next((s for s in self.steps if s.status == "pending"), None)
+
+    @property
+    def is_complete(self) -> bool:
+        """True when all steps are done (oracle step included)."""
+        return bool(self.steps) and all(s.status == "done" for s in self.steps)
+
+    @property
+    def pending_count(self) -> int:
+        return sum(1 for s in self.steps if s.status == "pending")
+
+    @property
+    def failed_count(self) -> int:
+        return sum(1 for s in self.steps if s.status == "failed")

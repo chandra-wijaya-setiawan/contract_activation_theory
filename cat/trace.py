@@ -52,6 +52,7 @@ EventKind = Literal[
     "plan_restipulate_failed", # R37: restipulate attempted but failed
     # v3 hypothesis engine
     "hypothesis_attempt",      # v3: Stipulator emitted a hypothesis (attempt N)
+    "performer_plan",          # v3: Performer's PerformerPlanSchema (north star)
     "knowledge_update",        # v3: knowledge accumulated after a hypothesis cycle
     "attestor_give_up",        # v3: Attestor decided task is unrecoverable
     # Legacy aliases (kept readable for pre-rename traces):

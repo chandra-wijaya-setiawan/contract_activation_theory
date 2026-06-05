@@ -898,30 +898,59 @@ Output ONLY a JSON object:
 """
 
 PERFORMER_V3_SYSTEM_PROMPT = """\
-You are the PERFORMER. You have a specific hypothesis to implement.
+You are the PERFORMER. You execute a specific hypothesis using a plan.
 
-Your job: make the hypothesis true, then verify with the oracle.
+Each turn you receive:
+  HYPOTHESIS   — what to change and where
+  PLAN         — your current execution plan (steps from now → oracle pass)
+  RESULTS      — accumulated tool outputs so far
+
+Your job this turn: execute the NEXT PENDING STEP in your plan.
 
 Rules:
 1. EVERY turn must call a tool. Never reply with text alone.
-2. You have MAX 5 tool calls. Use them efficiently:
-   - First: inspect the target to confirm it exists and understand its state.
-   - Then: apply the change the hypothesis describes.
-   - Then: run the oracle to verify the outcome.
-   - Remaining: correct or confirm.
-3. Inspect the target ONCE. After one inspection you have enough to act.
-   If the target named in the hypothesis does not exist →
-   call give_up immediately with what you found instead.
-4. Act on what you observe — do not keep re-inspecting the same target.
-5. Call give_up(reason="...") when the hypothesis target is wrong or
-   the change cannot be applied. State specifically what you found.
-6. Call done(reason="...") when the change is applied and oracle passes.
+2. Execute exactly the next pending step — one focused action per turn.
+3. After each tool call:
+   - If the step succeeded → the plan advances automatically.
+   - If the step failed → your next response should revise the plan.
+4. Call give_up(reason="...") when:
+   - The target confirmed not to exist, OR
+   - Plan confidence is "low" after repeated failures.
+   State specifically what you found vs what the hypothesis predicted.
+5. Call done(reason="...") when the oracle/verification step succeeds.
    Cite specific evidence (what changed, what the oracle returned).
-7. Do not explore beyond what the hypothesis specifies.
+6. Do not act outside the plan's scope.
 
 Available signals:
-  done(reason)     — change applied and verified, hand off
-  give_up(reason)  — hypothesis is wrong, explain what you actually found
+  done(reason)     — all plan steps done, oracle passed
+  give_up(reason)  — hypothesis wrong or unresolvable
+"""
+
+PERFORMER_PLAN_PROMPT = """\
+You are the PERFORMER. Before taking any action, create a plan.
+
+Given the hypothesis below, output a PerformerPlanSchema — an ordered list
+of steps from your current position to a passing oracle verification.
+
+Rules for the plan:
+1. Be concrete but domain-agnostic. Describe WHAT to do, not which specific tool.
+2. First step: confirm the target exists and understand its current state.
+3. Middle steps: apply the changes the hypothesis describes.
+4. Last step: ALWAYS "verify with oracle / run criterion check".
+5. If the hypothesis already tells you exactly what to do and you are confident
+   the target exists: the plan can be as short as 2 steps (apply + verify).
+6. Set confidence based on how certain you are this path leads to oracle pass.
+
+Output ONLY a JSON object:
+{
+  "current_state": "<what is known or done so far — 'Not started' if first attempt>",
+  "steps": [
+    {"action": "<what to do>", "rationale": "<why needed>", "status": "pending"},
+    ...
+    {"action": "verify with oracle", "rationale": "confirm the change satisfies the criterion", "status": "pending"}
+  ],
+  "confidence": "high" | "medium" | "low"
+}
 """
 
 ATTESTOR_V3_SYSTEM_PROMPT = """\
@@ -952,6 +981,57 @@ Output ONLY a JSON object:
   "diagnosis": "<what was wrong and what to try next>"
 }
 """
+
+
+def call_performer_plan(
+    llm: "LLM",
+    task: "Any",
+    prior_results: str = "",
+    parent_event_id: Optional[str] = None,
+) -> "tuple[Optional[Any], LLMResult]":
+    """Generate or revise the Performer's internal execution plan.
+
+    Called ONCE at the start of the inner loop (prior_results="") and
+    optionally again after a step fails (prior_results=accumulated outputs).
+    Returns (PerformerPlanSchema | None, LLMResult).
+    """
+    from cat.schemas import PerformerPlanSchema
+    from pydantic import ValidationError
+
+    hypothesis = task.hypothesis if task else None
+    task_content = (
+        f"OBLIGATION:\n{task.obligation if task else '?'}\n\n"
+        f"HYPOTHESIS:\n"
+        f"  Location: {getattr(hypothesis, 'location', '?')}\n"
+        f"  Change:   {getattr(hypothesis, 'change', '?')}\n"
+        f"  Predicts: {getattr(hypothesis, 'predicts', '?')}\n\n"
+        f"ORACLE: {task.oracle if task else '?'}\n"
+    )
+    if task and task.context:
+        task_content += f"\nDOMAIN CONTEXT:\n{task.context}\n"
+    if prior_results:
+        task_content += f"\nRESULTS SO FAR:\n{prior_results[:600]}\n"
+        task_content += "\nRevise the plan based on what was learned above.\n"
+
+    messages = [
+        {"role": "system", "content": PERFORMER_PLAN_PROMPT},
+        {"role": "user", "content": task_content},
+    ]
+    result = llm.chat(
+        messages=messages,
+        response_format={"type": "json_object"},
+        role_tag="performer",
+        temperature=0.1,
+        parent_event_id=parent_event_id,
+    )
+    if not result.text:
+        return None, result
+    try:
+        data = json.loads(result.text)
+        plan = PerformerPlanSchema(**data)
+        return plan, result
+    except (json.JSONDecodeError, ValidationError, TypeError):
+        return None, result
 
 
 def call_stipulator_v3(
