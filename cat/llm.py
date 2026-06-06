@@ -34,6 +34,7 @@ from cat.trace import Recorder, TraceEvent, utcnow_iso
 # billing if used for anything beyond comparative analysis.
 _PRICING: dict[str, tuple[float, float]] = {
     "deepseek/deepseek-v4-flash": (0.20, 0.50),
+    "nvidia/nemotron-3-ultra-550b-a55b": (0.0, 0.0),   # free tier
     "deepseek/deepseek-v4-pro": (0.85, 2.50),
     "deepseek/deepseek-chat-v3.1": (0.27, 1.10),
     "deepseek/deepseek-chat-v3-0324": (0.27, 1.10),
