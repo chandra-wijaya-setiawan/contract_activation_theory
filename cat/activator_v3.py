@@ -265,6 +265,15 @@ class ActivatorV3(Activator):
                     parent_event_id=run.last_state_event_id,
                 )
                 self._charge_llm(contract, attest_llm)
+                # Hard guard: never give_up until ≥ 3 hypotheses tried.
+                # One or two failed hypotheses is not enough evidence.
+                if attest_result.verdict == "give_up" and hypothesis_n < 2:
+                    attest_result.verdict = "new_hypothesis"
+                    attest_result.diagnosis = (
+                        f"[GUARD: give_up blocked — only {hypothesis_n+1} hypothesis tried] "
+                        + attest_result.diagnosis
+                    )
+
                 if attest_result.verdict == "give_up":
                     self.recorder.append(TraceEvent(
                         event_id=f"attest-giveup-{uuid.uuid4().hex[:6]}",

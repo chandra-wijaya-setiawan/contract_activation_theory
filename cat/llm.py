@@ -968,10 +968,18 @@ Output ONE of two verdicts:
                    satisfied with the available tools and information.
 
 Rules:
-1. Prefer new_hypothesis unless the task itself is clearly impossible.
-2. If all plausible targets and approaches have been tried → give_up.
-3. Your diagnosis must explain WHY this hypothesis failed and WHAT the
-   next hypothesis should target differently.
+1. ALWAYS choose new_hypothesis if fewer than 3 hypotheses have been tried.
+   A single failed hypothesis is not enough evidence to give up.
+   "Target not found" or "modification failed" means the hypothesis was WRONG,
+   not that the task is impossible. Try a different location or approach.
+2. Prefer new_hypothesis unless ALL of these are true:
+   - 3+ hypotheses have been tried
+   - All targeted different locations (not just the same wrong location)
+   - The task obligation itself seems unfulfillable (no plausible fix exists)
+3. give_up only when the task is genuinely impossible (e.g. the obligation
+   asks to fix something that is already correct, or requires capabilities
+   that don't exist in the environment).
+4. Your diagnosis must name a DIFFERENT target for the next hypothesis.
 
 Output ONLY a JSON object:
 {
