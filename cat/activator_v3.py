@@ -44,7 +44,7 @@ MAX_HYPOTHESES = 5
 MAX_INNER_ATTEMPTS = 5
 # Per-hypothesis tool call budget. Checked after each LLM dispatch.
 # v3 inner loop calls tools directly; budget enforced here not in base _check_budget.
-MAX_TOOLS_PER_HYPOTHESIS = 25
+MAX_TOOLS_PER_HYPOTHESIS = 40  # increased for models that call many tools per response
 
 
 class ActivatorV3(Activator):
