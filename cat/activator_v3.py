@@ -133,44 +133,33 @@ class ActivatorV3(Activator):
         knowledge = KnowledgeSchema()
         prior_attempts: list[dict] = []
 
+        # Tier escalation: give_up → escalate to next tier (not truly give up)
+        # Only give_up when already at the highest tier.
+        # Tier tracks current model level; escalates on any give_up signal.
+        current_tier = 0
+        tier_llm = self.llm  # starts at base model
+
+        def _get_tier_llm(tier: int) -> "Any":
+            """Build LLM for the given escalation tier. Returns base if tier=0."""
+            if tier == 0:
+                return self.llm
+            _, env_var, fallback = _ESCALATION_TIERS[min(tier, len(_ESCALATION_TIERS)-1)]
+            model = os.environ.get(env_var) or fallback
+            if not model or model == self.llm.model:
+                return self.llm
+            try:
+                from cat.llm import LLM as _LLM
+                return _LLM(model=model, recorder=self.recorder)
+            except Exception:
+                return self.llm
+
+        max_tier = len(_ESCALATION_TIERS) - 1
+
         for hypothesis_n in range(MAX_HYPOTHESES):
             if not self._check_budget(contract, state, run):
                 break
 
-            # Stipulate: generate ONE hypothesis.
-            # Multi-tier model escalation: as hypotheses fail, escalate to
-            # progressively stronger models for the Stipulator.
-            # Reset is automatic — H1 always uses the base model.
-            # After success or task end, the next task starts at tier 0.
-            stipulator_llm = self.llm
-            current_tier_model = self.llm.model
-            for min_n, env_var, fallback in reversed(_ESCALATION_TIERS):
-                if hypothesis_n >= min_n:
-                    # Check env var first, then use explicit fallback model
-                    tier_model = os.environ.get(env_var) or fallback
-                    if tier_model and tier_model != current_tier_model:
-                        try:
-                            from cat.llm import LLM as _LLM
-                            stipulator_llm = _LLM(
-                                model=tier_model,
-                                recorder=self.recorder,
-                            )
-                            current_tier_model = tier_model
-                            self.recorder.append(TraceEvent(
-                                event_id=f"stip-esc-{uuid.uuid4().hex[:6]}",
-                                parent_id=run.last_state_event_id,
-                                ts=utcnow_iso(),
-                                kind="stipulator_escalation",
-                                payload={
-                                    "from": self.llm.model,
-                                    "to": tier_model,
-                                    "hypothesis_n": hypothesis_n + 1,
-                                    "tier": min_n,
-                                },
-                            ))
-                        except Exception:
-                            stipulator_llm = self.llm
-                    break
+            stipulator_llm = tier_llm
 
             hypothesis, stip_result = call_stipulator_v3(
                 stipulator_llm,
@@ -259,33 +248,42 @@ class ActivatorV3(Activator):
             if oracle_failure:
                 knowledge.oracle_failures.append(oracle_failure[:400])
 
-            # Attestor: decide whether to try again or give up
-            # Only called when oracle failed (not every iter)
-            if result.verdict == "give_up" or hypothesis_n == MAX_HYPOTHESES - 1:
-                attest_result, attest_llm = call_attestor_v3(
-                    stipulator_llm,  # same tier as Stipulator+Performer this cycle
-                    performer_result=result,
-                    knowledge=knowledge,
-                    prior_attempts=prior_attempts,
-                    parent_event_id=run.last_state_event_id,
-                )
-                self._charge_llm(contract, attest_llm)
-                # Hard guard: never give_up until ≥ 3 hypotheses tried.
-                # One or two failed hypotheses is not enough evidence.
-                if attest_result.verdict == "give_up" and hypothesis_n < 2:
-                    attest_result.verdict = "new_hypothesis"
-                    attest_result.diagnosis = (
-                        f"[GUARD: give_up blocked — only {hypothesis_n+1} hypothesis tried] "
-                        + attest_result.diagnosis
-                    )
-
-                if attest_result.verdict == "give_up":
+            # Escalation logic: give_up → escalate to next tier.
+            # "give_up" from the Performer means the current model tier
+            # couldn't solve it. Escalate to the next tier — don't truly
+            # give up until already at the highest tier.
+            if result.verdict in ("give_up", "exhausted"):
+                if current_tier < max_tier:
+                    # Escalate to next tier — next hypothesis uses stronger model
+                    current_tier += 1
+                    tier_llm = _get_tier_llm(current_tier)
+                    _, env_var, _ = _ESCALATION_TIERS[current_tier]
                     self.recorder.append(TraceEvent(
-                        event_id=f"attest-giveup-{uuid.uuid4().hex[:6]}",
+                        event_id=f"escalate-{uuid.uuid4().hex[:6]}",
+                        parent_id=run.last_state_event_id,
+                        ts=utcnow_iso(),
+                        kind="stipulator_escalation",
+                        payload={
+                            "from": stipulator_llm.model,
+                            "to": tier_llm.model,
+                            "tier": current_tier,
+                            "reason": result.verdict,
+                            "hypothesis_n": hypothesis_n + 1,
+                        },
+                    ))
+                    # Continue — next hypothesis will use tier_llm
+                else:
+                    # Already at highest tier (haiku) — truly give up
+                    self.recorder.append(TraceEvent(
+                        event_id=f"give-up-final-{uuid.uuid4().hex[:6]}",
                         parent_id=run.last_state_event_id,
                         ts=utcnow_iso(),
                         kind="attestor_give_up",
-                        payload={"reason": attest_result.reason, "diagnosis": attest_result.diagnosis},
+                        payload={
+                            "reason": f"All {max_tier+1} tiers exhausted",
+                            "last_verdict": result.verdict,
+                            "last_reason": result.performer_reason[:300],
+                        },
                     ))
                     break
 
