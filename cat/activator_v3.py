@@ -431,12 +431,11 @@ class ActivatorV3(Activator):
                 performer_reason = "Performer stopped (implicit done)"
                 break
 
-            # Force-commit: if ≥2 attempts with no durable change made,
-            # inject an instruction to stop exploring and apply the change.
-            # Domain-agnostic: uses inv.durable_change (works for any tool/domain).
-            attempts_so_far = max((inv.attempt for inv in all_invocations), default=0)
+            # Force-commit: if current inner attempt had no durable change AND
+            # we've had 2+ inner attempts with no durable change, inject nudge.
+            # Uses inv.durable_change — domain-agnostic.
             any_durable_so_far = any(inv.durable_change for inv in all_invocations)
-            if attempts_so_far >= 2 and not any_durable_so_far:
+            if attempt >= 2 and not any_durable_so_far:
                 inner_messages.append({
                     "role": "user",
                     "content": (
