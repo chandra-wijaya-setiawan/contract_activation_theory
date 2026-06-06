@@ -308,9 +308,10 @@ class ActivatorV3(Activator):
                 performer_reason = "budget exhausted"
                 break
 
-            # After force-commit fires, restrict tools to mutation-only.
-            # The model physically cannot call read/bash/rg.
-            active_tools = mutation_tools if force_committed else all_tools
+            # Use mutation-only tools only after 3+ attempts with no change.
+            # At 2 attempts we use text-only nudge (allows give_up if truly stuck).
+            # At 3+ attempts we enforce mechanistically.
+            active_tools = mutation_tools if (force_committed and attempt >= 3) else all_tools
 
             # Direct LLM call with isolated message thread
             messages = [
