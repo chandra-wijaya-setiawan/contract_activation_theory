@@ -47,6 +47,17 @@ MAX_INNER_ATTEMPTS = 5
 # v3 inner loop calls tools directly; budget enforced here not in base _check_budget.
 MAX_TOOLS_PER_HYPOTHESIS = 40  # increased for models that call many tools per response
 
+# Multi-tier Stipulator model escalation.
+# When hypothesis_n reaches a threshold, upgrade the Stipulator model.
+# Reset is automatic per task — H1 always starts at tier 0.
+# Tiers: (min_hypothesis_n, env_var_for_model, fallback_suffix)
+# fallback_suffix: replaces "flash" with this in the base model name.
+_ESCALATION_TIERS = [
+    (0, "CAT_MODEL",                None),       # H1-H2: base model (flash)
+    (2, "CAT_ESCALATION_MODEL_T1",  "pro"),      # H3-H4: pro tier
+    (4, "CAT_ESCALATION_MODEL_T2",  "sonnet"),   # H5+:   sonnet tier
+]
+
 
 class ActivatorV3(Activator):
     """v3 hypothesis-based activator.
@@ -125,35 +136,43 @@ class ActivatorV3(Activator):
                 break
 
             # Stipulate: generate ONE hypothesis.
-            # Escalate to a stronger model after 2+ failed hypotheses —
-            # the base model's training knowledge may be wrong about the target.
-            # Domain-agnostic: applies whenever the model fails to generate
-            # a correct hypothesis regardless of domain.
+            # Multi-tier model escalation: as hypotheses fail, escalate to
+            # progressively stronger models for the Stipulator.
+            # Reset is automatic — H1 always uses the base model.
+            # After success or task end, the next task starts at tier 0.
             stipulator_llm = self.llm
-            if hypothesis_n >= 2:
-                escalation_model = os.environ.get(
-                    "CAT_ESCALATION_MODEL",
-                    os.environ.get("CAT_MODEL",
-                                   "openrouter/deepseek/deepseek-v4-flash")
-                    .replace("v4-flash", "v4-pro"),  # default: upgrade tier
-                )
-                try:
-                    from cat.llm import LLM as _LLM
-                    stipulator_llm = _LLM(
-                        model=escalation_model,
-                        recorder=self.recorder,
-                    )
-                    self.recorder.append(TraceEvent(
-                        event_id=f"stip-escalate-{uuid.uuid4().hex[:6]}",
-                        parent_id=run.last_state_event_id,
-                        ts=utcnow_iso(),
-                        kind="stipulator_escalation",
-                        payload={"from_model": self.llm.model,
-                                 "to_model": escalation_model,
-                                 "hypothesis_n": hypothesis_n + 1},
-                    ))
-                except Exception:
-                    stipulator_llm = self.llm  # fallback to base
+            current_tier_model = self.llm.model
+            for min_n, env_var, suffix in reversed(_ESCALATION_TIERS):
+                if hypothesis_n >= min_n:
+                    tier_model = os.environ.get(env_var)
+                    if not tier_model and suffix:
+                        # Auto-construct: replace "flash" with tier suffix
+                        tier_model = self.llm.model.replace(
+                            "flash", suffix
+                        ).replace("v4-flash", f"v4-{suffix}")
+                    if tier_model and tier_model != current_tier_model:
+                        try:
+                            from cat.llm import LLM as _LLM
+                            stipulator_llm = _LLM(
+                                model=tier_model,
+                                recorder=self.recorder,
+                            )
+                            current_tier_model = tier_model
+                            self.recorder.append(TraceEvent(
+                                event_id=f"stip-esc-{uuid.uuid4().hex[:6]}",
+                                parent_id=run.last_state_event_id,
+                                ts=utcnow_iso(),
+                                kind="stipulator_escalation",
+                                payload={
+                                    "from": self.llm.model,
+                                    "to": tier_model,
+                                    "hypothesis_n": hypothesis_n + 1,
+                                    "tier": min_n,
+                                },
+                            ))
+                        except Exception:
+                            stipulator_llm = self.llm
+                    break
 
             hypothesis, stip_result = call_stipulator_v3(
                 stipulator_llm,
