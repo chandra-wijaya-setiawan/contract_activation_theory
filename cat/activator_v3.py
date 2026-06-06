@@ -290,7 +290,13 @@ class ActivatorV3(Activator):
         performer_reason = ""
         hypothesis_tool_count = 0  # local budget per hypothesis
 
-        tools = self.registry.tool_schemas(only=run.grant) if self.registry else []
+        all_tools = self.registry.tool_schemas(only=run.grant) if self.registry else []
+        # Tools restricted to mutation-only after force-commit fires
+        _MUTATION_TOOLS = {"str_replace", "write", "multi_edit", "apply_patch",
+                           "done", "give_up"}
+        mutation_tools = [t for t in all_tools
+                          if t["function"]["name"] in _MUTATION_TOOLS]
+        force_committed = False  # track if force-commit has fired
 
         for attempt in range(1, task.max_attempts + 1):
             if hypothesis_tool_count >= MAX_TOOLS_PER_HYPOTHESIS:
@@ -302,6 +308,10 @@ class ActivatorV3(Activator):
                 performer_reason = "budget exhausted"
                 break
 
+            # After force-commit fires, restrict tools to mutation-only.
+            # The model physically cannot call read/bash/rg.
+            active_tools = mutation_tools if force_committed else all_tools
+
             # Direct LLM call with isolated message thread
             messages = [
                 {"role": "system", "content": PERFORMER_V3_SYSTEM_PROMPT},
@@ -309,7 +319,7 @@ class ActivatorV3(Activator):
 
             llm_result = self.llm.chat(
                 messages=messages,
-                tools=tools,
+                tools=active_tools,
                 tool_choice="required",
                 role_tag="performer",
                 temperature=0.2,
@@ -437,16 +447,18 @@ class ActivatorV3(Activator):
                     break
                 # No change made — fall through to force-commit check below
 
-            # Force-commit: if 2+ attempts with no durable change, inject nudge.
+            # Force-commit: if 2+ attempts with no durable change, inject nudge
+            # AND restrict tools to mutation-only for all subsequent attempts.
             any_durable_so_far = any(inv.durable_change for inv in all_invocations)
-            if attempt >= 2 and not any_durable_so_far:
+            if attempt >= 2 and not any_durable_so_far and not force_committed:
+                force_committed = True  # switch to mutation-only tools next turn
                 inner_messages.append({
                     "role": "user",
                     "content": (
                         "FRAMEWORK: You have gathered information for 2+ attempts "
                         "without applying any change. "
                         "You now have enough context. APPLY THE CHANGE the hypothesis describes. "
-                        "Use the information you already gathered to execute the modification. "
+                        "Only modification tools are now available — you cannot read more files. "
                         "If the target genuinely does not exist or cannot be changed, "
                         "call give_up(reason=...) with a specific explanation."
                     ),
