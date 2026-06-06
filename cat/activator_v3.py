@@ -14,6 +14,7 @@ USE_V3=true env var routes swe_bench to this activator.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from typing import Any, Optional
 
@@ -123,9 +124,39 @@ class ActivatorV3(Activator):
             if not self._check_budget(contract, state, run):
                 break
 
-            # Stipulate: generate ONE hypothesis
+            # Stipulate: generate ONE hypothesis.
+            # Escalate to a stronger model after 2+ failed hypotheses —
+            # the base model's training knowledge may be wrong about the target.
+            # Domain-agnostic: applies whenever the model fails to generate
+            # a correct hypothesis regardless of domain.
+            stipulator_llm = self.llm
+            if hypothesis_n >= 2:
+                escalation_model = os.environ.get(
+                    "CAT_ESCALATION_MODEL",
+                    os.environ.get("CAT_MODEL",
+                                   "openrouter/deepseek/deepseek-v4-flash")
+                    .replace("v4-flash", "v4-pro"),  # default: upgrade tier
+                )
+                try:
+                    from cat.llm import LLM as _LLM
+                    stipulator_llm = _LLM(
+                        model=escalation_model,
+                        recorder=self.recorder,
+                    )
+                    self.recorder.append(TraceEvent(
+                        event_id=f"stip-escalate-{uuid.uuid4().hex[:6]}",
+                        parent_id=run.last_state_event_id,
+                        ts=utcnow_iso(),
+                        kind="stipulator_escalation",
+                        payload={"from_model": self.llm.model,
+                                 "to_model": escalation_model,
+                                 "hypothesis_n": hypothesis_n + 1},
+                    ))
+                except Exception:
+                    stipulator_llm = self.llm  # fallback to base
+
             hypothesis, stip_result = call_stipulator_v3(
-                self.llm,
+                stipulator_llm,
                 obligation=contract.obligation,
                 representations=contract.representations,
                 knowledge=knowledge,
@@ -447,6 +478,22 @@ class ActivatorV3(Activator):
                     performer_reason = "Performer stopped after making a change"
                     break
                 # No change made — fall through to force-commit check below
+
+            # Auto-give_up: if a modification tool errored (target not found,
+            # target doesn't exist as predicted), this hypothesis is wrong.
+            # Domain-agnostic: applies to str_replace/write/refund_api/etc.
+            # No point retrying — escalate to a new hypothesis.
+            last_inv = all_invocations[-1] if all_invocations else None
+            if (last_inv and not last_inv.succeeded
+                    and last_inv.tool_name in ("str_replace", "write", "multi_edit",
+                                               "apply_patch")):
+                verdict = "give_up"
+                performer_reason = (
+                    f"Modification tool '{last_inv.tool_name}' failed: "
+                    f"{last_inv.error[:200] or last_inv.output_text[:200]}. "
+                    f"Hypothesis target does not match reality."
+                )
+                break
 
             # Force-commit: if 2+ attempts with no durable change, inject nudge
             # AND restrict tools to mutation-only for all subsequent attempts.
