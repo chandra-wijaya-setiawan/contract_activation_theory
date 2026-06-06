@@ -41,7 +41,7 @@ from cat.schemas import (
 )
 from cat.trace import TraceEvent, utcnow_iso
 
-MAX_HYPOTHESES = 5
+MAX_HYPOTHESES = 6  # allows H5-H6 to use T2 (Haiku) tier
 MAX_INNER_ATTEMPTS = 5
 # Per-hypothesis tool call budget. Checked after each LLM dispatch.
 # v3 inner loop calls tools directly; budget enforced here not in base _check_budget.
@@ -53,9 +53,11 @@ MAX_TOOLS_PER_HYPOTHESIS = 40  # increased for models that call many tools per r
 # Tiers: (min_hypothesis_n, env_var_for_model, fallback_suffix)
 # fallback_suffix: replaces "flash" with this in the base model name.
 _ESCALATION_TIERS = [
-    (0, "CAT_MODEL",                None),       # H1-H2: base model (flash)
-    (2, "CAT_ESCALATION_MODEL_T1",  "pro"),      # H3-H4: pro tier
-    (4, "CAT_ESCALATION_MODEL_T2",  "sonnet"),   # H5+:   sonnet tier
+    # (min_hypothesis_n, env_var, fallback_model)
+    # fallback_model: explicit model string (avoids constructing nonexistent names)
+    (0, "CAT_MODEL",               None),
+    (2, "CAT_ESCALATION_MODEL_T1", "openrouter/deepseek/deepseek-v4-pro"),
+    (4, "CAT_ESCALATION_MODEL_T2", "openrouter/anthropic/claude-haiku-4-5"),
 ]
 
 
@@ -142,14 +144,10 @@ class ActivatorV3(Activator):
             # After success or task end, the next task starts at tier 0.
             stipulator_llm = self.llm
             current_tier_model = self.llm.model
-            for min_n, env_var, suffix in reversed(_ESCALATION_TIERS):
+            for min_n, env_var, fallback in reversed(_ESCALATION_TIERS):
                 if hypothesis_n >= min_n:
-                    tier_model = os.environ.get(env_var)
-                    if not tier_model and suffix:
-                        # Auto-construct: replace "flash" with tier suffix
-                        tier_model = self.llm.model.replace(
-                            "flash", suffix
-                        ).replace("v4-flash", f"v4-{suffix}")
+                    # Check env var first, then use explicit fallback model
+                    tier_model = os.environ.get(env_var) or fallback
                     if tier_model and tier_model != current_tier_model:
                         try:
                             from cat.llm import LLM as _LLM
