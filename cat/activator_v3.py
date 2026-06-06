@@ -206,7 +206,9 @@ class ActivatorV3(Activator):
                 },
             ))
 
-            # Perform: implement the hypothesis (inner react loop)
+            # Perform: implement the hypothesis (inner react loop).
+            # Use the SAME escalated LLM as the Stipulator for this cycle —
+            # escalate the entire engine (Stipulator + Performer + Attestor).
             task = PerformerTaskSchema(
                 obligation=contract.obligation,
                 hypothesis=hypothesis,
@@ -214,7 +216,10 @@ class ActivatorV3(Activator):
                 context=self._build_context(knowledge),
                 max_attempts=MAX_INNER_ATTEMPTS,
             )
-            result = self._perform_hypothesis(contract, state, run, task)
+            result = self._perform_hypothesis(
+                contract, state, run, task,
+                llm_override=stipulator_llm if stipulator_llm is not self.llm else None,
+            )
 
             # Knowledge update regardless of outcome
             self._update_knowledge(knowledge, result, oracle_cmd)
@@ -258,7 +263,7 @@ class ActivatorV3(Activator):
             # Only called when oracle failed (not every iter)
             if result.verdict == "give_up" or hypothesis_n == MAX_HYPOTHESES - 1:
                 attest_result, attest_llm = call_attestor_v3(
-                    self.llm,
+                    stipulator_llm,  # same tier as Stipulator+Performer this cycle
                     performer_result=result,
                     knowledge=knowledge,
                     prior_attempts=prior_attempts,
@@ -314,8 +319,16 @@ class ActivatorV3(Activator):
         state: Any,
         run: ActivatorRun,
         task: PerformerTaskSchema,
+        llm_override: "Optional[Any]" = None,
     ) -> PerformerOutcome:
-        """Inner react loop: Performer implements one hypothesis guided by a plan."""
+        """Inner react loop: Performer implements one hypothesis.
+
+        llm_override: when set, uses this LLM for Performer calls instead of
+        self.llm. Allows full engine escalation (same model for Stipulator +
+        Performer + Attestor within one hypothesis cycle).
+        """
+        # Use escalated LLM if provided, fall back to self.llm
+        active_llm = llm_override if llm_override is not None else self.llm
 
         # Plan is embedded in the react loop — no separate LLM call.
         # Each tool call's `reason` field IS the Thought for that iteration.
@@ -375,7 +388,7 @@ class ActivatorV3(Activator):
                 {"role": "system", "content": PERFORMER_V3_SYSTEM_PROMPT},
             ] + inner_messages
 
-            llm_result = self.llm.chat(
+            llm_result = active_llm.chat(
                 messages=messages,
                 tools=active_tools,
                 tool_choice="required",
@@ -586,7 +599,7 @@ class ActivatorV3(Activator):
                         f"Last tool outputs:\n{last_outputs}"
                     )},
                 ]
-                summary = self.llm.chat(summary_msgs, role_tag="performer")
+                summary = active_llm.chat(summary_msgs, role_tag="performer")
                 self._charge_llm(contract, summary)
                 performer_reason = summary.text or "Exhausted max attempts"
             except Exception:
