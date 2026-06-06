@@ -431,23 +431,21 @@ class ActivatorV3(Activator):
                 performer_reason = "Performer stopped (implicit done)"
                 break
 
-            # Force-commit: if ≥2 attempts all read-only (no durable change),
-            # inject an explicit instruction to stop exploring and make the edit.
-            # Both flash and pro models explore indefinitely without this nudge.
-            read_only_tools = {"read", "rg", "bash", "fd", "goto_def", "find_refs",
-                               "outline", "list", "git_diff", "git_status"}
+            # Force-commit: if ≥2 attempts with no durable change made,
+            # inject an instruction to stop exploring and apply the change.
+            # Domain-agnostic: uses inv.durable_change (works for any tool/domain).
             attempts_so_far = max((inv.attempt for inv in all_invocations), default=0)
             any_durable_so_far = any(inv.durable_change for inv in all_invocations)
-            if (attempts_so_far >= 2 and not any_durable_so_far
-                    and all(inv.tool_name in read_only_tools for inv in all_invocations)):
+            if attempts_so_far >= 2 and not any_durable_so_far:
                 inner_messages.append({
                     "role": "user",
                     "content": (
-                        "FRAMEWORK: You have explored for 2+ attempts without making any change. "
-                        "You now MUST call str_replace (or write/apply_patch) with the content "
-                        "you already read. Do NOT call read/bash/rg again. "
-                        "Use the exact file content you saw to construct the str_replace call. "
-                        "If you genuinely cannot determine the correct edit, call give_up(reason=...)."
+                        "FRAMEWORK: You have gathered information for 2+ attempts "
+                        "without applying any change. "
+                        "You now have enough context. APPLY THE CHANGE the hypothesis describes. "
+                        "Use the information you already gathered to execute the modification. "
+                        "If the target genuinely does not exist or cannot be changed, "
+                        "call give_up(reason=...) with a specific explanation."
                     ),
                 })
 
