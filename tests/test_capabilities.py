@@ -3,12 +3,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from cat.capabilities import (
+from cat.capability.full_registry import (
     OUTPUT_CAP_BYTES,
     build_default_registry,
     workdir_snapshot,
 )
-from cat.contracts import State
+from cat.contract.model import State
 
 
 # Use the venv's Python explicitly — bare `python` on PATH may resolve to a
@@ -152,7 +152,7 @@ def test_output_truncation(tmp_path: Path):
 
 import subprocess as _sp
 
-from cat.capabilities import build_docker_registry
+from cat.capability.full_registry import build_docker_registry
 
 
 class _LocalContainer:

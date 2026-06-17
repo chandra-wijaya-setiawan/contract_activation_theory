@@ -60,6 +60,46 @@ _CACHE_DIR = Path(os.environ.get(
 # Oracle builder
 # ---------------------------------------------------------------------------
 
+def _normalize_test_id(test_id: str, repo_root: str = "") -> str:
+    """Convert SWE-bench test IDs to pytest node IDs.
+
+    SWE-bench stores test IDs in Django/unittest format:
+      "method_name (module.path.ClassName)"
+    or as test descriptions:
+      "Some docstring text."
+
+    Pytest needs:
+      "module/path.py::ClassName::method_name"
+    or (for descriptions): skip — use only proper method IDs.
+
+    Django conventions: the test runner module `foo.tests.SomeClass` maps to
+    the file `tests/foo/tests.py`, so we add a `tests/` prefix for dotted
+    paths that don't start with a known top-level directory.
+    """
+    # Already pytest format (contains ::)
+    if "::" in test_id:
+        return test_id
+    # unittest format: "method_name (module.path.ClassName)"
+    m = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s+\(([^)]+)\.([^.)]+)\)$', test_id)
+    if m:
+        method, module_path, class_name = m.group(1), m.group(2), m.group(3)
+        # module_path: e.g. "aggregation.tests" → file "aggregation/tests.py"
+        # Django keeps these under tests/ (e.g. /testbed/tests/aggregation/tests.py).
+        # Paths that already embed their root (astropy/..., sklearn/...) don't need it.
+        # Heuristic: if the first segment is a short generic word (no dots already
+        # indicate depth) add "tests/" prefix — most Django-style repos use this layout.
+        rel_path = module_path.replace(".", "/") + ".py"
+        # If the path has only 1-2 segments and doesn't look like an absolute package
+        # (e.g. "aggregation/tests.py" rather than "astropy/utils/tests/test_misc.py"),
+        # add the tests/ prefix Django uses.
+        segments = rel_path.split("/")
+        if len(segments) <= 3 and not rel_path.startswith("tests/"):
+            rel_path = "tests/" + rel_path
+        return f"{rel_path}::{class_name}::{method}"
+    # Looks like a test description (not a valid method name) — skip
+    return ""
+
+
 def _test_func_needs_network(func_name: str, patch_added_lines: str) -> bool:
     """Return True if the named test function's body references httpbin."""
     pattern = re.compile(
@@ -101,34 +141,70 @@ def _swebench_oracle(
         line[1:] for line in test_patch.splitlines() if line.startswith("+")
     )
 
+    # Normalize to pytest node IDs; skip IDs that can't be converted (descriptions).
+    norm_fail = [_normalize_test_id(t) for t in fail_to_pass]
+    norm_pass = [_normalize_test_id(t) for t in pass_to_pass]
+
+    # When FAIL_TO_PASS contains only descriptions (no class refs), fall back
+    # to deriving test IDs from the test_patch itself: find the new test method
+    # names and pair them with the file path from the diff header.
+    if not any(norm_fail):
+        patch_file_m = re.search(r'^diff --git a/(.+?) b/', test_patch, re.MULTILINE)
+        if patch_file_m:
+            patch_file = patch_file_m.group(1)
+            new_methods = re.findall(r'^\+\s{4}def (test_\w+)\b', test_patch, re.MULTILINE)
+            # Find the class name: try patch context first, then infer from PASS_TO_PASS.
+            # The hunk header "@@...@@ def method" gives the enclosing function but not
+            # the class — look for class in PASS_TO_PASS entries for the same module.
+            class_name = None
+            # Extract module from patch file (e.g. "tests/aggregation/tests.py" → "aggregation.tests")
+            patch_mod = re.sub(r'^tests/', '', patch_file).replace('.py', '').replace('/', '.')
+            for ptp in pass_to_pass:
+                ptp_m = re.match(r'^[a-zA-Z_]\w*\s+\(([^)]+)\.([^.)]+)\)$', ptp)
+                if ptp_m:
+                    ptp_mod, ptp_class = ptp_m.group(1), ptp_m.group(2)
+                    if patch_mod.endswith(ptp_mod) or ptp_mod.endswith(patch_mod.split('.')[-1]):
+                        class_name = ptp_class
+                        break
+            if new_methods and class_name:
+                norm_fail = [f"{patch_file}::{class_name}::{m}" for m in new_methods]
+            elif new_methods:
+                norm_fail = [f"{patch_file}::{m}" for m in new_methods]
+
     safe_fail = [
-        t for t in fail_to_pass
-        if not _test_func_needs_network(t.split("::")[-1], added_lines)
+        t for t in norm_fail
+        if t and not _test_func_needs_network(t.split("::")[-1], added_lines)
     ]
     safe_pass = [
-        t for t in pass_to_pass
-        if not _test_func_needs_network(t.split("::")[-1], added_lines)
+        t for t in norm_pass
+        if t and not _test_func_needs_network(t.split("::")[-1], added_lines)
     ]
 
     if not safe_fail:
         return ""
 
-    # Cap PASS_TO_PASS at a reasonable number so we don't run 1000s of tests
-    # on every oracle check. Pick a random-but-deterministic sample.
-    # 30 is a reasonable balance: enough to catch obvious regressions,
-    # not so many that the oracle takes minutes.
-    MAX_REGRESSION_SAMPLE = 30
-    if len(safe_pass) > MAX_REGRESSION_SAMPLE:
-        # Hash-based deterministic subsample keyed by task_id
-        import hashlib
-        h = int(hashlib.sha256(task_id.encode()).hexdigest()[:8], 16)
-        # Stable rotation over the sorted list
-        sorted_pass = sorted(safe_pass)
-        start = h % len(sorted_pass)
-        safe_pass = (sorted_pass[start:] + sorted_pass[:start])[:MAX_REGRESSION_SAMPLE]
-
     patch_b64 = base64.b64encode(test_patch.encode()).decode()
-    test_ids = " ".join(safe_fail + safe_pass)
+
+    # Build the test runner command. Django repos use their own runtests.py
+    # (pytest is not installed in Django testbeds). Other repos use pytest.
+    # Detect Django by checking if task_id matches the django__ pattern.
+    is_django = task_id.startswith("django__")
+    if is_django:
+        # Convert pytest IDs back to Django test runner format:
+        # "tests/aggregation/tests.py::AggregateTestCase::method" → "aggregation.tests.AggregateTestCase.method"
+        def pytest_id_to_django(tid: str) -> str:
+            # "tests/aggregation/tests.py::AggregateTestCase::method"
+            # → "aggregation.tests.AggregateTestCase.method"
+            segments = tid.split("::")
+            file_part = re.sub(r'^tests/', '', segments[0])  # strip leading tests/
+            file_part = re.sub(r'\.py$', '', file_part)      # strip .py
+            dotted_path = file_part.replace('/', '.')
+            return '.'.join([dotted_path] + segments[1:])
+        django_ids = " ".join(pytest_id_to_django(t) for t in safe_fail + safe_pass)
+        test_runner_cmd = f"./tests/runtests.py --verbosity 2 --settings=test_sqlite {django_ids}"
+    else:
+        test_ids = " ".join(safe_fail + safe_pass)
+        test_runner_cmd = f"PYTHONPATH=/testbed python -m pytest {test_ids} -x -q --tb=short"
 
     # 1.6.6.4 fix: restore canonical test files BEFORE applying test_patch.
     # Why: during a run the performer may have edited files under tests/ (a
@@ -147,8 +223,7 @@ def _swebench_oracle(
         f"git checkout -- 'test_*' 'tests_*' '*_tests' 2>/dev/null; "
         # Apply the canonical test_patch (idempotent for already-applied hunks)
         f"echo '{patch_b64}' | base64 -d | git apply --ignore-whitespace - 2>/dev/null; "
-        # Run the safe FAIL_TO_PASS subset; no pipes around pytest (exit code preservation)
-        f"PYTHONPATH=/testbed pytest {test_ids} -x -q --tb=short"
+        + test_runner_cmd
     )
 
 

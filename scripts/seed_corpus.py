@@ -13,7 +13,11 @@ import json
 import sys
 from pathlib import Path
 
-from cat._legacy.corpus import Corpus
+try:
+    from cat._legacy.corpus import Corpus
+except ImportError:
+    print("[seed_corpus] cat._legacy.corpus not available (v1/v2 feature); skipping.", flush=True)
+    import sys; sys.exit(0)
 
 
 def seed_one_run(corpus: Corpus, run_dir: Path) -> dict:

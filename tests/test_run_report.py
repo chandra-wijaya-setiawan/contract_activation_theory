@@ -1,7 +1,7 @@
 """Tests for run_report tool-economy extraction (1.8.0)."""
 from __future__ import annotations
 
-from cat.run_report import _tool_usage_from_events
+from tooling.reports.run_report import _tool_usage_from_events
 
 
 def _ev(kind, **payload):

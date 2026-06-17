@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cat-agent"
-version = "0.0.1"
+version = "0.3.0"
 description = "Contract Activation Theory agent: contract-disciplined alternative to ReAct"
 requires-python = ">=3.11"
 dependencies = [
@@ -24,8 +24,15 @@ bench = [
     "terminal-bench",
 ]
 
+[project.scripts]
+cat-chat = "cli.chat:main"
+cat-bench = "cli.bench:main"
+cat-report = "cli.report:main"
+cat-trace-view = "tooling.trace.view:main"
+
 [tool.setuptools.packages.find]
-include = ["cat*", "benchmarks*"]
+where = ["src"]
+include = ["cat*", "adapters*", "tooling*", "cli*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
