@@ -64,14 +64,14 @@ _PROBE_WRITE_CMD = (
 # content, so capture_pane() reliably returns the probe output regardless
 # of how much other output preceded it.
 _PROBE_READS: list[tuple[str, str]] = [
-    ("workdir",      "clear; head -40 /tmp/cat_r_workdir.txt"),
-    ("ls_detail",    "clear; head -35 /tmp/cat_r_ls_la.txt"),
-    ("file_types",   "clear; head -20 /tmp/cat_r_filetypes.txt"),
-    ("notes",        "clear; head -60 /tmp/cat_r_notes.txt"),
-    ("test_scripts", "clear; head -15 /tmp/cat_r_scripts.txt"),
-    ("test_command", "clear; head -20 /tmp/cat_r_cmd.txt"),
-    ("git_state",    "clear; head -10 /tmp/cat_r_git.txt"),
-    ("eval_command", "clear; head -10 /tmp/cat_r_eval_cmd.txt"),
+    ("workdir",      "head -40 /tmp/cat_r_workdir.txt"),
+    ("ls_detail",    "head -35 /tmp/cat_r_ls_la.txt"),
+    ("file_types",   "head -20 /tmp/cat_r_filetypes.txt"),
+    ("notes",        "head -60 /tmp/cat_r_notes.txt"),
+    ("test_scripts", "head -15 /tmp/cat_r_scripts.txt"),
+    ("test_command", "head -20 /tmp/cat_r_cmd.txt"),
+    ("git_state",    "head -10 /tmp/cat_r_git.txt"),
+    ("eval_command", "head -10 /tmp/cat_r_eval_cmd.txt"),
 ]
 
 

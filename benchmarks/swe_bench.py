@@ -141,35 +141,52 @@ def _swebench_oracle(
         line[1:] for line in test_patch.splitlines() if line.startswith("+")
     )
 
+    # Extract the primary file changed by the test_patch — used to resolve bare names.
+    patch_file_m = re.search(r'^diff --git a/(.+?) b/', test_patch, re.MULTILINE)
+    patch_file = patch_file_m.group(1) if patch_file_m else ""
+
+    def _resolve_id(test_id: str) -> str:
+        """Normalize a single test ID, falling back to bare-name resolution."""
+        norm = _normalize_test_id(test_id)
+        if norm:
+            return norm
+        # Bare function name (e.g. "test_Permutation_subclassing") — pair with patch file.
+        if patch_file and re.match(r'^test_\w+$', test_id):
+            return f"{patch_file}::{test_id}"
+        return ""
+
     # Normalize to pytest node IDs; skip IDs that can't be converted (descriptions).
-    norm_fail = [_normalize_test_id(t) for t in fail_to_pass]
-    norm_pass = [_normalize_test_id(t) for t in pass_to_pass]
+    # Also filter truncated parametrize IDs (have "[" but no "]") — they cause
+    # pytest exit_code=4 because the shell splits on embedded spaces.
+    def _is_valid(t: str) -> bool:
+        return bool(t) and not ("[" in t and "]" not in t)
+
+    norm_fail = [_resolve_id(t) for t in fail_to_pass]
+    norm_fail = [t for t in norm_fail if _is_valid(t)]
+    norm_pass = [_resolve_id(t) for t in pass_to_pass]
+    norm_pass = [t for t in norm_pass if _is_valid(t)]
 
     # When FAIL_TO_PASS contains only descriptions (no class refs), fall back
     # to deriving test IDs from the test_patch itself: find the new test method
     # names and pair them with the file path from the diff header.
-    if not any(norm_fail):
-        patch_file_m = re.search(r'^diff --git a/(.+?) b/', test_patch, re.MULTILINE)
-        if patch_file_m:
-            patch_file = patch_file_m.group(1)
-            new_methods = re.findall(r'^\+\s{4}def (test_\w+)\b', test_patch, re.MULTILINE)
-            # Find the class name: try patch context first, then infer from PASS_TO_PASS.
-            # The hunk header "@@...@@ def method" gives the enclosing function but not
-            # the class — look for class in PASS_TO_PASS entries for the same module.
-            class_name = None
-            # Extract module from patch file (e.g. "tests/aggregation/tests.py" → "aggregation.tests")
-            patch_mod = re.sub(r'^tests/', '', patch_file).replace('.py', '').replace('/', '.')
-            for ptp in pass_to_pass:
-                ptp_m = re.match(r'^[a-zA-Z_]\w*\s+\(([^)]+)\.([^.)]+)\)$', ptp)
-                if ptp_m:
-                    ptp_mod, ptp_class = ptp_m.group(1), ptp_m.group(2)
-                    if patch_mod.endswith(ptp_mod) or ptp_mod.endswith(patch_mod.split('.')[-1]):
-                        class_name = ptp_class
-                        break
-            if new_methods and class_name:
-                norm_fail = [f"{patch_file}::{class_name}::{m}" for m in new_methods]
-            elif new_methods:
-                norm_fail = [f"{patch_file}::{m}" for m in new_methods]
+    if not norm_fail and patch_file:
+        # Look for new test methods added in the patch (indented = class method,
+        # or top-level = module-level function).
+        new_methods = re.findall(r'^\+\s*def (test_\w+)\b', test_patch, re.MULTILINE)
+        # Find the class name from PASS_TO_PASS for class-method tests.
+        class_name = None
+        patch_mod = re.sub(r'^tests/', '', patch_file).replace('.py', '').replace('/', '.')
+        for ptp in pass_to_pass:
+            ptp_m = re.match(r'^[a-zA-Z_]\w*\s+\(([^)]+)\.([^.)]+)\)$', ptp)
+            if ptp_m:
+                ptp_mod, ptp_class = ptp_m.group(1), ptp_m.group(2)
+                if patch_mod.endswith(ptp_mod) or ptp_mod.endswith(patch_mod.split('.')[-1]):
+                    class_name = ptp_class
+                    break
+        if new_methods and class_name:
+            norm_fail = [f"{patch_file}::{class_name}::{m}" for m in new_methods]
+        elif new_methods:
+            norm_fail = [f"{patch_file}::{m}" for m in new_methods]
 
     safe_fail = [
         t for t in norm_fail
