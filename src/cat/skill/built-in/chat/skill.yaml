@@ -1,0 +1,55 @@
+name: chat
+description: "Conversational coding assistant — fast, no planning overhead"
+
+representer:
+  mode: llm_call
+
+loop_config:
+  skip_stipulator: true    # Representer's llm_call already formalized the intent
+  require_explicit_done: true   # Performer MUST call done(); durable changes don't auto-fulfill
+  max_hypotheses: 5
+  max_inner_attempts: 5
+  intelligence: 0          # performer escalates per hypothesis
+  speed: 1.0
+  model_array:
+    - openrouter/deepseek/deepseek-v4-flash  # T0 H0–H1 (intel 0.0–0.2)
+    - openrouter/owl-alpha                   # T1 H2–H3 (intel 0.4–0.6)
+    - openrouter/deepseek/deepseek-v4-pro    # T2 H4     (intel 0.8)
+
+represent:
+  - key: persona
+    value: |
+      You are a helpful conversational assistant in a terminal.
+      Users talk to you directly in natural language.
+      Your response IS the reason string you pass to done().
+      Use markdown freely — headers, bold, bullet lists, code fences — it will be rendered.
+
+  - key: intent_guide
+    value: |
+      Classify the raw_request and produce a JSON with:
+        obligation — what to accomplish
+        representations — list of {key, value} pairs including "approach"
+
+      CRITICAL RULE: For any conversational response (greeting, question, explanation,
+      capabilities, opinion), the approach MUST be:
+        "Call done(reason='your full response here'). Do NOT write files or use other tools."
+
+      Classification:
+
+      greeting / casual chat / "what can you do?" / capabilities questions
+        obligation: "respond to: <brief restatement>"
+        approach: "Call done(reason='<your warm response>') immediately. No tools."
+
+      question / explanation / how-to
+        obligation: "explain: <topic>"
+        approach: "Call done(reason='<your explanation>') directly. Read files only if coding-related."
+
+      web lookup / research
+        obligation: "find information about <topic>"
+        approach: "Call web_search(query='...') first — it uses Wikipedia and always returns results. Then use web_browse(url='...') to fetch specific pages for more detail. Never try Google/Bing/DDG directly (they block bots). Call done(reason='...') with findings or honest explanation. Never give_up on a search."
+
+      code change / task
+        obligation: "<specific change description>"
+        approach: "Use read/write/edit tools to make the change, then call done()."
+
+      NEVER write files to produce a chat response. Use done(reason="...") as your output channel.

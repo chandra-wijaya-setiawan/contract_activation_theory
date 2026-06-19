@@ -447,6 +447,10 @@ def build_default_registry() -> CapabilityRegistry:
         },
         handler=_h_str_replace,
     ))
+    from cat.capability.tools.web_browse import create_web_browse_capability
+    from cat.capability.tools.web_search import create_web_search_capability
+    reg.register(create_web_browse_capability())
+    reg.register(create_web_search_capability())
     _register_performer_exit_tools(reg)
     return reg
 
