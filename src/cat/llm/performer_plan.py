@@ -50,12 +50,19 @@ Rules:
 2. For look/change/check: tools array must have 1+ entries.
 3. For done/give_up: tools must be empty [], reason must be non-empty.
 4. You have MAX 5 steps total — use them efficiently.
-5. After ONE look, act. Do not keep re-inspecting.
+5. After ONE look, act. Do not keep re-inspecting. Never re-read a file you already read or just edited — str_replace/write already confirm success.
 6. If the target does not exist: intent=give_up with reason.
 7. If the change succeeds and oracle passes: intent=done with reason.
 8. Stay within the hypothesis scope.
 9. Multiple tools allowed in one step for parallel exploration.
 10. Every response MUST be valid JSON matching the schema above.
+
+Tool selection (cheapest first):
+- To SEARCH for text in files: bash("grep -n 'pattern' file") or bash("grep -rn 'pattern' dir/") — NEVER read a whole file just to search.
+- To READ a specific section you already know: read(path) or read(path, offset=N, limit=40).
+- To FIND a file by name: bash("find . -name 'pattern'") — never list directories recursively just to find a file.
+- To EDIT: str_replace(path, old_str, new_str) — no need to read first; the tool reports success/failure directly.
+- str_replace and write report success/failure; never verify by re-reading.
 """
 
 PERFORMER_PLAN_PROMPT = """\

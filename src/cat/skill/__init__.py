@@ -63,7 +63,7 @@ class SkillDef:
     # represent: list of {key, value} dicts from YAML
     represent:   list[dict] = field(default_factory=list)
     # representer configuration
-    representer_mode:   str  = "bash_probes"   # "llm_call" | "bash_probes" | "adapter"
+    representer_mode:   str  = "bash_probes"   # "llm_call" | "bash_probes" | "probes_then_llm_call" | "adapter"
     representer_probes: list = field(default_factory=list)  # [{key, command}, ...]
     # Paths to scripts (None = not present)
     oracle_script:   Optional[Path] = None

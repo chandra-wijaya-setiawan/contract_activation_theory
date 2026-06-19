@@ -382,7 +382,11 @@ def build_default_registry() -> CapabilityRegistry:
     reg = CapabilityRegistry()
     reg.register(Capability(
         name="bash",
-        description="Run a shell command in the workdir. Returns stdout+stderr, truncated. Returns is_error=true on non-zero exit.",
+        description=(
+            "Run a shell command in the workdir. Returns stdout+stderr, truncated. "
+            "PREFERRED for searching: bash('grep -n \"pattern\" file') or bash('grep -rn \"pattern\" dir/') — "
+            "much cheaper than reading whole files. Also use for find, wc, git, scripts, tests."
+        ),
         json_schema={
             "type": "object",
             "properties": {

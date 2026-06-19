@@ -72,7 +72,12 @@ _md_console = Console()   # stdout — used to render Markdown responses
 # ── Spinner ───────────────────────────────────────────────────────────────────
 
 class Spinner:
-    """Animated braille spinner on stderr with elapsed-seconds counter."""
+    """Animated braille spinner on stderr with elapsed-seconds counter.
+
+    Writes on the *current* line using \\r — no \\n, no cursor-up tricks.
+    All content output must go to stderr too so the single stream's cursor
+    position stays authoritative.
+    """
 
     def __init__(self, enabled: bool = True):
         self._enabled = enabled
@@ -85,21 +90,20 @@ class Spinner:
             return
         self._stop.clear()
         t0 = time.time()
-        label_snap = label   # capture for thread closure
+        label_snap = label
         def _run() -> None:
-            sys.stderr.write("\n")   # claim a fresh line; \r will overwrite within it
-            sys.stderr.flush()
             i = 0
             while True:
                 ch = _SPINNER[i % len(_SPINNER)]
                 elapsed = int(time.time() - t0)
                 suffix = f"  {_DIM}{elapsed}s{_RESET}" if elapsed >= 2 else ""
-                sys.stderr.write(f"\r   {_DIM}{ch}  {label_snap}…{_RESET}{suffix}")
+                # \r → go to start of current line, overwrite in place
+                sys.stderr.write(f"\r   {_DIM}{ch}  {label_snap}…{_RESET}{suffix}   ")
                 sys.stderr.flush()
                 i += 1
-                if self._stop.wait(0.1):   # draw first, then wait
+                if self._stop.wait(0.1):
                     break
-            sys.stderr.write(f"\r{_ERASE}\033[1A")   # erase spinner line, move cursor back up
+            sys.stderr.write(f"\r{_ERASE}")   # erase spinner line, stay on same line
             sys.stderr.flush()
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
@@ -108,6 +112,7 @@ class Spinner:
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.3)
+        self._thread = None
 
 
 # ── Streaming recorder ────────────────────────────────────────────────────────
@@ -133,12 +138,18 @@ class StreamingRecorder(Recorder):
         self._spinner.stop()
         self._render(event)
 
+    def _print(self, s: str, flush: bool = True) -> None:
+        """Write a line to stderr — same stream as the spinner."""
+        sys.stderr.write(s + "\n")
+        if flush:
+            sys.stderr.flush()
+
     def _render(self, event: TraceEvent) -> None:
         kind = event.kind
         p = event.payload or {}
 
         if kind == "contract_represent":
-            print(f"   {_DIM}⟳  planning…{_RESET}", flush=True)
+            self._print(f"   {_DIM}⟳  planning…{_RESET}")
             self._spinner.start("planning")
 
         elif kind == "hypothesis_attempt":
@@ -147,56 +158,56 @@ class StreamingRecorder(Recorder):
             start = p.get("start_from_requested", "base")
             model = p.get("execution_model", "")
             tier  = f"  {_DIM}{model}{_RESET}" if model else ""
-            print(f"\n{_BOLD}{_CYAN}◈  Hypothesis {n}{_RESET} [{start}]{tier}")
+            self._print(f"\n{_BOLD}{_CYAN}◈  Hypothesis {n}{_RESET} [{start}]{tier}")
             loc  = (p.get("location") or "").strip()
             chg  = (p.get("change")   or "").strip()
             pred = (p.get("predicts") or "").strip()
             basis = (p.get("basis")   or "").strip()
             if loc and loc != "*":
-                print(f"   {_DIM}target  {_RESET}{loc}")
+                self._print(f"   {_DIM}target  {_RESET}{loc}")
             if chg:
-                print(f"   {_DIM}plan    {_RESET}{chg}")
+                self._print(f"   {_DIM}plan    {_RESET}{chg}")
             if pred:
-                print(f"   {_DIM}expects {_RESET}{pred}")
+                self._print(f"   {_DIM}expects {_RESET}{pred}")
             if basis:
-                print(f"   {_DIM}basis   {_RESET}{basis}")
+                self._print(f"   {_DIM}basis   {_RESET}{basis}")
             self._spinner.start("generating")
 
         elif kind == "performer_response":
             text = (p.get("text") or "").strip()
             if text and len(text) > 60:
-                print()
+                self._print("")
                 for line in text.splitlines():
-                    print(f"  {_DIM}{line}{_RESET}")
-                print()
+                    self._print(f"  {_DIM}{line}{_RESET}")
+                self._print("")
 
         elif kind == "tool_call":
             tool = p.get("tool", "")
             args = p.get("args", {})
             if tool == "bash":
                 cmd = (args.get("command") or "")[:70].replace("\n", " ")
-                print(f"   {_GREY}▸ bash{_RESET}  {cmd}", flush=True)
+                self._print(f"   {_GREY}▸ bash{_RESET}  {cmd}")
             elif tool in ("str_replace", "multi_edit", "write", "apply_patch"):
                 path  = args.get("path") or args.get("source_path") or ""
                 extra = f"  ({len(args['edits'])} edits)" if tool == "multi_edit" and "edits" in args else ""
-                print(f"   {_YELLOW}✎ {tool}{_RESET}  {path}{extra}", flush=True)
+                self._print(f"   {_YELLOW}✎ {tool}{_RESET}  {path}{extra}")
             elif tool in ("read", "outline", "git_diff", "git_status", "rg", "fd"):
                 path = args.get("path") or args.get("file_path") or args.get("pattern") or args.get("name") or ""
-                print(f"   {_GREY}▸ {tool}{_RESET}  {str(path)[:70]}", flush=True)
+                self._print(f"   {_GREY}▸ {tool}{_RESET}  {str(path)[:70]}")
             elif tool == "done":
                 reason = (args.get("reason") or "").strip()
                 if reason:
-                    print()
-                    _md_console.print(Markdown(reason))
-                    print()
+                    self._print("")
+                    console.print(Markdown(reason))
+                    self._print("")
             elif tool == "give_up":
                 reason = (args.get("reason") or "").strip()
                 if reason:
-                    print(f"   {_RED}↺  give_up{_RESET} — {reason[:120]}")
+                    self._print(f"   {_RED}↺  give_up{_RESET} — {reason[:120]}")
             elif tool in ("web_browse", "web_search"):
                 q = (args.get("url") or args.get("query") or "")[:70]
                 verb = "browse" if tool == "web_browse" else "search"
-                print(f"   {_GREY}▸ {verb}{_RESET}  {q}", flush=True)
+                self._print(f"   {_GREY}▸ {verb}{_RESET}  {q}")
             _TOOL_SPIN = {
                 "bash": "running", "rg": "searching", "fd": "searching",
                 "read": "reading", "outline": "reading",
@@ -213,7 +224,7 @@ class StreamingRecorder(Recorder):
         elif kind == "tool_result":
             if p.get("is_error"):
                 out = (p.get("output") or "")[:80].replace("\n", " ")
-                print(f"   {_RED}✗ error{_RESET}  {out}", flush=True)
+                self._print(f"   {_RED}✗ error{_RESET}  {out}")
             # LLM is about to decide its next action — keep spinner going
             if p.get("tool") not in ("done", "give_up"):
                 self._spinner.start("reasoning")
@@ -222,17 +233,17 @@ class StreamingRecorder(Recorder):
             sat  = p.get("satisfied")
             ev   = (p.get("evidence") or "").replace("\n", " ").strip()
             mark = f"{_GREEN}✓" if sat else f"{_RED}✗"
-            print(f"   {mark} oracle{_RESET}  {ev}")
+            self._print(f"   {mark} oracle{_RESET}  {ev}")
 
         elif kind == "knowledge_update":
             verdict = p.get("verdict", "")
             reason = (p.get("reason") or "").strip()
             if verdict in ("completed", "exhausted") and reason:
-                print()
-                _md_console.print(Markdown(reason))
-                print()
+                self._print("")
+                console.print(Markdown(reason))
+                self._print("")
             elif verdict == "give_up" and reason:
-                print(f"   {_RED}↺  give_up{_RESET} — {reason[:120]}")
+                self._print(f"   {_RED}↺  give_up{_RESET} — {reason[:120]}")
 
         elif kind == "llm_usage":
             self._cost_usd += float(p.get("usd", 0))
@@ -242,11 +253,11 @@ class StreamingRecorder(Recorder):
             reason  = (p.get("reason") or "")[:80]
             elapsed = time.time() - self._start_ts
             if to == "fulfilled":
-                print(f"\n{_GREEN}{_BOLD}✅  done{_RESET}  "
-                      f"({self._current_h} hypothesis · {elapsed:.0f}s · ${self._cost_usd:.4f})")
+                self._print(f"\n{_GREEN}{_BOLD}✅  done{_RESET}  "
+                             f"({self._current_h} hypothesis · {elapsed:.0f}s · ${self._cost_usd:.4f})")
             elif to == "failed":
-                print(f"\n{_RED}{_BOLD}✗  failed{_RESET}  {reason}  "
-                      f"({elapsed:.0f}s · ${self._cost_usd:.4f})")
+                self._print(f"\n{_RED}{_BOLD}✗  failed{_RESET}  {reason}  "
+                             f"({elapsed:.0f}s · ${self._cost_usd:.4f})")
 
 
 # ── Infrastructure helpers ────────────────────────────────────────────────────
@@ -593,10 +604,9 @@ def chat(session: Session) -> None:
             continue
 
         last_sha = _pre_sha(session.workdir)
-        sys.stderr.write(f"   {_DIM}⠋  working…{_RESET}")
-        sys.stderr.flush()
         session.run_task(task)
-        print()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 # ── One-shot ──────────────────────────────────────────────────────────────────
