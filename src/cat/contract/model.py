@@ -7,7 +7,6 @@ Design commitments (see DESIGN.md):
 """
 from __future__ import annotations
 
-import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -151,6 +150,7 @@ class State:
     workdir: Path = field(default_factory=lambda: Path("."))
     kv: dict = field(default_factory=dict)
     last_tool_result: Optional[dict] = None
+    last_response: str = ""   # written by activator before oracle check; read by LLM judge
 
 
 @dataclass
@@ -168,8 +168,11 @@ class Contract:
     grant: set[str] = field(default_factory=set)
     capabilities: list[str] = field(default_factory=list)
     depth: int = 0
+    parent_contract_id: Optional[str] = None
     suspend_reason: str = ""
     re_entry_condition: str = ""
+    chat_history: list[dict] = field(default_factory=list)
+    raw_request: str = ""
 
     @classmethod
     def new(

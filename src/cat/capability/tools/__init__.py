@@ -14,7 +14,7 @@ Domain-specific tools are registered by the task adapter (e.g., swe_bench.py).
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
 from cat.capability.registry import Capability
 

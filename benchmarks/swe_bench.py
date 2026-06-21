@@ -388,7 +388,6 @@ class TbSweAgent(TbCatAgent):
         Skips the failure injection if no oracle is available (LLM judge
         fallback) or tests already pass.
         """
-        from cat.contracts import Evidence
 
         # Fact 1 (always present for SWE-bench): the harness-test convention.
         reps = [Representation(

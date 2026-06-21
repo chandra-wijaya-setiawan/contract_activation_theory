@@ -259,7 +259,7 @@ if [[ -f "$RUN_DIR/results.json" ]]; then
   CORPUS_DB="${CAT_CORPUS_DB:-$REPO_ROOT/data/corpus/cat_corpus.db}"
   echo ""
   echo "── Writing samples to corpus: $CORPUS_DB"
-  cd "$REPO_ROOT" && python3 scripts/seed_corpus.py "$CORPUS_DB" "$RUN_DIR" || true
+  cd "$REPO_ROOT" && python3 src/experiment/seed_corpus.py "$CORPUS_DB" "$RUN_DIR" || true
 fi
 
 # Regenerate top-level INDEX

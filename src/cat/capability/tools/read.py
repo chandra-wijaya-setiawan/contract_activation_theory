@@ -24,7 +24,7 @@ def create_read_capability() -> Capability:
 
 
 def _handle(args: dict, state: State) -> ToolResult:
-    path = args.get("path")
+    path = args.get("path") or args.get("file_path") or args.get("filepath")
     if not isinstance(path, str) or not path:
         return ToolResult(tool="read", is_error=True, output="missing 'path'")
     try:

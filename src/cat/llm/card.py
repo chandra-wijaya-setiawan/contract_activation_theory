@@ -26,6 +26,7 @@ class LLMModelCard:
 _CARDS: list[LLMModelCard] = [
     LLMModelCard("openrouter/deepseek/deepseek-v4-flash", "DeepSeek", "DeepSeek V4", "flash"),
     LLMModelCard("openrouter/deepseek/deepseek-v4-pro",   "DeepSeek", "DeepSeek V4", "pro"),
+    LLMModelCard("openrouter/owl-alpha",                  "OpenRouter", "Owl Alpha", "alpha"),
     LLMModelCard("openrouter/moonshotai/kimi-k2.6",       "Moonshot AI", "Kimi K2", "k2.6"),
     LLMModelCard("openrouter/anthropic/claude-opus-4.5",  "Anthropic", "Claude Opus", "4.5"),
     LLMModelCard("openrouter/openai/gpt-5.3-codex",       "OpenAI", "GPT-5 Codex", "5.3"),

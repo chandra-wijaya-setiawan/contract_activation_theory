@@ -130,6 +130,7 @@ class LLMKernel:
             "variant": c.variant, "mode": self.mode, "role": self.role_tag,
             "intelligence": round(self._intel, 3), "ok": ok,
             "tokens_in": ar.tokens_in, "tokens_out": ar.tokens_out,
+            "tokens_cached": getattr(ar, "tokens_cached", 0),
             "usd": ar.usd, "finish_reason": ar.finish_reason,
         })
 
@@ -143,7 +144,7 @@ class LLMKernel:
         tool_choice: str = "auto",
         parent_event_id: Optional[str] = None,
     ) -> KernelResult:
-        from cat.llm.adapters import adapter_for
+        from cat.llm.adapters import adapter_for  # noqa: E402
         active_schema = schema if schema is not None else self.schema
         work = list(messages)
         max_tok = self.base_max_tokens

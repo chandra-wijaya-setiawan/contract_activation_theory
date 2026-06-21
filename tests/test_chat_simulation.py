@@ -128,7 +128,7 @@ class TestSkillLoading:
         skill = SkillRegistry().load("chat")
         cfg   = skill.loop_config
         assert cfg.skip_representer is False, "chat uses llm_call representer for intent formalization"
-        assert cfg.skip_stipulator  is False, "chat uses Stipulator for hypothesis generation"
+        assert cfg.skip_stipulator  is True,  "chat skips Stipulator; Representer llm_call already plans"
         assert cfg.skip_oracle      is False, "chat uses LLM judge oracle"
         assert cfg.max_hypotheses   >= 3,     "chat retries with escalating model tiers"
         assert cfg.intelligence     < 0.5,    "chat planner uses fast/cheap model"

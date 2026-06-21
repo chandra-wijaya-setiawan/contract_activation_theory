@@ -30,7 +30,7 @@ def check_admission(
       (c) Capacity — is there room to run?
       (d) Grant — derive granted capability set.
     """
-    from cat.engine.base import ActivatorRun
+    from cat.agent.base import ActivatorRun
     if run is None:
         run = ActivatorRun(contract=contract, state=state)
 

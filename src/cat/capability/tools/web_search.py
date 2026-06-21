@@ -135,7 +135,6 @@ def _wikipedia_search(query: str, n: int) -> tuple[list[dict], str]:
     for h in hits:
         title = h.get("title", "")
         snippet = re.sub(r"<[^>]+>", "", h.get("snippet", "")).strip()
-        page_id = h.get("pageid")
         url_slug = title.replace(" ", "_")
         article_url = f"https://en.wikipedia.org/wiki/{url_slug}"
         results.append({"title": title, "url": article_url, "snippet": snippet})

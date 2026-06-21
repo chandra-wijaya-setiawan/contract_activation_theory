@@ -1,14 +1,7 @@
 """Contract Activation Theory (CAT) — contract-disciplined agent runtime.
 
-Public surface kept small; deeper modules expose internals for tests and tooling.
-
-Usage:
-    from cat import Contract, Activator, HypothesisLoopActivator
-    from cat.contract import ContractState, Criterion
-    from cat.llm import LLMKernel
-
-See design.v3.md for the full architecture spec.
-See refactor_plan.md for the module layout and migration status.
+Public API:
+    from cat import Contract, Activator, LLMKernel, Recorder
 """
 from cat.contract.model import (
     Contract,
@@ -17,7 +10,7 @@ from cat.contract.model import (
     Constraints,
     Cost,
 )
-from cat.engine.activator import HypothesisLoopActivator
+from cat.agent.hypothesis import HypothesisLoopActivator
 from cat.trace import Recorder, TraceEvent, Trajectory
 
 __all__ = [

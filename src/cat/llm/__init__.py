@@ -12,7 +12,7 @@ The llm package owns all model interaction:
 
 Design notes:
   - LLMKernel is the "brain/CPU" — self-heals (reask + escalate) on bad output
-  - Adapters handle per-model request/response shaping
+  - Adapters (cat.llm.adapters) handle per-model request/response shaping
   - Router dispatches to the correct backend for a model_id
 """
 from cat.llm.client import LLM, LLMResult, call_structured

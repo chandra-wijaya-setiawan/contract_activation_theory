@@ -20,7 +20,7 @@ Why this matters for the hypothesis loop:
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable
 
 
 class NullCheckpointer:
@@ -109,7 +109,7 @@ class GitCheckpointer:
         sh = (
             f"git read-tree {ref} && "
             "git checkout-index -f -a && "
-            "git clean -fdq >/dev/null 2>&1; "
+            "git clean -fdq --exclude=.cat >/dev/null 2>&1; "
             "git reset -q HEAD >/dev/null 2>&1; "
             "echo OK"
         )

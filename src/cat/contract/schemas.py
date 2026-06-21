@@ -45,6 +45,7 @@ class PerformerTaskSchema(BaseModel):
     oracle: str = ""
     context: str = ""
     max_attempts: int = 5
+    chat_history: list[dict] = Field(default_factory=list)
 
 
 class PerformerStep(BaseModel):
@@ -70,6 +71,11 @@ class AttestorV3Schema(BaseModel):
     verdict: Literal["new_hypothesis", "give_up"] = "new_hypothesis"
     reason: str = ""
     diagnosis: str = ""
+
+
+class ChatJudgeSchema(BaseModel):
+    verdict: Literal["accept", "retry"] = "accept"
+    reason: str = ""
 
 
 class InvocationSchema(BaseModel):
@@ -177,3 +183,18 @@ class PerformerExecutionStep(BaseModel):
             if not self.then:
                 raise ValueError(f"intent={self.intent!r} requires then")
         return self
+
+
+class ContractHeaderSchema(BaseModel):
+    obligation:      str        = ""
+    representations: list[dict] = Field(default_factory=list)
+
+
+class SubAgentResult(BaseModel):
+    """Result returned by a sub-agent after contract discharge."""
+    verdict: Literal["completed", "failed", "partial"] = "failed"
+    output: str = Field(default="", description="Natural language summary of what the sub-agent did")
+    artifacts: dict[str, str] = Field(default_factory=dict, description="Key-value outputs: file paths, extracted facts, etc.")
+    tokens_spent: int = Field(default=0, description="Total tokens consumed by the sub-agent")
+    tool_calls: int = Field(default=0, description="Total tool calls made by the sub-agent")
+    trace_id: str = Field(default="", description="Sub-agent contract ID for trace linkage")

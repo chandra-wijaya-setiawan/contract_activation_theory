@@ -26,10 +26,12 @@ dist/
 
 # Run artifacts (traces, parquet, jsonl)
 data/
+.cat/
 
 # Local backups
 cat_backup/
 cat_archive/
+src_backup/
 *.parquet
 
 # OS / editor

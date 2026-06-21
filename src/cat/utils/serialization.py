@@ -86,7 +86,8 @@ def estimate_usd(model: str, tokens_in: int, tokens_out: int) -> float:
 
 
 def _strip_provider(model: str) -> str:
-    """Strip 'openrouter/' prefix from model ID."""
-    if model.startswith("openrouter/"):
-        return model[len("openrouter/"):]
+    """Strip provider prefix from model ID (openrouter/, ollama/, etc.)."""
+    for prefix in ("openrouter/", "ollama/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
     return model

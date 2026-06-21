@@ -30,6 +30,7 @@ class LLMResult:
     finish_reason: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
+    tokens_cached: int = 0   # KV-cache hits; >0 means prefix was served from cache
     usd: float = 0.0
     model: str = ""
     raw: dict = field(default_factory=dict)
@@ -94,7 +95,21 @@ class LLM:
 
     R11: retries with exponential backoff on degenerate (0/0 token) responses
     and openai-client exceptions. Backoff: base_delay * 2^attempt.
+
+    Multi-provider routing:
+      - Models prefixed with "ollama/" route to OLLAMA_BASE_URL (default
+        http://10.0.0.3:11434/v1) with api_key="ollama".
+      - All other models route to OpenRouter (OPENROUTER_API_KEY).
     """
+
+    # Provider routing table: prefix → (base_url, api_key, extra_headers)
+    _PROVIDER_TABLE: dict[str, tuple[str, Optional[str], dict]] = {
+        "ollama/": (
+            os.environ.get("OLLAMA_BASE_URL", "http://10.0.0.3:11434/v1"),
+            "ollama",
+            {},
+        ),
+    }
 
     def __init__(
         self,
@@ -108,13 +123,25 @@ class LLM:
         self.api_model = _strip_provider(model)
         self.recorder = recorder
         self.parent_event_id = parent_event_id
+
+        # Resolve provider by model prefix
+        provider_base_url = base_url
+        provider_api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        provider_headers = {
+            "HTTP-Referer": "https://github.com/cat-agent",
+            "X-Title": "CAT Agent",
+        }
+        for prefix, (p_url, p_key, p_headers) in self._PROVIDER_TABLE.items():
+            if model.startswith(prefix):
+                provider_base_url = p_url
+                provider_api_key = p_key
+                provider_headers = p_headers
+                break
+
         self.client = OpenAI(
-            api_key=api_key or os.environ.get("OPENROUTER_API_KEY"),
-            base_url=base_url,
-            default_headers={
-                "HTTP-Referer": "https://github.com/cat-agent",
-                "X-Title": "CAT Agent",
-            },
+            api_key=provider_api_key,
+            base_url=provider_base_url,
+            default_headers=provider_headers,
         )
 
     def chat(
@@ -198,12 +225,16 @@ class LLM:
         usage = getattr(resp, "usage", None)
         t_in = int(getattr(usage, "prompt_tokens", 0)) if usage else 0
         t_out = int(getattr(usage, "completion_tokens", 0)) if usage else 0
+        # KV cache hits: OpenAI/DeepSeek surface this as prompt_tokens_details.cached_tokens
+        _details = getattr(usage, "prompt_tokens_details", None) if usage else None
+        t_cached = int(getattr(_details, "cached_tokens", 0)) if _details else 0
         usd = estimate_usd(self.model, t_in, t_out)
 
         result = LLMResult(
             text=msg.content, tool_calls=tool_calls_list,
             finish_reason=choice.finish_reason or "",
-            tokens_in=t_in, tokens_out=t_out, usd=usd, model=self.model,
+            tokens_in=t_in, tokens_out=t_out, tokens_cached=t_cached,
+            usd=usd, model=self.model,
             raw={"wall_s": wall_s, "role_tag": role_tag},
         )
 
@@ -217,6 +248,7 @@ class LLM:
                     "role": role_tag, "wall_s": round(wall_s, 3),
                     "finish_reason": result.finish_reason,
                     "n_tool_calls": len(tool_calls_list),
+                    "cached": t_cached,
                 },
             ))
 

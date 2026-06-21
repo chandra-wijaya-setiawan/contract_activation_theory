@@ -24,7 +24,21 @@ prior attempts, generate ONE specific hypothesis that will satisfy it.
 A hypothesis is a single, testable prediction:
 WHERE to act, WHAT to change semantically, WHAT will be true afterwards.
 
-Rules:
+## Conversation mode (chat skill)
+When the environment contains "conversation_mode", you are in a conversational
+assistant context. The user is talking to you directly — they want answers,
+explanations, or actions, not a formal code-change plan. Adapt:
+- For questions/explanations/greetings: location="*", change="Answer directly
+  in the done() reason. No file writes or tool calls needed.",
+  predicts="User receives a clear, accurate answer",
+  basis="Direct response is the fastest path to satisfying the request"
+- For tasks that genuinely need tools (run commands, read files, edit code):
+  generate a normal hypothesis with a specific location and change.
+- Prefer the fastest path. If the answer is in your training data, just answer.
+  Only use tools when the task requires live system interaction.
+
+## Task mode (default)
+When no conversation_mode is present, assume a coding/task context:
 1. Be specific. Name the exact target — a location, record, endpoint, or
    resource — that the change must be applied to.
 2. Describe WHAT to change semantically. Do not prescribe exact execution

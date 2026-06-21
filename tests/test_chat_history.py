@@ -129,11 +129,11 @@ def test_activator_prepends_chat_history_to_performer_messages():
     not the current task — verifying Option B message threading.
     """
     from pathlib import Path
-    from cat.engine.activator import HypothesisLoopActivator
+    from cat.agent.hypothesis import HypothesisLoopActivator
     from cat.contract.model import Contract, Constraints, State
     from cat.trace import Recorder
     from cat.capability.registry import CapabilityRegistry
-    from cat.skill import LoopConfig, SkillDef
+    from cat.agent.definition import AgentDef, LoopConfig
     from cat.capability.git_checkpoint import NullCheckpointer
     from cat.llm.client import LLM
     from cat.llm.kernel import LLMKernel
@@ -157,7 +157,7 @@ def test_activator_prepends_chat_history_to_performer_messages():
         return _orig_run(messages, **kw)
     capturing_kernel.run = _capturing_run
 
-    skill = SkillDef(
+    skill = AgentDef(
         name="chat",
         loop_config=LoopConfig(
             skip_representer=True,
