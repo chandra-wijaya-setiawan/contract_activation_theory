@@ -1,4 +1,4 @@
-"""Attestor — judges whether a hypothesis attempt succeeded or failed.
+"""Attestor — builds the judgment prompt. LLM calls go through LLMKernel.
 
 Called once per hypothesis cycle (only on oracle failure) to decide:
   - "new_hypothesis" → try again with updated knowledge
@@ -8,11 +8,7 @@ See design.v3.md §"Attestor (called only on oracle failure)".
 """
 from __future__ import annotations
 
-import json
 from typing import Any, Optional
-
-from cat.contract.schemas import AttestorV3Schema
-from cat.llm.client import LLM, LLMResult
 
 ATTESTOR_V3_SYSTEM_PROMPT = """\
 You are the ATTESTOR. The oracle failed after a hypothesis attempt.
@@ -52,16 +48,12 @@ Output ONLY a JSON object:
 """
 
 
-def call_attestor_v3(
-    llm: LLM,
+def build_attestor_messages(
     performer_result: Any,
     knowledge: Any = None,
     prior_attempts: Optional[list[dict]] = None,
-    parent_event_id: Optional[str] = None,
-) -> tuple[Optional[AttestorV3Schema], LLMResult]:
-    """Call the Attestor to judge a failed hypothesis attempt."""
-    from pydantic import ValidationError
-
+) -> list[dict]:
+    """Build the message list for the Attestor LLM call."""
     verdict_str = getattr(performer_result, "verdict", "exhausted")
     reason_str = getattr(performer_result, "performer_reason", "") or ""
     findings = getattr(knowledge, "findings", {}) if knowledge else {}
@@ -91,22 +83,7 @@ def call_attestor_v3(
         f"\nORACLE FAILURES:{oracle_str or ' (none)'}\n"
         f"\nPRIOR FAILED ATTEMPTS:{prior_str or ' (none)'}"
     )
-    messages = [
+    return [
         {"role": "system", "content": ATTESTOR_V3_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
-    result = llm.chat(
-        messages=messages,
-        response_format={"type": "json_object"},
-        role_tag="attestor",
-        temperature=0.0,
-        parent_event_id=parent_event_id,
-    )
-    if not result.text:
-        return AttestorV3Schema(verdict="new_hypothesis", reason="attestor returned no text"), result
-    try:
-        data = json.loads(result.text)
-        v = AttestorV3Schema(**data)
-        return v, result
-    except (json.JSONDecodeError, ValidationError, TypeError):
-        return AttestorV3Schema(verdict="new_hypothesis", reason="attestor parse failed"), result

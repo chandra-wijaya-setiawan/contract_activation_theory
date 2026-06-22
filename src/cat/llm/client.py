@@ -36,57 +36,6 @@ class LLMResult:
     raw: dict = field(default_factory=dict)
 
 
-def call_structured(
-    llm: "LLM",
-    messages: list,
-    model_cls: Any,
-    *,
-    role_tag: str,
-    max_tokens: int = 4096,
-    temperature: float = 0.1,
-    parent_event_id: Optional[str] = None,
-) -> tuple[Optional[Any], Any]:
-    """Get a Pydantic-model-constrained response from the LLM.
-
-    Strategy (best -> most compatible):
-      1. Pydantic-derived json_schema strict mode
-      2. Fallback to json_object
-      3. extract_json_object() rescues JSON embedded in prose
-      4. Pydantic validates the final dict
-
-    Returns (model_instance | None, LLMResult).
-    """
-    from pydantic import ValidationError
-
-    schema = model_cls.model_json_schema()
-    json_schema_fmt = {
-        "type": "json_schema",
-        "json_schema": {"name": model_cls.__name__, "schema": schema, "strict": True},
-    }
-
-    result = None
-    for fmt in (json_schema_fmt, {"type": "json_object"}):
-        try:
-            result = llm.chat(
-                messages=messages, response_format=fmt,
-                role_tag=role_tag, temperature=temperature,
-                max_tokens=max_tokens, parent_event_id=parent_event_id,
-            )
-        except Exception:
-            continue
-        if not result or not result.text:
-            continue
-        data = extract_json_object(result.text)
-        if data is None:
-            continue
-        try:
-            return model_cls(**data), result
-        except (ValidationError, TypeError):
-            continue
-
-    return None, result
-
-
 class LLM:
     """Thin OpenAI-compatible wrapper. One instance per agent run.
 
@@ -151,6 +100,7 @@ class LLM:
         tools: Optional[list[dict]] = None,
         tool_choice: Optional[str] = None,
         response_format: Optional[dict] = None,
+        extra_body: Optional[dict] = None,
         max_tokens: Optional[int] = None,
         temperature: float = 0.2,
         reasoning_effort: Optional[str] = None,
@@ -160,7 +110,11 @@ class LLM:
         max_retries: int = 3,
         retry_base_delay_s: float = 2.0,
     ) -> LLMResult:
-        """One chat completion. Records llm_usage TraceEvent on success."""
+        """One chat completion. Records llm_usage TraceEvent on success.
+
+        NO provider translation — the caller (provider) already shaped the
+        right kwargs for this model. LLM just executes.
+        """
         kwargs: dict[str, Any] = {
             "model": self.api_model, "messages": messages, "temperature": temperature,
         }
@@ -172,10 +126,14 @@ class LLM:
             kwargs["response_format"] = response_format
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        # Merge extra_body: provider params (format, etc.) + reasoning
+        merged_extra = dict(extra_body or {})
         _reasoning = reasoning if reasoning is not None else (
             {"effort": reasoning_effort} if reasoning_effort is not None else None)
         if _reasoning is not None:
-            kwargs["extra_body"] = {"reasoning": _reasoning}
+            merged_extra["reasoning"] = _reasoning
+        if merged_extra:
+            kwargs["extra_body"] = merged_extra
 
         t0 = time.time()
         resp = None
@@ -209,6 +167,10 @@ class LLM:
         if resp is None and last_exc is not None:
             raise last_exc
 
+        if not resp or not resp.choices:
+            return LLMResult(text=None, tool_calls=[], model=self.model,
+                             tokens_in=0, tokens_out=0, tokens_cached=0,
+                             usd=0.0, wall_s=wall_s)
         choice = resp.choices[0]
         msg = choice.message
         tool_calls_list: list[dict[str, Any]] = []

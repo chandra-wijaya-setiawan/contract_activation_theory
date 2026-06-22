@@ -1,4 +1,4 @@
-"""Stipulator — generates hypotheses about how to satisfy the obligation.
+"""Stipulator — builds the hypothesis prompt. LLM calls go through LLMKernel.
 
 The Stipulator is called once per hypothesis cycle. It receives:
   - The original obligation
@@ -15,7 +15,6 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from cat.contract.schemas import HypothesisSchema
-from cat.llm.client import LLM, LLMResult, call_structured
 
 STIPULATOR_V3_SYSTEM_PROMPT = """\
 You are the STIPULATOR. Given an obligation and what is already known from
@@ -78,7 +77,6 @@ def build_stipulator_messages(
         lines: list[str] = []
         for r in representations:
             evidence_lines = (r.evidence or "").strip().splitlines()
-            # Show more lines for high-signal reps (initial_test_failure)
             n_lines = 30 if "initial_test" in (r.key or "") else 12
             preview = "\n    ".join(ln for ln in evidence_lines[:n_lines] if ln.strip())
             lines.append(f"  {r.key}:\n    {preview}")
@@ -115,7 +113,6 @@ def build_stipulator_messages(
                     f"     Why failed: {reason}\n"
                 )
 
-        # Available checkpoints the next hypothesis can branch from.
         cp_labels = ["base"]
         for pa in prior_attempts:
             c = pa.get("checkpoint", "")
@@ -140,19 +137,3 @@ def build_stipulator_messages(
         {"role": "system", "content": STIPULATOR_V3_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
-
-
-def call_stipulator_v3(
-    llm: LLM,
-    obligation: str,
-    representations: Optional[list[Any]] = None,
-    knowledge: Any = None,
-    prior_attempts: Optional[list[dict]] = None,
-    parent_event_id: Optional[str] = None,
-) -> tuple[Optional[HypothesisSchema], LLMResult]:
-    """Call the Stipulator to generate one hypothesis."""
-    messages = build_stipulator_messages(obligation, representations, knowledge, prior_attempts)
-    return call_structured(
-        llm, messages, HypothesisSchema,
-        role_tag="stipulator", max_tokens=4096, parent_event_id=parent_event_id,
-    )

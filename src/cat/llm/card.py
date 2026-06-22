@@ -29,6 +29,7 @@ _CARDS: list[LLMModelCard] = [
     LLMModelCard("openrouter/owl-alpha",                  "OpenRouter", "Owl Alpha", "alpha"),
     LLMModelCard("openrouter/moonshotai/kimi-k2.6",       "Moonshot AI", "Kimi K2", "k2.6"),
     LLMModelCard("openrouter/anthropic/claude-opus-4.5",  "Anthropic", "Claude Opus", "4.5"),
+    LLMModelCard("openrouter/anthropic/claude-haiku-4.5",  "Anthropic", "Claude Haiku", "4.5"),
     LLMModelCard("openrouter/openai/gpt-5.3-codex",       "OpenAI", "GPT-5 Codex", "5.3"),
     LLMModelCard("openrouter/minimax/minimax-m3",         "MiniMax", "MiniMax M3", "m3"),
     LLMModelCard("openrouter/qwen/qwen3.7-plus",          "Alibaba", "Qwen3", "3.7-plus"),

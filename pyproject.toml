@@ -13,6 +13,7 @@ dependencies = [
     "openai>=1.40",
     "httpx>=0.27",
     "jedi>=0.19",
+    "instructor>=1.15",
 ]
 
 [project.optional-dependencies]

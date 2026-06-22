@@ -57,6 +57,9 @@ EventKind = Literal[
     "performer_plan",          # v3: Performer's PerformerPlanSchema (north star)
     "knowledge_update",        # v3: knowledge accumulated after a hypothesis cycle
     "attestor_give_up",        # v3: Attestor decided task is unrecoverable
+    # LLM kernel tracing
+    "llm_input",               # kernel → provider: what we're asking
+    "llm_output",              # provider → kernel: what we got back
     # Legacy aliases (kept readable for pre-rename traces):
     "contract_decompose",      # legacy alias for contract_stipulate
     "capability_invoke",       # legacy alias for capability_perform

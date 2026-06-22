@@ -1,22 +1,30 @@
-"""web_search capability — structured web search using Wikipedia API.
+"""web_search capability — structured web search using DuckDuckGo HTML.
 
-Primary source: Wikipedia search API (always accessible, no bot detection).
+Primary source: DuckDuckGo HTML search (no API key, no browser, ~1s).
+Fallback: Wikipedia search API.
+
 Returns title + snippet + URL for each result.
-
 For full page content, follow up with web_browse(url=...).
-For JS-rendered pages or sites requiring login, use web_browse (CDP backend).
 """
 from __future__ import annotations
 
+import html as html_mod
 import json
 import re
 import subprocess
+import urllib.parse
 from typing import Any
+
+import httpx
 
 from cat.capability.registry import Capability, ToolResult
 from cat.contract.model import State
 
 _OUTPUT_CAP = 6_000
+_DDG_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0 Safari/537.36"
+)
 
 _SCHEMA = {
     "type": "object",
@@ -39,8 +47,8 @@ def create_web_search_capability() -> Capability:
         name="web_search",
         description=(
             "Search the web and return result titles, URLs, and snippets. "
-            "Uses Wikipedia's search API (works without browser or API key). "
-            "Good for: people, places, concepts, facts. "
+            "Uses DuckDuckGo HTML (fast, no API key). "
+            "Good for: recent news, releases, people, places, concepts, facts. "
             "Follow up with web_browse(url=...) to read a full page."
         ),
         json_schema=_SCHEMA,
@@ -55,6 +63,74 @@ def _truncate(s: str, cap: int) -> str:
     return enc[:cap].decode("utf-8", errors="replace") + f"\n... [truncated at {cap} bytes]"
 
 
+def _search_ddg(query: str, n: int) -> list[dict]:
+    """Search DuckDuckGo HTML endpoint. Returns [{title, url, snippet}]."""
+    try:
+        r = httpx.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers={"User-Agent": _DDG_UA},
+            timeout=15,
+            follow_redirects=True,
+        )
+        if r.status_code != 200:
+            return []
+    except Exception:
+        return []
+
+    html_text = r.text
+    results: list[dict] = []
+
+    blocks = re.findall(
+        r'class="result__title".*?'
+        r'href="([^"]+)".*?'
+        r'>(.*?)</a>.*?'
+        r'class="result__snippet"[^>]*>(.*?)(?:</a>|</div>)',
+        html_text, re.DOTALL,
+    )
+
+    for url, title, snippet in blocks[:n]:
+        title = re.sub(r'<[^>]+>', '', title).strip()
+        snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+        url = html_mod.unescape(url)
+        if url.startswith("//duckduckgo.com/l/?"):
+            m = re.search(r'uddg=([^&]+)', url)
+            if m:
+                url = html_mod.unescape(m.group(1))
+        if title and url:
+            results.append({"title": title, "url": url, "snippet": snippet})
+
+    return results
+
+
+def _search_wikipedia(query: str, n: int) -> list[dict]:
+    """Search Wikipedia via its free API. Returns [{title, url, snippet}]."""
+    params = urllib.parse.urlencode({
+        "action": "query", "list": "search", "srsearch": query,
+        "format": "json", "srlimit": n, "srprop": "snippet|titlesnippet",
+    })
+    url = f"https://en.wikipedia.org/w/api.php?{params}"
+    cmd = [
+        "curl", "-s", "--max-time", "15",
+        "-H", "Accept: application/json",
+        "-H", "User-Agent: CAT-Agent/1.0",
+        url,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if proc.returncode != 0:
+            return []
+        data = json.loads(proc.stdout)
+        hits = data.get("query", {}).get("search", [])
+        return [{
+            "title": h.get("title", ""),
+            "url": f"https://en.wikipedia.org/wiki/{h.get('title', '').replace(' ', '_')}",
+            "snippet": re.sub(r"<[^>]+>", "", h.get("snippet", "")).strip(),
+        } for h in hits]
+    except Exception:
+        return []
+
+
 def _handle(args: dict[str, Any], state: State) -> ToolResult:
     query = (args.get("query") or "").strip()
     if not query:
@@ -62,81 +138,37 @@ def _handle(args: dict[str, Any], state: State) -> ToolResult:
 
     n = min(int(args.get("n_results") or 5), 10)
 
-    results, err = _wikipedia_search(query, n)
+    # Primary: DuckDuckGo HTML
+    results = _search_ddg(query, n)
+    source = "duckduckgo"
 
-    if err and not results:
-        return ToolResult(tool="web_search", is_error=True, output=err,
-                          detail={"query": query})
-
-    lines = [f'=== Web Search: "{query}" ===', ""]
-
-    if results:
-        for i, r in enumerate(results, 1):
-            lines.append(f"{i}. {r['title']}")
-            if r.get("url"):
-                lines.append(f"   {r['url']}")
-            if r.get("snippet"):
-                lines.append(f"   {r['snippet']}")
-            lines.append("")
+    # Fallback: Wikipedia
+    if not results:
+        results = _search_wikipedia(query, n)
+        source = "wikipedia"
 
     if not results:
-        lines.append("No results found.")
-        lines.append("")
-        lines.append("Tip: try web_browse(url='https://en.wikipedia.org/w/index.php?search=<query>')")
-    else:
-        lines.append("Tip: use web_browse(url='<URL above>') to read the full page.")
+        return ToolResult(
+            tool="web_search",
+            is_error=True,
+            output=f"No search results for: {query}",
+            detail={"query": query},
+        )
 
-    output = "\n".join(lines)
+    lines = [f'=== Web Search: "{query}" ===', ""]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r['title']}")
+        if r.get("url"):
+            lines.append(f"   {r['url']}")
+        if r.get("snippet"):
+            lines.append(f"   {r['snippet']}")
+        lines.append("")
+
+    lines.append("Tip: use web_browse(url='<URL above>') to read the full page.")
+
     return ToolResult(
         tool="web_search",
         is_error=False,
-        output=_truncate(output, _OUTPUT_CAP),
-        detail={"query": query, "n_results": len(results), "source": "wikipedia"},
+        output=_truncate("\n".join(lines), _OUTPUT_CAP),
+        detail={"query": query, "n_results": len(results), "source": source},
     )
-
-
-def _wikipedia_search(query: str, n: int) -> tuple[list[dict], str]:
-    """Search Wikipedia via its free API. Returns (results, error_or_empty)."""
-    import urllib.parse
-
-    params = urllib.parse.urlencode({
-        "action": "query",
-        "list": "search",
-        "srsearch": query,
-        "format": "json",
-        "srlimit": n,
-        "srprop": "snippet|titlesnippet",
-    })
-    url = f"https://en.wikipedia.org/w/api.php?{params}"
-
-    cmd = [
-        "curl", "-s", "--max-time", "15",
-        "-H", "Accept: application/json",
-        "-H", "User-Agent: CAT-Agent/1.0 (research tool; contact: cat@example.com)",
-        url,
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-    except subprocess.TimeoutExpired:
-        return [], "Wikipedia search timed out"
-    except Exception as exc:
-        return [], f"curl error: {exc}"
-
-    if proc.returncode != 0:
-        return [], f"curl exit {proc.returncode}: {(proc.stderr or '')[:200]}"
-
-    try:
-        data = json.loads(proc.stdout)
-    except Exception:
-        return [], f"Wikipedia API returned non-JSON: {proc.stdout[:200]}"
-
-    hits = data.get("query", {}).get("search", [])
-    results = []
-    for h in hits:
-        title = h.get("title", "")
-        snippet = re.sub(r"<[^>]+>", "", h.get("snippet", "")).strip()
-        url_slug = title.replace(" ", "_")
-        article_url = f"https://en.wikipedia.org/wiki/{url_slug}"
-        results.append({"title": title, "url": article_url, "snippet": snippet})
-
-    return results, ""

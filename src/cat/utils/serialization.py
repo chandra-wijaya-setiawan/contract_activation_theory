@@ -91,3 +91,51 @@ def _strip_provider(model: str) -> str:
         if model.startswith(prefix):
             return model[len(prefix):]
     return model
+
+
+# ── Tool context injection (shared by providers) ────────────────────────
+
+def build_tool_context(tools: list[dict]) -> str:
+    """Render tool schemas as compact JSON examples for the model to copy."""
+    tool_desc_parts = []
+    for t in tools:
+        fn = t.get("function", {})
+        name = fn.get("name", "?")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        props = params.get("properties", {})
+        required = params.get("required", [])
+        sig_parts = []
+        hint_parts = []
+        for arg_name, arg_schema in props.items():
+            if arg_name == "reason":
+                continue
+            req_star = "*" if arg_name in required else ""
+            sig_parts.append(f'"{arg_name}": "..."')
+            hint = arg_schema.get("description", "")
+            hint_parts.append(f'  "{arg_name}"{req_star}: {hint}')
+        sig = "{" + ", ".join(sig_parts) + "}" if sig_parts else "{}"
+        hints = "\n".join(hint_parts)
+        tool_desc_parts.append(f'{name} \u2014 {desc}\n  arguments: {sig}\n{hints}')
+    return "\n\n".join(tool_desc_parts)
+
+
+def inject_tool_context(messages: list[dict], tools_block: str) -> list[dict]:
+    """Prepend tool context to last user message."""
+    tool_context = (
+        f"Available tools (* = required argument):\n\n{tools_block}\n\n"
+        "Classify each tool call by intent:\n"
+        "- look:   gather information (read, search, list, inspect)\n"
+        "- change: modify state (write, edit, create, delete)\n"
+        "- check:  verify against criterion (run test, validate)\n"
+        "- done:   task complete \u2014 no tools, provide reason\n"
+        "- give_up: cannot proceed \u2014 no tools, provide reason\n\n"
+        "Use the EXACT key names shown above in your tools[].arguments JSON."
+    )
+    msgs = list(messages)
+    if msgs and msgs[-1].get("role") == "user":
+        msgs[-1] = {
+            "role": "user",
+            "content": msgs[-1]["content"] + "\n\n" + tool_context,
+        }
+    return msgs

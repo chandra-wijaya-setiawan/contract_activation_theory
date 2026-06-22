@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from cat.agent.base import Agent as BaseActivator, ActivatorRun
@@ -22,7 +23,6 @@ from cat.llm import (
     LLMKernel,
     KernelResult,
     build_stipulator_messages,
-    call_performer_plan,
     build_performer_plan_messages,
 )
 from cat.llm.performer_plan import PERFORMER_V3_SYSTEM_PROMPT
@@ -284,8 +284,8 @@ class HypothesisAgent(BaseActivator):
                     knowledge=knowledge,
                     prior_attempts=prior_attempts,
                 )
-                stip_res = planner_kernel.run(stip_messages,
-                                              parent_event_id=run.last_state_event_id)
+                stip_res = planner_kernel.generate_schema(
+                    stip_messages, parent_event_id=run.last_state_event_id)
                 hypothesis = stip_res.value if stip_res.ok else None
                 self._charge_kernel(contract, stip_res)
 
@@ -453,10 +453,14 @@ class HypothesisAgent(BaseActivator):
     def _reps_to_context(self, contract: Any) -> str:
         """Format contract representations as context for the Performer."""
         lines = []
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         for r in (contract.representations or []):
             key = getattr(r, "key", "") or ""
             val = getattr(r, "value", "") or getattr(r, "evidence", "") or ""
+            if not isinstance(val, str):
+                val = str(val)
             val = val.strip()
+            val = val.replace("{{CURRENT_DATETIME}}", now)
             if key and val:
                 lines.append(f"{key}:\n{val}")
         return "\n\n".join(lines)
@@ -492,17 +496,14 @@ class HypothesisAgent(BaseActivator):
             # planning_llm is an LLMKernel (preferred) or a plain LLM (legacy).
             plan_messages = build_performer_plan_messages(task, prior_results=prior_results)
             parent = run.last_perform_event_id or run.last_state_event_id
-            if planning_llm is not None and hasattr(planning_llm, "run"):
-                pres = planning_llm.run(plan_messages, schema=PerformerPlanSchema,
-                                        parent_event_id=parent)
+            if planning_llm is not None:
+                pres = planning_llm.generate_schema(
+                    plan_messages, schema=PerformerPlanSchema,
+                    parent_event_id=parent)
                 plan = pres.value if pres.ok else None
                 self._charge_kernel(contract, pres)
             else:
-                plan, plan_llm_result = call_performer_plan(
-                    planning_llm if planning_llm is not None else active_llm,
-                    task, prior_results=prior_results, parent_event_id=parent,
-                )
-                self._charge_llm(contract, plan_llm_result)
+                plan = None
             if plan and self.recorder:
                 self.recorder.append(TraceEvent(
                     event_id=f"pp-{uuid.uuid4().hex[:6]}",
@@ -584,8 +585,9 @@ class HypothesisAgent(BaseActivator):
             # Performer LLM call via kernel (toolcall mode with self-heal).
             # The kernel handles: reask on validation error, retry on truncation,
             # and model escalation on repeated failures.
-            performer_res = performer_kernel.run(
+            performer_res = performer_kernel.generate_toolcall(
                 messages,
+                schema=PerformerExecutionStep,
                 tools=active_tools,
                 parent_event_id=run.last_perform_event_id or run.last_state_event_id,
             )

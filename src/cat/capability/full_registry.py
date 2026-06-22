@@ -291,8 +291,12 @@ def build_default_registry() -> CapabilityRegistry:
     from cat.capability.tools.web_browse import create_web_browse_capability
     from cat.capability.tools.web_search import create_web_search_capability
     from cat.capability.tools.subagent import create_subagent_capability
+    from cat.capability.tools.notebook_editor import create_notebook_editor_capability
+    from cat.capability.tools.internet_research import create_internet_research_capability
     reg.register(create_web_browse_capability())
     reg.register(create_web_search_capability())
+    reg.register(create_notebook_editor_capability())
+    reg.register(create_internet_research_capability())
     _register_performer_exit_tools(reg)
     return reg
 
@@ -305,15 +309,18 @@ def register_subagent_tool(
     llm,
     checkpointer=None,
 ) -> None:
-    """Register the spawn_subagent tool into an existing registry."""
+    """Register the spawn_subagent tool into an existing registry (idempotent)."""
     from cat.capability.tools.subagent import create_subagent_capability
-    registry.register(create_subagent_capability(
+    cap = create_subagent_capability(
         agent_registry=agent_registry,
         capability_registry=capability_registry,
         recorder=recorder,
         llm=llm,
         checkpointer=checkpointer,
-    ))
+    )
+    if cap.name in registry._caps:
+        return  # already registered, skip
+    registry.register(cap)
 
 
 def _register_performer_exit_tools(reg: "CapabilityRegistry") -> None:

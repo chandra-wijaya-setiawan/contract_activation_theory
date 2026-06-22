@@ -1,4 +1,4 @@
-"""Performer plan — continuation plan generation for H2+.
+"""Performer plan — continuation plan prompt builder. LLM calls go through LLMKernel.
 
 When there are prior attempts, the Performer benefits from a plan that
 anchors current_state to what was already tried so the model continues
@@ -8,10 +8,7 @@ See design.v3.md §"Inner Loop (Performer)".
 """
 from __future__ import annotations
 
-from typing import Any, Optional
-
-from cat.contract.schemas import PerformerPlanSchema
-from cat.llm.client import LLM, LLMResult, call_structured
+from typing import Any
 
 PERFORMER_V3_SYSTEM_PROMPT = """\
 You are the PERFORMER. You execute a specific hypothesis using tools.
@@ -36,7 +33,7 @@ Field rules:
 
 Each tool object must have:
   - name: one of the available tools in the environment
-  - input: object with tool-specific arguments
+  - arguments: object with tool-specific arguments
 
 Intent meanings:
   look   — observe/explore (inspect the target, search, list)
@@ -58,10 +55,15 @@ Rules:
 10. Every response MUST be valid JSON matching the schema above.
 
 Tool selection (cheapest first):
-- To SEARCH for text in files: bash("grep -n 'pattern' file") or bash("grep -rn 'pattern' dir/") — NEVER read a whole file just to search.
+- ⚠️ FOR .ipynb NOTEBOOK FILES: Use notebook_editor ONLY — NEVER bash find/read/write/str_replace on .ipynb files.
+  notebook_editor(command="store load", notebook="<path>") — ALWAYS first step for any .ipynb task.
+  notebook_editor(command="stats") — overview (empty cells, personal voice). notebook_editor(command="find", keyword="...") — search.
+  notebook_editor(command="read", cell_idx=N) — read cell. notebook_editor(command="write", cell_idx=N, content="...") — edit cell.
+  notebook_editor(command="store sync") — save back to .ipynb. notebook_editor(command="answer", cell_idx=N, content="...") — green-box.
+- To SEARCH for text in non-notebook files: bash("grep -n 'pattern' file") or bash("grep -rn 'pattern' dir/").
 - To READ a specific section you already know: read(path) or read(path, offset=N, limit=40).
-- To FIND a file by name: bash("find . -name 'pattern'") — never list directories recursively just to find a file.
-- To EDIT: str_replace(path, old_str, new_str) — no need to read first; the tool reports success/failure directly.
+- To FIND a non-notebook file by name: bash("find . -name 'pattern'").
+- To EDIT non-notebook files: str_replace(path, old_str, new_str) — no need to read first.
 - str_replace and write report success/failure; never verify by re-reading.
 """
 
@@ -117,17 +119,3 @@ def build_performer_plan_messages(
         {"role": "system", "content": PERFORMER_PLAN_PROMPT},
         {"role": "user", "content": task_content},
     ]
-
-
-def call_performer_plan(
-    llm: LLM,
-    task: Any,
-    prior_results: str = "",
-    parent_event_id: Optional[str] = None,
-) -> tuple[Optional[PerformerPlanSchema], LLMResult]:
-    """Generate a continuation plan for the Performer."""
-    messages = build_performer_plan_messages(task, prior_results)
-    return call_structured(
-        llm, messages, PerformerPlanSchema,
-        role_tag="performer", max_tokens=4096, parent_event_id=parent_event_id,
-    )

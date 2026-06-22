@@ -129,6 +129,23 @@ def _run_browser_use(url: str, extract: str, custom_script: str) -> ToolResult:
     )
 
 
+def _extract_article(raw: str) -> str:
+    """Extract article text from HTML. Uses trafilatura if available."""
+    try:
+        from trafilatura import extract
+        text = extract(
+            raw,
+            include_comments=False,
+            include_tables=True,
+            deduplicate=True,
+        )
+        if text and len(text.strip()) > 100:
+            return text.strip()
+    except Exception:
+        pass
+    return _strip_html(raw)
+
+
 def _run_curl(url: str, extract: str) -> ToolResult:
     cmd = [
         "curl", "-L", "-s", "--max-time", "20",
@@ -155,7 +172,7 @@ def _run_curl(url: str, extract: str) -> ToolResult:
         abs_links = [l for l in links if l.startswith("http")][:60]
         output = "\n".join(abs_links) or "(no absolute links found)"
     elif "<html" in raw.lower() or "<body" in raw.lower():
-        output = _strip_html(raw)
+        output = _extract_article(raw)
     else:
         output = raw
 
