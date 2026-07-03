@@ -1,0 +1,32 @@
+name: task
+description: "Full hypothesis loop for coding tasks with oracle verification"
+
+representer:
+  mode: bash_probes
+  probes:
+    - key: workdir
+      command: "pwd && echo '---' && ls -1"
+    - key: ls_detail
+      command: "ls -la 2>/dev/null | head -35"
+    - key: file_types
+      command: "find . -maxdepth 1 -type f | head -20 | xargs file 2>/dev/null | head -20"
+    - key: notes
+      command: "cat README* readme* NOTES* notes* HINTS* hints* 2>/dev/null | head -60"
+    - key: test_scripts
+      command: "find . -maxdepth 3 \\( -name 'run_tests.sh' -o -name 'run-tests.sh' -o -name 'pytest.ini' -o -name 'setup.py' -o -name 'pyproject.toml' -o -name 'tox.ini' \\) 2>/dev/null | head -10"
+    - key: test_command
+      command: "{ cat run_tests.sh 2>/dev/null || cat run-tests.sh 2>/dev/null || echo '(no run_tests.sh)'; } | head -20"
+    - key: git_state
+      command: "git log --oneline -5 2>/dev/null || echo '(not a git repo)'"
+    - key: eval_command
+      command: "{ if [ -f /tests/run-tests.sh ]; then grep -E 'pytest' /tests/run-tests.sh | grep -v '#' | head -5; else echo '(no /tests/run-tests.sh)'; fi; }"
+
+loop_config:
+  max_hypotheses: 6
+  max_inner_attempts: 5
+  intelligence: 1.0           # planner uses strongest available tier
+  speed: 0.5
+  model_array:
+    - openrouter/deepseek/deepseek-v4-flash   # T0: performer starts here
+    - openrouter/deepseek/deepseek-v4-pro     # T1: escalates on give_up
+    - openrouter/owl-alpha                    # T2: final escalation

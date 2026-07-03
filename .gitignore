@@ -1,5 +1,6 @@
 # Claude Code local overrides (personal, never commit)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Python
 __pycache__/
@@ -24,9 +25,13 @@ dist/
 *.egg
 
 # Run artifacts (traces, parquet, jsonl)
-data/runs/
-data/bench_runs/
-data/traces/
+data/
+.cat/
+
+# Local backups
+cat_backup/
+cat_archive/
+src_backup/
 *.parquet
 
 # OS / editor

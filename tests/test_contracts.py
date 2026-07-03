@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from cat.contracts import (
+from cat.contract.model import (
     Constraints,
     Contract,
     ContractState,
